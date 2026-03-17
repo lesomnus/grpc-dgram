@@ -1,0 +1,51 @@
+edition = "2023";
+
+package echo;
+
+import "google/protobuf/timestamp.proto";
+
+option features.field_presence = IMPLICIT;
+option go_package = "github.com/lesomnus/grpc-dgram/internal/echo";
+
+service EchoService {
+  rpc Once(EchoRequest) returns (EchoResponse) {}
+  rpc Many(EchoRequest) returns (stream EchoResponse) {}
+  rpc Buff(stream EchoRequest) returns (EchoBatchResponse) {}
+  rpc Live(stream EchoRequest) returns (stream EchoResponse) {}
+}
+
+message EchoRequest {
+  // Server should respond with this status.
+  Status status = 1;
+  string message = 2;
+
+  // Perform a circular shift on themessage
+  // to the right by the given number.
+  // If the number is negative, shift to the left.
+  int32 circular_shift = 4;
+
+  // Server should respond with this number of EchoResponse.
+  // This effect only with stream method.
+  uint32 repeat = 5;
+
+  // Server does not response if this is true.
+  bool over_void = 6;
+
+  google.protobuf.Timestamp date_created = 15;
+}
+
+message EchoResponse {
+  string message = 2;
+  uint32 sequence = 3;
+
+  google.protobuf.Timestamp date_created = 15;
+}
+
+message EchoBatchResponse {
+  repeated EchoResponse items = 1;
+}
+
+message Status {
+  int32 code = 1;
+  string message = 2;
+}

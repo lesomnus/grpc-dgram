@@ -1,0 +1,11 @@
+edition = "2023";
+
+package drpc;
+
+import "drpc/frame.proto";
+
+option go_package = "github.com/lesomnus/grpc-dgram;drpc";
+
+message Envelop {
+  repeated Frame frames = 8;
+}

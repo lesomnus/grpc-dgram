@@ -1,0 +1,13 @@
+version: v2
+inputs:
+  - directory: ./proto
+plugins:
+  - local: [go, tool, google.golang.org/protobuf/cmd/protoc-gen-go]
+    out: .
+    opt:
+      - module=github.com/lesomnus/grpc-dgram
+      - default_api_level=API_OPAQUE
+  - local: [go, tool, google.golang.org/grpc/cmd/protoc-gen-go-grpc]
+    out: .
+    opt:
+      - module=github.com/lesomnus/grpc-dgram

@@ -1,0 +1,15 @@
+{
+	"name": "lesomnus.grpc-dgram",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"golang.go",
+				"bufbuild.vscode-buf",
+				"streetsidesoftware.code-spell-checker"
+			]
+		}
+	}
+}
