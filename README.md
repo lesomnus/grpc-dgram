@@ -7,6 +7,7 @@ Strictly speaking, this project is not gRPC.
 gRPC is defined on top of HTTP/2, and it also carries a set of behavioral conventions around request/response handling, streaming, metadata, deadlines, and status propagation.
 This project intentionally does not preserve that wire-level or runtime contract as is.
 Instead, it adapts the programming model to a datagram environment where loss, reordering, duplication, and partial delivery need to be considered first.
+That means this project is designed with unreliable channels in mind, not as a generic reliability layer that turns an unreliable transport into a reliable one.
 
 The name *grpc-dgram* is practical: the project is designed so that code generated from `.proto` files for gRPC can be reused with minimal friction.
 In other words, the goal is not "gRPC over datagram" in the protocol-spec sense, but "a datagram transport that can work with gRPC-generated stubs and service definitions":
@@ -46,6 +47,7 @@ TBD
 - It is not HTTP/2-based gRPC.
 - It does not aim to be wire-compatible with standard gRPC implementations.
 - It does not fully preserve the service processing rules, transport semantics, or feature set expected by the official gRPC stack.
+- It does not implement a general-purpose reliability protocol on top of an unreliable channel.
 
 If you need interoperability with existing gRPC servers, proxies, observability tooling, or the HTTP/2 ecosystem, this project is the wrong transport.
 
@@ -55,3 +57,4 @@ If you need interoperability with existing gRPC servers, proxies, observability 
 - HTTP/2 transport compatibility
 - Transparent interoperability with standard gRPC implementations
 - Exact reproduction of all gRPC metadata, streaming, and lifecycle semantics
+- Providing a general-purpose reliability layer over unreliable transports
