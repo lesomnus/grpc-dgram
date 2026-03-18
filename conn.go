@@ -2,14 +2,14 @@ package drpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/proto"
 )
 
 var _ grpc.ClientConnInterface = &Conn{}
@@ -17,7 +17,7 @@ var _ grpc.ClientConnInterface = &Conn{}
 type Conn struct {
 	mu sync.Mutex
 	tx FrameHandler
-	ss map[uint32]*stream
+	ss map[uint32]*clientStream
 
 	sid atomic.Uint32
 
@@ -32,7 +32,7 @@ type Conn struct {
 func NewConn(tx FrameHandler) *Conn {
 	return &Conn{
 		tx: tx,
-		ss: map[uint32]*stream{},
+		ss: map[uint32]*clientStream{},
 
 		timeout: 5 * time.Second,
 	}
@@ -47,7 +47,7 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 	if !ok {
 		// Corresponding stream not found.
 		// Maybe the f is delayed or for the previous Conn?
-		return nil
+		return io.EOF
 	}
 
 	select {
@@ -59,26 +59,10 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 }
 
 func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...grpc.CallOption) error {
-	// TODO: use codec
-	payload, err := proto.Marshal(in.(proto.Message))
-	if err != nil {
-		return err
-	}
-
-	req := &Frame{}
-	req.SetPayload(payload)
-
-	// Method.
-	if i, ok := c.methods.Load(method); ok {
-		req.SetMethodIndex(i.(uint32))
-	} else {
-		req.SetMethod(method)
-	}
-
-	// Metadata
-	if md, ok := metadata.FromOutgoingContext(ctx); ok {
-		req.SetMetadata(newMd(md))
-	}
+	// // Metadata
+	// if md, ok := metadata.FromOutgoingContext(ctx); ok {
+	// 	req.SetMetadata(newMd(md))
+	// }
 
 	// // Deadline.
 	// if deadline, ok := ctx.Deadline(); ok {
@@ -92,41 +76,36 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 	// 	ctx = ctx_
 	// }
 
-	stream := c.newStream()
-	if err := stream.send(req); err != nil {
+	stream := c.newStream(ctx, method)
+	defer stream.Close()
+
+	if err := stream.SendMsg(in); err != nil {
+		return err
+	}
+	if err := stream.RecvMsg(out); err != nil {
+		if errors.Is(err, io.EOF) {
+			return fmt.Errorf("unexpected close of stream")
+		}
 		return err
 	}
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-
-	case res, ok := <-stream.rx:
-		if !ok {
-			return fmt.Errorf("unexpected close of stream")
-		}
-		if err := res.Err(); err != nil {
-			return err
-		}
-
-		// TODO: use codec
-		return proto.Unmarshal(res.GetPayload(), out.(proto.Message))
-	}
+	return nil
 }
 
 func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-	return nil, fmt.Errorf("not implemented")
+	stream := c.newStream(ctx, method)
+	return stream, nil
 }
 
-func (c *Conn) newStream() *stream {
-	sid := c.sid.Add(1)
-	stream := newStream(sid, c.tx)
-
+func (c *Conn) newStream(ctx context.Context, method string) *clientStream {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	var stream *clientStream
 	for {
+		sid := c.sid.Add(1)
 		if _, ok := c.ss[sid]; !ok {
+			stream = newClientStream(ctx, c, sid, method)
 			c.ss[sid] = stream
 			break
 		}

@@ -20,7 +20,7 @@ In other words, the goal is not "gRPC over datagram" in the protocol-spec sense,
 - [x] Unary Call
 - [ ] Server-side Streaming Call
 - [ ] Client-side Streaming Call
-- [ ] Bidirectional Streaming Call
+- [x] Bidirectional Streaming Call
 - [ ] Metadata
 - [ ] Trailer
 - [ ] Codecs

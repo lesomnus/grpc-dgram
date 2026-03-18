@@ -47,7 +47,7 @@ func (EchoServer) Once(ctx context.Context, req *EchoRequest) (*EchoResponse, er
 	}
 
 	v := req.GetMessage()
-	v = circularShift(v, int(req.GetCircularShift()))
+	v = CircularShift(v, int(req.GetCircularShift()))
 	return EchoResponse_builder{
 		Message:     v,
 		Sequence:    0,
@@ -66,7 +66,7 @@ func (EchoServer) many(seq *uint32, req *EchoRequest, h func(res *EchoResponse) 
 		n = 1
 	}
 	for range n {
-		v = circularShift(v, int(req.GetCircularShift()))
+		v = CircularShift(v, int(req.GetCircularShift()))
 		if err := h(EchoResponse_builder{
 			Message:     v,
 			Sequence:    *seq,
@@ -142,14 +142,16 @@ func (s EchoServer) Live(stream grpc.BidiStreamingServer[EchoRequest, EchoRespon
 	}
 }
 
-func circularShift(s string, n int) string {
-	if len(s) == 0 {
+func CircularShift(s string, n int) string {
+	l := len(s)
+	if l == 0 {
 		return s
 	}
 
-	v := []rune(s)
-	l := len(v)
-	n = ((-n % l) + l) % l
+	n %= l
+	if n < 0 {
+		n += l
+	}
 
-	return string(v[n:]) + string(v[:n])
+	return s[n:] + s[:n]
 }

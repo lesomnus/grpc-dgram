@@ -16,18 +16,20 @@ var _ grpc.ServiceRegistrar = &Server{}
 type Server struct {
 	mu sync.Mutex
 	tx FrameHandler
-	ss map[uint32]*stream
+	ss map[uint32]*serverStream
 
 	// methods is a mapping from method name to index.
 	// Key must be a full method name (e.g. "/hday.HolderService/Add").
 	methods  []*serviceDesc
 	services map[string]*serviceDesc
+
+	wg sync.WaitGroup
 }
 
 func NewServer(tx FrameHandler) *Server {
 	return &Server{
 		tx: tx,
-		ss: map[uint32]*stream{},
+		ss: map[uint32]*serverStream{},
 
 		methods:  []*serviceDesc{},
 		services: map[string]*serviceDesc{},
@@ -39,7 +41,10 @@ func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
 		fullname := fmt.Sprintf("/%s/%s", desc.ServiceName, method.MethodName)
 		d, ok := s.services[fullname]
 		if !ok {
-			d = &serviceDesc{index: uint32(len(s.methods))}
+			d = &serviceDesc{
+				index:    uint32(len(s.methods)),
+				fullname: fullname,
+			}
 			s.services[fullname] = d
 			s.methods = append(s.methods, d)
 		}
@@ -52,7 +57,10 @@ func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
 		fullname := fmt.Sprintf("/%s/%s", desc.ServiceName, stream.StreamName)
 		d, ok := s.services[fullname]
 		if !ok {
-			d = &serviceDesc{index: uint32(len(s.methods))}
+			d = &serviceDesc{
+				index:    uint32(len(s.methods)),
+				fullname: fullname,
+			}
 			s.services[fullname] = d
 			s.methods = append(s.methods, d)
 		}
@@ -63,12 +71,11 @@ func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
 	}
 }
 
-// Handle processes given frame and returns response if the request was unary call
-// and returns nothing if the request was streaming call.
 func (s *Server) Handle(ctx context.Context, req *Frame) error {
 	sid := req.GetSid()
 	res := Frame_builder{
 		Sid:  sid,
+		Seq:  1,
 		Code: uint32(codes.Unimplemented),
 	}.Build()
 	handle_status := func(err error) error {
@@ -119,30 +126,36 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 
 	stream, ok := s.getStream(sid)
 	if !ok {
-		if err := desc.stream.Handler(desc.impl, stream); err != nil {
-			return handle_status(err)
-		}
+		s.wg.Go(func() {
+			desc.stream.Handler(desc.impl, stream)
+		})
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case stream.rx <- req:
 	}
 
 	return nil
 }
 
-func (s *Server) getStream(sid uint32) (*stream, bool) {
+func (s *Server) getStream(sid uint32) (*serverStream, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	streams, ok := s.ss[sid]
+	stream, ok := s.ss[sid]
 	if !ok {
-		streams = &stream{}
-		// s.reset()
-		s.ss[sid] = streams
+		stream = newServerStream(context.Background(), s, sid)
+		s.ss[sid] = stream
 	}
 
-	return streams, ok
+	return stream, ok
 }
 
 type serviceDesc struct {
-	index   uint32
+	index    uint32
+	fullname string
+
 	service *grpc.ServiceDesc
 	method  *grpc.MethodDesc
 	stream  *grpc.StreamDesc

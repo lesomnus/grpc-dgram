@@ -18,7 +18,13 @@ message Frame {
   // service is mapped to what number during communication.
   string method = 4;
   uint32 method_index = 5;
-  // uint32 flags = 6;
+
+  // enum FLAG {
+  //   FLAG_UNSPECIFIED = 0;
+  //   FLAG_OPEN = 1;
+  //   FLAG_CLOSE = 2;
+  // }
+  // FLAG flags = 6;
 
   google.protobuf.Timestamp deadline = 7;
 

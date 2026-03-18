@@ -10,39 +10,166 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var _ grpc.ServerStream = &stream{}
+var (
+	_ grpc.ServerStream = &serverStream{}
+	_ grpc.ClientStream = &clientStream{}
+)
+
+type serverStream struct {
+	server *Server
+	stream
+}
+
+func newServerStream(ctx context.Context, server *Server, sid uint32) *serverStream {
+	desc := server.methods[sid]
+
+	return &serverStream{
+		server: server,
+		stream: newStream(ctx, server.tx, sid, desc.service.ServiceName, desc.index),
+	}
+}
+
+func (s *serverStream) SetHeader(md metadata.MD) error {
+	// TODO:
+	return nil
+}
+
+func (s *serverStream) SendHeader(md metadata.MD) error {
+	// TODO:
+	return nil
+}
+
+func (s *serverStream) SetTrailer(md metadata.MD) {
+	// TODO:
+	return
+}
+
+func (s *serverStream) RecvMsg(m any) error {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case v, ok := <-s.rx:
+			if !ok {
+				return io.EOF
+			}
+			if v.HasDeadline() && time.Now().After(v.GetDeadline().AsTime()) {
+				continue
+			}
+			if !s.rx_seq.checkAndSet(rx_seq(v.GetSeq())) {
+				continue
+			}
+
+			return v.unmarshal(m)
+		}
+	}
+}
+
+func (s *serverStream) Close() error {
+	s.server.mu.Lock()
+	defer s.server.mu.Unlock()
+
+	delete(s.server.ss, s.sid)
+	close(s.rx)
+	return nil
+}
+
+type clientStream struct {
+	conn *Conn
+	stream
+}
+
+func newClientStream(ctx context.Context, conn *Conn, sid uint32, method string) *clientStream {
+	method_index := uint32(0)
+	if v, ok := conn.methods.Load(method); ok {
+		method_index = v.(uint32)
+	}
+
+	return &clientStream{
+		conn:   conn,
+		stream: newStream(ctx, conn.tx, sid, method, method_index),
+	}
+}
+
+func (s *clientStream) Header() (metadata.MD, error) {
+	// TODO:
+	return metadata.MD{}, nil
+}
+
+func (s *clientStream) Trailer() metadata.MD {
+	// TODO:
+	return metadata.MD{}
+}
+
+func (s *clientStream) CloseSend() error {
+	// TODO:
+	return nil
+}
+
+func (s *clientStream) RecvMsg(m any) error {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case v, ok := <-s.rx:
+			if !ok {
+				return io.EOF
+			}
+			if s.method_index == 0 {
+				i := v.GetMethodIndex()
+				s.method_index = i
+				s.conn.methods.Store(s.method, i)
+			}
+			if v.HasDeadline() && time.Now().After(v.GetDeadline().AsTime()) {
+				continue
+			}
+			if !s.rx_seq.checkAndSet(rx_seq(v.GetSeq())) {
+				continue
+			}
+
+			return v.unmarshal(m)
+		}
+	}
+}
+
+func (s *clientStream) Close() error {
+	s.conn.mu.Lock()
+	defer s.conn.mu.Unlock()
+
+	delete(s.conn.ss, s.sid)
+	close(s.rx)
+	return nil
+}
 
 type stream struct {
+	sid uint32
+
+	method       string
+	method_index uint32
+
 	ctx    context.Context
 	cancel context.CancelFunc
-
-	sid uint32
 
 	tx     FrameHandler
 	tx_seq tx_seq
 	rx     chan *Frame
-	rx_seq uint32
+	rx_seq rx_seq
 }
 
-func newStream(sid uint32, tx FrameHandler) *stream {
-	s := &stream{sid: sid, tx: tx, rx: make(chan *Frame)}
-	s.ctx, s.cancel = context.WithCancel(context.Background())
+func newStream(ctx context.Context, tx FrameHandler, sid uint32, method string, method_index uint32) stream {
+	s := stream{
+		sid: sid,
+
+		method:       method,
+		method_index: method_index,
+
+		tx: tx,
+		rx: make(chan *Frame),
+	}
+
+	s.ctx, s.cancel = context.WithCancel(ctx)
+
 	return s
-}
-
-func (s *stream) SetHeader(md metadata.MD) error {
-	// TODO:
-	return nil
-}
-
-func (s *stream) SendHeader(md metadata.MD) error {
-	// TODO:
-	return nil
-}
-
-func (s *stream) SetTrailer(md metadata.MD) {
-	// TODO:
-	return
 }
 
 func (s *stream) Context() context.Context {
@@ -57,38 +184,14 @@ func (s *stream) SendMsg(m any) error {
 	}
 
 	f := &Frame{}
-	f.SetPayload(payload)
-
-	return s.tx(s.ctx, f)
-}
-
-func (s *stream) send(f *Frame) error {
 	f.SetSid(s.sid)
 	f.SetSeq(s.tx_seq.next())
-	return s.tx(s.ctx, f)
-}
-
-func (s *stream) RecvMsg(m any) error {
-	for {
-		select {
-		case <-s.ctx.Done():
-			return s.ctx.Err()
-		case v, ok := <-s.rx:
-			if !ok {
-				return io.EOF
-			}
-			if time.Now().After(v.GetDeadline().AsTime()) {
-				continue
-			}
-
-			seq := v.GetSeq()
-			if s.rx_seq >= seq {
-				continue
-			}
-
-			s.rx_seq = seq
-
-			return v.unmarshal(m)
-		}
+	if s.method_index == 0 {
+		f.SetMethod(s.method)
+	} else {
+		f.SetMethodIndex(s.method_index)
 	}
+
+	f.SetPayload(payload)
+	return s.tx(s.ctx, f)
 }

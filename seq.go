@@ -7,9 +7,8 @@ const (
 type tx_seq uint32
 
 func (v *tx_seq) next() uint32 {
-	w := *v
 	*v++
-	return uint32(w)
+	return uint32(*v)
 }
 
 type rx_seq uint32
