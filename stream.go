@@ -41,7 +41,6 @@ func (s *serverStream) SendHeader(md metadata.MD) error {
 
 func (s *serverStream) SetTrailer(md metadata.MD) {
 	// TODO:
-	return
 }
 
 func (s *serverStream) RecvMsg(m any) error {

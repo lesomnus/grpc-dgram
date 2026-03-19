@@ -19,7 +19,7 @@ In other words, the goal is not "gRPC over datagram" in the protocol-spec sense,
 ## Features
 
 - [x] Unary Call
-- [ ] Server-side Streaming Call
+- [x] Server-side Streaming Call
 - [ ] Client-side Streaming Call
 - [x] Bidirectional Streaming Call
 - [ ] Metadata
