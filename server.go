@@ -23,17 +23,34 @@ type Server struct {
 	methods  []*serviceDesc
 	services map[string]*serviceDesc
 
+	unary_int grpc.UnaryServerInterceptor
+
 	wg sync.WaitGroup
 }
 
-func NewServer(tx FrameHandler) *Server {
-	return &Server{
+func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
+	opt := serverOption{}
+	for _, o := range opts {
+		o.apply(&opt)
+	}
+
+	v := &Server{
 		tx: tx,
 		ss: map[uint32]*serverStream{},
 
 		methods:  []*serviceDesc{},
 		services: map[string]*serviceDesc{},
+
+		// unary_int: ,
 	}
+	if opt.unary_int != nil {
+		opt.unary_ints = append([]grpc.UnaryServerInterceptor{opt.unary_int}, opt.unary_ints...)
+	}
+	if opt.unary_ints != nil {
+		v.unary_int = chainUnaryInterceptors(opt.unary_ints)
+	}
+
+	return v
 }
 
 func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
@@ -114,9 +131,11 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 
 	if desc.method != nil {
 		// TODO: use codec.
-		res, err := desc.method.Handler(desc.impl, ctx, func(v any) error {
+		dec := func(v any) error {
 			return proto.Unmarshal(req.GetPayload(), v.(proto.Message))
-		}, nil)
+		}
+
+		res, err := desc.method.Handler(desc.impl, ctx, dec, s.unary_int)
 		if err != nil {
 			return handle_status(err)
 		}
@@ -161,4 +180,49 @@ type serviceDesc struct {
 	stream  *grpc.StreamDesc
 
 	impl any
+}
+
+type ServerOption interface {
+	apply(*serverOption)
+}
+
+type serverOption struct {
+	unary_int  grpc.UnaryServerInterceptor
+	unary_ints []grpc.UnaryServerInterceptor
+}
+
+type serverOptionFunc func(*serverOption)
+
+func (f serverOptionFunc) apply(o *serverOption) {
+	f(o)
+}
+
+func UnaryInterceptor(i grpc.UnaryServerInterceptor) ServerOption {
+	return serverOptionFunc(func(o *serverOption) {
+		if o.unary_int != nil {
+			panic("The unary server interceptor was already set and may not be reset.")
+		}
+		o.unary_int = i
+	})
+}
+
+func ChainUnaryInterceptors(is ...grpc.UnaryServerInterceptor) ServerOption {
+	return serverOptionFunc(func(o *serverOption) {
+		o.unary_ints = append(o.unary_ints, is...)
+	})
+}
+
+func chainUnaryInterceptors(is []grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		return is[0](ctx, req, info, getChainUnaryHandler(is, 0, info, handler))
+	}
+}
+
+func getChainUnaryHandler(is []grpc.UnaryServerInterceptor, curr int, info *grpc.UnaryServerInfo, finalHandler grpc.UnaryHandler) grpc.UnaryHandler {
+	if curr == len(is)-1 {
+		return finalHandler
+	}
+	return func(ctx context.Context, req any) (any, error) {
+		return is[curr+1](ctx, req, info, getChainUnaryHandler(is, curr+1, info, finalHandler))
+	}
 }

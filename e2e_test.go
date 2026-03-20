@@ -7,48 +7,61 @@ import (
 	drpc "github.com/lesomnu/grpc-dgram"
 	"github.com/lesomnu/grpc-dgram/internal/echo"
 	"github.com/lesomnu/grpc-dgram/internal/x"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-func TestE2E(t *testing.T) {
-	pipe := func(t *testing.T) (echo.EchoServiceClient, func()) {
-		ctx, cancel := context.WithCancel(t.Context())
+type PipeOption struct {
+	ServerOpts []drpc.ServerOption
+}
 
-		ca := make(chan *drpc.Frame, 10)
-		server := drpc.NewServer(func(_ context.Context, f *drpc.Frame) error {
-			t.Logf("server->client %d:%d", f.GetSid(), f.GetSeq())
-			ca <- f
-			return nil
-		})
+func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
+	ctx, cancel := context.WithCancel(t.Context())
 
-		cb := make(chan *drpc.Frame, 10)
-		conn := drpc.NewConn(func(_ context.Context, f *drpc.Frame) error {
-			t.Logf("client->server %d:%d", f.GetSid(), f.GetSeq())
-			cb <- f
-			return nil
-		})
+	ca := make(chan *drpc.Frame, 10)
+	server := drpc.NewServer(func(_ context.Context, f *drpc.Frame) error {
+		t.Logf("server->client %d:%d", f.GetSid(), f.GetSeq())
+		ca <- f
+		return nil
+	}, o.ServerOpts...)
 
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case f := <-ca:
-					if err := conn.Handle(ctx, f); err != nil {
-						panic(err)
-					}
-				case f := <-cb:
-					if err := server.Handle(ctx, f); err != nil {
-						panic(err)
-					}
+	cb := make(chan *drpc.Frame, 10)
+	conn := drpc.NewConn(func(_ context.Context, f *drpc.Frame) error {
+		t.Logf("client->server %d:%d", f.GetSid(), f.GetSeq())
+		cb <- f
+		return nil
+	})
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case f := <-ca:
+				if err := conn.Handle(ctx, f); err != nil {
+					panic(err)
+				}
+			case f := <-cb:
+				if err := server.Handle(ctx, f); err != nil {
+					panic(err)
 				}
 			}
-		}()
+		}
+	}()
 
-		echo.RegisterEchoServiceServer(server, echo.EchoServer{})
-		return echo.NewEchoServiceClient(conn), cancel
-	}
+	return server, conn, cancel
+}
+
+func (o PipeOption) Use(t *testing.T) (echo.EchoServiceClient, func()) {
+	server, conn, cancel := o.Build(t)
+
+	echo.RegisterEchoServiceServer(server, echo.EchoServer{})
+	return echo.NewEchoServiceClient(conn), cancel
+}
+
+func TestE2E(t *testing.T) {
+	pipe := PipeOption{}.Use
 
 	t.Run("Unary", func(t *testing.T) {
 		ctx := t.Context()
@@ -66,14 +79,54 @@ func TestE2E(t *testing.T) {
 	t.Run("Unary unknown service", func(t *testing.T) {
 		ctx := t.Context()
 
-		client, cancel := pipe(t)
+		_, conn, cancel := PipeOption{}.Build(t)
 		defer cancel()
 
+		client := echo.NewEchoServiceClient(conn)
 		_, err := client.Once(ctx, &echo.EchoRequest{})
 		x.Error(t, err)
 
 		code := status.Code(err)
 		x.Equal(t, codes.Unimplemented, code)
+	})
+	t.Run("Unary interceptor", func(t *testing.T) {
+		ctx := t.Context()
+
+		msgs := []string{}
+		client, cancel := PipeOption{
+			ServerOpts: []drpc.ServerOption{
+				drpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
+					msgs = append(msgs, req.(*echo.EchoRequest).GetMessage())
+					res, err := handler(ctx, req)
+					if err != nil {
+						return nil, err
+					}
+
+					msgs = append(msgs, res.(*echo.EchoResponse).GetMessage())
+					return res, nil
+				}),
+			},
+		}.Use(t)
+		defer cancel()
+
+		_, err := client.Once(ctx, echo.EchoRequest_builder{
+			Message:       "Royale with Cheese",
+			CircularShift: 3,
+		}.Build())
+		x.NoError(t, err)
+
+		_, err = client.Once(ctx, echo.EchoRequest_builder{
+			Message:       "Le Big Mac",
+			CircularShift: 3,
+		}.Build())
+		x.NoError(t, err)
+
+		x.Equal(t, []string{
+			"Royale with Cheese",
+			"ale with CheeseRoy",
+			"Le Big Mac",
+			"Big MacLe ",
+		}, msgs)
 	})
 	t.Run("Server Streaming", func(t *testing.T) {
 		ctx := t.Context()

@@ -27,7 +27,7 @@ func False(t *testing.T, condition bool, msgAndArgs ...interface{}) {
 	}
 }
 
-func Equal[T comparable](t *testing.T, expected, actual T, msgAndArgs ...interface{}) {
+func Equal[T any](t *testing.T, expected, actual T, msgAndArgs ...interface{}) {
 	t.Helper()
 	if !reflect.DeepEqual(expected, actual) {
 		if len(msgAndArgs) > 0 {
@@ -37,7 +37,7 @@ func Equal[T comparable](t *testing.T, expected, actual T, msgAndArgs ...interfa
 	}
 }
 
-func NotEqual[T comparable](t *testing.T, expected, actual T, msgAndArgs ...interface{}) {
+func NotEqual[T any](t *testing.T, expected, actual T, msgAndArgs ...interface{}) {
 	t.Helper()
 	if reflect.DeepEqual(expected, actual) {
 		if len(msgAndArgs) > 0 {
@@ -89,7 +89,6 @@ func ErrorIs(t *testing.T, err, target error, msgAndArgs ...interface{}) {
 		"in chain: %s\n"+
 		"%s", expectedText, chain,
 		fmt.Sprint(msgAndArgs...))
-	return
 }
 
 func buildErrorChainString(err error, withType bool) string {

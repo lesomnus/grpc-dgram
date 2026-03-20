@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
@@ -50,6 +51,10 @@ func (s *serverStream) RecvMsg(m any) error {
 			return s.ctx.Err()
 		case v, ok := <-s.rx:
 			if !ok {
+				return io.EOF
+			}
+			if v.GetCode() == uint32(codes.Canceled) {
+				// Client closes the stream.
 				return io.EOF
 			}
 			if v.HasDeadline() && time.Now().After(v.GetDeadline().AsTime()) {
@@ -101,8 +106,9 @@ func (s *clientStream) Trailer() metadata.MD {
 }
 
 func (s *clientStream) CloseSend() error {
-	// TODO:
-	return nil
+	f := s.nextFrame()
+	f.SetCode(uint32(codes.Canceled))
+	return s.tx(s.ctx, f)
 }
 
 func (s *clientStream) RecvMsg(m any) error {
@@ -182,6 +188,12 @@ func (s *stream) SendMsg(m any) error {
 		return err
 	}
 
+	f := s.nextFrame()
+	f.SetPayload(payload)
+	return s.tx(s.ctx, f)
+}
+
+func (s *stream) nextFrame() *Frame {
 	f := &Frame{}
 	f.SetSid(s.sid)
 	f.SetSeq(s.tx_seq.next())
@@ -191,6 +203,5 @@ func (s *stream) SendMsg(m any) error {
 		f.SetMethodIndex(s.method_index)
 	}
 
-	f.SetPayload(payload)
-	return s.tx(s.ctx, f)
+	return f
 }
