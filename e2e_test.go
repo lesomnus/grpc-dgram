@@ -2,6 +2,7 @@ package drpc_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	drpc "github.com/lesomnu/grpc-dgram"
@@ -20,37 +21,54 @@ func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
 	ctx, cancel := context.WithCancel(t.Context())
 
 	ca := make(chan *drpc.Frame, 10)
-	server := drpc.NewServer(func(_ context.Context, f *drpc.Frame) error {
+	server := drpc.NewServer(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
 		t.Logf("server->client %d:%d", f.GetSid(), f.GetSeq())
 		ca <- f
 		return nil
-	}, o.ServerOpts...)
+	}), o.ServerOpts...)
 
 	cb := make(chan *drpc.Frame, 10)
-	conn := drpc.NewConn(func(_ context.Context, f *drpc.Frame) error {
+	conn := drpc.NewConn(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
 		t.Logf("client->server %d:%d", f.GetSid(), f.GetSeq())
 		cb <- f
 		return nil
-	})
+	}))
 
-	go func() {
+	var wg sync.WaitGroup
+	wg.Go(func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case f := <-ca:
 				if err := conn.Handle(ctx, f); err != nil {
-					panic(err)
-				}
-			case f := <-cb:
-				if err := server.Handle(ctx, f); err != nil {
-					panic(err)
+					if err != ctx.Err() {
+						panic(err)
+					}
 				}
 			}
 		}
-	}()
+	})
+	wg.Go(func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case f := <-cb:
+				if err := server.Handle(ctx, f); err != nil {
+					if err != ctx.Err() {
+						panic(err)
+					}
+				}
+			}
+		}
+	})
 
-	return server, conn, cancel
+	return server, conn, func() {
+		server.GracefulStop()
+		cancel()
+		wg.Wait()
+	}
 }
 
 func (o PipeOption) Use(t *testing.T) (echo.EchoServiceClient, func()) {
@@ -66,8 +84,8 @@ func TestE2E(t *testing.T) {
 	t.Run("Unary", func(t *testing.T) {
 		ctx := t.Context()
 
-		client, cancel := pipe(t)
-		defer cancel()
+		client, stop := pipe(t)
+		defer stop()
 
 		res, err := client.Once(ctx, echo.EchoRequest_builder{
 			Message:       "Royale with Cheese",
@@ -131,8 +149,8 @@ func TestE2E(t *testing.T) {
 	t.Run("Server Streaming", func(t *testing.T) {
 		ctx := t.Context()
 
-		client, cancel := pipe(t)
-		defer cancel()
+		client, stop := pipe(t)
+		defer stop()
 
 		stream, err := client.Many(ctx, echo.EchoRequest_builder{
 			Message:       "bar",
@@ -154,11 +172,12 @@ func TestE2E(t *testing.T) {
 	t.Run("Client Streaming", func(t *testing.T) {
 		ctx := t.Context()
 
-		client, cancel := pipe(t)
-		defer cancel()
+		client, stop := pipe(t)
+		defer stop()
 
 		stream, err := client.Buff(ctx)
 		x.NoError(t, err)
+		defer stream.CloseSend()
 
 		err = stream.Send(echo.EchoRequest_builder{
 			Message:       "bar",
@@ -192,11 +211,12 @@ func TestE2E(t *testing.T) {
 	t.Run("Bidi Streaming", func(t *testing.T) {
 		ctx := t.Context()
 
-		client, cancel := pipe(t)
-		defer cancel()
+		client, stop := pipe(t)
+		defer stop()
 
 		stream, err := client.Live(ctx)
 		x.NoError(t, err)
+		defer stream.CloseSend()
 
 		err = stream.Send(echo.EchoRequest_builder{
 			Message:       "bar",

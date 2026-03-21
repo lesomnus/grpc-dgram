@@ -27,7 +27,7 @@ func TestConn(t *testing.T) {
 		defer wg.Wait()
 
 		var conn *drpc.Conn
-		conn = drpc.NewConn(func(ctx context.Context, f *drpc.Frame) error {
+		conn = drpc.NewConn(drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
 			wg.Go(func() {
 				frame_out.SetSid(f.GetSid())
 				frame_out.SetSeq(1)
@@ -35,7 +35,7 @@ func TestConn(t *testing.T) {
 				x.NoError(t, err)
 			})
 			return nil
-		})
+		}))
 
 		req := &echo.EchoRequest{}
 		res := &echo.EchoResponse{}
@@ -58,7 +58,7 @@ func TestConn(t *testing.T) {
 		defer wg.Wait()
 
 		var conn *drpc.Conn
-		conn = drpc.NewConn(func(ctx context.Context, f *drpc.Frame) error {
+		conn = drpc.NewConn(drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
 			frame_in = f
 			wg.Go(func() {
 				frame_out.SetSid(f.GetSid())
@@ -67,7 +67,7 @@ func TestConn(t *testing.T) {
 				x.NoError(t, err)
 			})
 			return nil
-		})
+		}))
 
 		req := &echo.EchoRequest{}
 		res := &echo.EchoResponse{}
@@ -90,10 +90,10 @@ func TestConn(t *testing.T) {
 		frame_out := &drpc.Frame{}
 
 		var conn *drpc.Conn
-		conn = drpc.NewConn(func(ctx context.Context, f *drpc.Frame) error {
+		conn = drpc.NewConn(drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
 			frame_in = f
 			return nil
-		})
+		}))
 
 		ctx_, cancel := context.WithCancel(ctx)
 		cancel()

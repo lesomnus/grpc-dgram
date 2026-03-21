@@ -21,12 +21,10 @@ type serverStream struct {
 	stream
 }
 
-func newServerStream(ctx context.Context, server *Server, sid uint32) *serverStream {
-	desc := server.methods[sid]
-
+func newServerStream(ctx context.Context, server *Server, sid uint32, desc *serviceDesc) *serverStream {
 	return &serverStream{
 		server: server,
-		stream: newStream(ctx, server.tx, sid, desc.service.ServiceName, desc.index),
+		stream: newStream(ctx, server.tx, sid, desc.fullname, desc.index),
 	}
 }
 
@@ -48,11 +46,8 @@ func (s *serverStream) RecvMsg(m any) error {
 	for {
 		select {
 		case <-s.ctx.Done():
-			return s.ctx.Err()
-		case v, ok := <-s.rx:
-			if !ok {
-				return io.EOF
-			}
+			return io.EOF
+		case v := <-s.rx:
 			if v.GetCode() == uint32(codes.Canceled) {
 				// Client closes the stream.
 				return io.EOF
@@ -74,7 +69,7 @@ func (s *serverStream) Close() error {
 	defer s.server.mu.Unlock()
 
 	delete(s.server.ss, s.sid)
-	close(s.rx)
+	s.cancel()
 	return nil
 }
 
@@ -108,18 +103,15 @@ func (s *clientStream) Trailer() metadata.MD {
 func (s *clientStream) CloseSend() error {
 	f := s.nextFrame()
 	f.SetCode(uint32(codes.Canceled))
-	return s.tx(s.ctx, f)
+	return s.tx.Handle(s.ctx, f)
 }
 
 func (s *clientStream) RecvMsg(m any) error {
 	for {
 		select {
 		case <-s.ctx.Done():
-			return s.ctx.Err()
-		case v, ok := <-s.rx:
-			if !ok {
-				return io.EOF
-			}
+			return io.EOF
+		case v := <-s.rx:
 			if s.method_index == 0 {
 				i := v.GetMethodIndex()
 				s.method_index = i
@@ -142,7 +134,7 @@ func (s *clientStream) Close() error {
 	defer s.conn.mu.Unlock()
 
 	delete(s.conn.ss, s.sid)
-	close(s.rx)
+	s.cancel()
 	return nil
 }
 
@@ -169,7 +161,7 @@ func newStream(ctx context.Context, tx FrameHandler, sid uint32, method string, 
 		method_index: method_index,
 
 		tx: tx,
-		rx: make(chan *Frame),
+		rx: make(chan *Frame, 10),
 	}
 
 	s.ctx, s.cancel = context.WithCancel(ctx)
@@ -190,7 +182,7 @@ func (s *stream) SendMsg(m any) error {
 
 	f := s.nextFrame()
 	f.SetPayload(payload)
-	return s.tx(s.ctx, f)
+	return s.tx.Handle(s.ctx, f)
 }
 
 func (s *stream) nextFrame() *Frame {
@@ -204,4 +196,15 @@ func (s *stream) nextFrame() *Frame {
 	}
 
 	return f
+}
+
+func (s *stream) put(ctx context.Context, f *Frame) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.ctx.Done():
+		return nil
+	case s.rx <- f:
+		return nil
+	}
 }

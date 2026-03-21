@@ -50,12 +50,7 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 		return io.EOF
 	}
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case s.rx <- f:
-		return nil
-	}
+	return s.put(ctx, f)
 }
 
 func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...grpc.CallOption) error {

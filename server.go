@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -25,7 +26,9 @@ type Server struct {
 
 	unary_int grpc.UnaryServerInterceptor
 
-	wg sync.WaitGroup
+	wg     sync.WaitGroup
+	drain  atomic.Bool
+	closed atomic.Bool
 }
 
 func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
@@ -95,38 +98,33 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 		Seq:  1,
 		Code: uint32(codes.Unimplemented),
 	}.Build()
-	handle_status := func(err error) error {
-		st, ok := status.FromError(err)
-		res.SetCode(uint32(st.Code()))
-		if ok {
-			res.SetDesc(st.Message())
-			return nil
-		} else {
-			return st.Err()
-		}
-	}
-	handle_res := func(v any) error {
-		payload, err := proto.Marshal(v.(proto.Message))
-		if err != nil {
-			res.SetCode(uint32(codes.Unknown))
-			return err
-		}
-
-		res.SetPayload(payload)
-		res.SetCode(uint32(codes.OK))
-		return s.tx(ctx, res)
+	if s.closed.Load() {
+		res.SetCode(uint32(codes.Unavailable))
+		s.tx.Handle(ctx, res)
+		return nil
 	}
 
 	var desc *serviceDesc
 	if i := int(req.GetMethodIndex()); i == 0 {
 		desc = s.services[req.GetMethod()]
 		if desc == nil {
-			return s.tx(ctx, res)
+			return s.tx.Handle(ctx, res)
 		}
 	} else if len(s.methods) <= i {
-		return s.tx(ctx, res)
+		return s.tx.Handle(ctx, res)
 	} else {
 		desc = s.methods[i]
+	}
+
+	fill_err := func(err error) {
+		st, ok := status.FromError(err)
+		if ok {
+			res.SetCode(uint32(st.Code()))
+			res.SetDesc(st.Message())
+		} else {
+			res.SetCode(uint32(codes.Unknown))
+			res.SetDesc(err.Error())
+		}
 	}
 
 	if desc.method != nil {
@@ -135,40 +133,82 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 			return proto.Unmarshal(req.GetPayload(), v.(proto.Message))
 		}
 
-		res, err := desc.method.Handler(desc.impl, ctx, dec, s.unary_int)
-		if err != nil {
-			return handle_status(err)
-		}
+		s.wg.Go(func() {
+			defer s.tx.Handle(ctx, res)
+			if s.drain.Load() {
+				res.SetCode(uint32(codes.Unavailable))
+				return
+			}
 
-		return handle_res(res)
+			v, err := desc.method.Handler(desc.impl, ctx, dec, s.unary_int)
+			if err != nil {
+				fill_err(err)
+				return
+			}
+
+			payload, err := proto.Marshal(v.(proto.Message))
+			if err != nil {
+				fill_err(err)
+				return
+			}
+
+			res.SetPayload(payload)
+			res.SetCode(uint32(codes.OK))
+		})
+		return nil
 	}
 
-	stream, ok := s.getStream(sid)
+	stream, ok := s.getStream(sid, desc)
 	if !ok {
+		if s.drain.Load() {
+			res.SetCode(uint32(codes.Unavailable))
+			s.tx.Handle(ctx, res)
+			return nil
+		}
 		s.wg.Go(func() {
-			desc.stream.Handler(desc.impl, stream)
+			defer stream.Close()
+			defer s.tx.Handle(ctx, res)
+			if s.drain.Load() {
+				res.SetCode(uint32(codes.Unavailable))
+				return
+			}
+
+			if err := desc.stream.Handler(desc.impl, stream); err != nil {
+				fill_err(err)
+				return
+			}
+
+			res.SetCode(uint32(codes.OK))
 		})
 	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case stream.rx <- req:
-	}
 
+	stream.put(ctx, req)
 	return nil
 }
 
-func (s *Server) getStream(sid uint32) (*serverStream, bool) {
+func (s *Server) getStream(sid uint32, desc *serviceDesc) (*serverStream, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	stream, ok := s.ss[sid]
 	if !ok {
-		stream = newServerStream(context.Background(), s, sid)
+		stream = newServerStream(context.Background(), s, sid, desc)
 		s.ss[sid] = stream
 	}
 
 	return stream, ok
+}
+
+// GracefulStop stops the dRPC server gracefully.
+// It makes future call of Handle return an error and waits for existing calls to finish.
+func (s *Server) GracefulStop() {
+	s.drain.Store(true)
+	s.wg.Wait()
+	s.closed.Store(true)
+}
+
+func (s *Server) Stop() {
+
 }
 
 type serviceDesc struct {
