@@ -24,7 +24,8 @@ type Server struct {
 	methods  []*serviceDesc
 	services map[string]*serviceDesc
 
-	unary_int grpc.UnaryServerInterceptor
+	unary_int  grpc.UnaryServerInterceptor
+	stream_int grpc.StreamServerInterceptor
 
 	wg     sync.WaitGroup
 	drain  atomic.Bool
@@ -50,7 +51,13 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 		opt.unary_ints = append([]grpc.UnaryServerInterceptor{opt.unary_int}, opt.unary_ints...)
 	}
 	if opt.unary_ints != nil {
-		v.unary_int = chainUnaryInterceptors(opt.unary_ints)
+		v.unary_int = chainUnaryServerInterceptors(opt.unary_ints)
+	}
+	if opt.stream_int != nil {
+		opt.stream_ints = append([]grpc.StreamServerInterceptor{opt.stream_int}, opt.stream_ints...)
+	}
+	if opt.stream_ints != nil {
+		v.stream_int = chainStreamServerInterceptors(opt.stream_ints)
 	}
 
 	return v
@@ -173,9 +180,19 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 				return
 			}
 
-			if err := desc.stream.Handler(desc.impl, stream); err != nil {
+			var err error
+			if s.stream_int != nil {
+				info := grpc.StreamServerInfo{
+					FullMethod:     desc.fullname,
+					IsClientStream: desc.stream.ClientStreams,
+					IsServerStream: desc.stream.ServerStreams,
+				}
+				err = s.stream_int(desc.impl, stream, &info, desc.stream.Handler)
+			} else {
+				err = desc.stream.Handler(desc.impl, stream)
+			}
+			if err != nil {
 				fill_err(err)
-				return
 			}
 
 			res.SetCode(uint32(codes.OK))
@@ -227,8 +244,10 @@ type ServerOption interface {
 }
 
 type serverOption struct {
-	unary_int  grpc.UnaryServerInterceptor
-	unary_ints []grpc.UnaryServerInterceptor
+	unary_int   grpc.UnaryServerInterceptor
+	unary_ints  []grpc.UnaryServerInterceptor
+	stream_int  grpc.StreamServerInterceptor
+	stream_ints []grpc.StreamServerInterceptor
 }
 
 type serverOptionFunc func(*serverOption)
@@ -252,17 +271,48 @@ func ChainUnaryInterceptors(is ...grpc.UnaryServerInterceptor) ServerOption {
 	})
 }
 
-func chainUnaryInterceptors(is []grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor {
+func chainUnaryServerInterceptors(is []grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		return is[0](ctx, req, info, getChainUnaryHandler(is, 0, info, handler))
 	}
 }
 
-func getChainUnaryHandler(is []grpc.UnaryServerInterceptor, curr int, info *grpc.UnaryServerInfo, finalHandler grpc.UnaryHandler) grpc.UnaryHandler {
+func getChainUnaryHandler(is []grpc.UnaryServerInterceptor, curr int, info *grpc.UnaryServerInfo, last grpc.UnaryHandler) grpc.UnaryHandler {
 	if curr == len(is)-1 {
-		return finalHandler
+		return last
 	}
 	return func(ctx context.Context, req any) (any, error) {
-		return is[curr+1](ctx, req, info, getChainUnaryHandler(is, curr+1, info, finalHandler))
+		return is[curr+1](ctx, req, info, getChainUnaryHandler(is, curr+1, info, last))
+	}
+}
+
+func StreamInterceptor(i grpc.StreamServerInterceptor) ServerOption {
+	return serverOptionFunc(func(o *serverOption) {
+		if o.stream_int != nil {
+			panic("The stream server interceptor was already set and may not be reset.")
+		}
+		o.stream_int = i
+	})
+
+}
+
+func ChainStreamInterceptors(is ...grpc.StreamServerInterceptor) ServerOption {
+	return serverOptionFunc(func(o *serverOption) {
+		o.stream_ints = append(o.stream_ints, is...)
+	})
+}
+
+func chainStreamServerInterceptors(is []grpc.StreamServerInterceptor) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		return is[0](srv, ss, info, getChainStreamHandler(is, 0, info, handler))
+	}
+}
+
+func getChainStreamHandler(is []grpc.StreamServerInterceptor, curr int, info *grpc.StreamServerInfo, last grpc.StreamHandler) grpc.StreamHandler {
+	if curr == len(is)-1 {
+		return last
+	}
+	return func(srv any, stream grpc.ServerStream) error {
+		return is[curr+1](srv, stream, info, getChainStreamHandler(is, curr+1, info, last))
 	}
 }

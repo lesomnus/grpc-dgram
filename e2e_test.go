@@ -2,6 +2,7 @@ package drpc_test
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -15,6 +16,7 @@ import (
 
 type PipeOption struct {
 	ServerOpts []drpc.ServerOption
+	ConnOpts   []drpc.ConnOption
 }
 
 func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
@@ -32,7 +34,7 @@ func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
 		t.Logf("client->server %d:%d", f.GetSid(), f.GetSeq())
 		cb <- f
 		return nil
-	}))
+	}), o.ConnOpts...)
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -97,8 +99,8 @@ func TestE2E(t *testing.T) {
 	t.Run("Unary unknown service", func(t *testing.T) {
 		ctx := t.Context()
 
-		_, conn, cancel := PipeOption{}.Build(t)
-		defer cancel()
+		_, conn, stop := PipeOption{}.Build(t)
+		defer stop()
 
 		client := echo.NewEchoServiceClient(conn)
 		_, err := client.Once(ctx, &echo.EchoRequest{})
@@ -111,21 +113,33 @@ func TestE2E(t *testing.T) {
 		ctx := t.Context()
 
 		msgs := []string{}
-		client, cancel := PipeOption{
+		client, stop := PipeOption{
 			ServerOpts: []drpc.ServerOption{
 				drpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
-					msgs = append(msgs, req.(*echo.EchoRequest).GetMessage())
+					msgs = append(msgs, fmt.Sprintf("[S] %s", req.(*echo.EchoRequest).GetMessage()))
 					res, err := handler(ctx, req)
 					if err != nil {
 						return nil, err
 					}
 
-					msgs = append(msgs, res.(*echo.EchoResponse).GetMessage())
+					msgs = append(msgs, fmt.Sprintf("[S] %s", res.(*echo.EchoResponse).GetMessage()))
 					return res, nil
 				}),
 			},
+			ConnOpts: []drpc.ConnOption{
+				drpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+					msgs = append(msgs, fmt.Sprintf("[C] %s", req.(*echo.EchoRequest).GetMessage()))
+					err := invoker(ctx, method, req, reply, cc, opts...)
+					if err != nil {
+						return err
+					}
+
+					msgs = append(msgs, fmt.Sprintf("[C] %s", reply.(*echo.EchoResponse).GetMessage()))
+					return nil
+				}),
+			},
 		}.Use(t)
-		defer cancel()
+		defer stop()
 
 		_, err := client.Once(ctx, echo.EchoRequest_builder{
 			Message:       "Royale with Cheese",
@@ -140,10 +154,14 @@ func TestE2E(t *testing.T) {
 		x.NoError(t, err)
 
 		x.Equal(t, []string{
-			"Royale with Cheese",
-			"ale with CheeseRoy",
-			"Le Big Mac",
-			"Big MacLe ",
+			"[C] Royale with Cheese",
+			"[S] Royale with Cheese",
+			"[S] ale with CheeseRoy",
+			"[C] ale with CheeseRoy",
+			"[C] Le Big Mac",
+			"[S] Le Big Mac",
+			"[S] Big MacLe ",
+			"[C] Big MacLe ",
 		}, msgs)
 	})
 	t.Run("Server Streaming", func(t *testing.T) {
@@ -245,5 +263,54 @@ func TestE2E(t *testing.T) {
 		x.NoError(t, err)
 		x.Equal(t, "rba", res.GetMessage())
 		x.Equal(t, 2, res.GetSequence())
+	})
+	t.Run("Stream interceptor", func(t *testing.T) {
+		ctx := t.Context()
+
+		msgs := []string{}
+		client, stop := PipeOption{
+			ServerOpts: []drpc.ServerOption{
+				drpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+					msgs = append(msgs, fmt.Sprintf("[S:I] %s", info.FullMethod))
+					err := handler(srv, ss)
+					msgs = append(msgs, fmt.Sprintf("[S:O] %s", info.FullMethod))
+					return err
+				}),
+			},
+		}.Use(t)
+		defer stop()
+
+		stream, err := client.Live(ctx)
+		x.NoError(t, err)
+		defer stream.CloseSend()
+
+		err = stream.Send(echo.EchoRequest_builder{
+			Message:       "bar",
+			CircularShift: 1,
+		}.Build())
+		x.NoError(t, err)
+
+		_, err = stream.Recv()
+		x.NoError(t, err)
+
+		err = stream.Send(echo.EchoRequest_builder{
+			Message:       "bar",
+			Repeat:        2,
+			CircularShift: 1,
+		}.Build())
+		x.NoError(t, err)
+
+		_, err = stream.Recv()
+		x.NoError(t, err)
+
+		_, err = stream.Recv()
+		x.NoError(t, err)
+		stream.CloseSend()
+		stop()
+
+		x.Equal(t, []string{
+			"[S:I] /echo.EchoService/Live",
+			"[S:O] /echo.EchoService/Live",
+		}, msgs)
 	})
 }
