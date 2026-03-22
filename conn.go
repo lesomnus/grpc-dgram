@@ -30,7 +30,8 @@ type Conn struct {
 	timeout time.Duration
 	codec   encoding.CodecV2
 
-	unary_int grpc.UnaryClientInterceptor
+	unary_int  grpc.UnaryClientInterceptor
+	stream_int grpc.StreamClientInterceptor
 }
 
 func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
@@ -53,6 +54,16 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 	} else {
 		v.unary_int = func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+	}
+	if opt.stream_int != nil {
+		opt.stream_ints = append([]grpc.StreamClientInterceptor{opt.stream_int}, opt.stream_ints...)
+	}
+	if opt.stream_ints != nil {
+		v.stream_int = chainStreamClientInterceptors(opt.stream_ints)
+	} else {
+		v.stream_int = func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			return streamer(ctx, desc, cc, method, opts...)
 		}
 	}
 
@@ -112,7 +123,13 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 
 func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 	stream := c.newStream(ctx, method)
-	return stream, nil
+	if c.stream_int == nil {
+		return stream, nil
+	}
+
+	return c.stream_int(ctx, desc, nil, method, func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		return stream, nil
+	}, opts...)
 }
 
 func (c *Conn) newStream(ctx context.Context, method string) *clientStream {
@@ -135,8 +152,10 @@ func (c *Conn) newStream(ctx context.Context, method string) *clientStream {
 }
 
 type connOption struct {
-	unary_int  grpc.UnaryClientInterceptor
-	unary_ints []grpc.UnaryClientInterceptor
+	unary_int   grpc.UnaryClientInterceptor
+	unary_ints  []grpc.UnaryClientInterceptor
+	stream_int  grpc.StreamClientInterceptor
+	stream_ints []grpc.StreamClientInterceptor
 }
 
 type ConnOption interface {
@@ -160,7 +179,7 @@ func WithUnaryInterceptor(i grpc.UnaryClientInterceptor) ConnOption {
 
 func WithChainUnaryInterceptor(is ...grpc.UnaryClientInterceptor) ConnOption {
 	return connOptionFunc(func(o *connOption) {
-		o.unary_ints = is
+		o.unary_ints = append(o.unary_ints, is...)
 	})
 }
 
@@ -176,5 +195,32 @@ func getChainUnaryInvoker(is []grpc.UnaryClientInterceptor, curr int, last grpc.
 	}
 	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
 		return is[curr+1](ctx, method, req, reply, cc, getChainUnaryInvoker(is, curr+1, last), opts...)
+	}
+}
+
+func WithStreamInterceptor(i grpc.StreamClientInterceptor) ConnOption {
+	return connOptionFunc(func(o *connOption) {
+		o.stream_int = i
+	})
+}
+
+func WithChainStreamInterceptor(is ...grpc.StreamClientInterceptor) ConnOption {
+	return connOptionFunc(func(o *connOption) {
+		o.stream_ints = append(o.stream_ints, is...)
+	})
+}
+
+func chainStreamClientInterceptors(is []grpc.StreamClientInterceptor) grpc.StreamClientInterceptor {
+	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		return is[0](ctx, desc, cc, method, getChainStreamer(is, 0, streamer), opts...)
+	}
+}
+
+func getChainStreamer(is []grpc.StreamClientInterceptor, curr int, last grpc.Streamer) grpc.Streamer {
+	if curr == len(is)-1 {
+		return last
+	}
+	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		return is[curr+1](ctx, desc, cc, method, getChainStreamer(is, curr+1, last), opts...)
 	}
 }

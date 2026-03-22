@@ -277,6 +277,18 @@ func TestE2E(t *testing.T) {
 					return err
 				}),
 			},
+			ConnOpts: []drpc.ConnOption{
+				drpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+					msgs = append(msgs, fmt.Sprintf("[C:I] %s", method))
+					stream, err := streamer(ctx, desc, cc, method, opts...)
+					if err != nil {
+						return nil, err
+					}
+
+					msgs = append(msgs, fmt.Sprintf("[C:O] %s", method))
+					return stream, nil
+				}),
+			},
 		}.Use(t)
 		defer stop()
 
@@ -309,6 +321,8 @@ func TestE2E(t *testing.T) {
 		stop()
 
 		x.Equal(t, []string{
+			"[C:I] /echo.EchoService/Live",
+			"[C:O] /echo.EchoService/Live",
 			"[S:I] /echo.EchoService/Live",
 			"[S:O] /echo.EchoService/Live",
 		}, msgs)
