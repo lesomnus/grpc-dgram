@@ -101,9 +101,8 @@ func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
 func (s *Server) Handle(ctx context.Context, req *Frame) error {
 	sid := req.GetSid()
 	res := Frame_builder{
-		Sid:  sid,
-		Seq:  1,
-		Code: uint32(codes.Unimplemented),
+		Sid: sid,
+		Seq: 1,
 	}.Build()
 	if s.closed.Load() {
 		res.SetCode(uint32(codes.Unavailable))
@@ -115,9 +114,11 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 	if i := int(req.GetMethodIndex()); i == 0 {
 		desc = s.services[req.GetMethod()]
 		if desc == nil {
+			res.SetCode(uint32(codes.Unimplemented))
 			return s.tx.Handle(ctx, res)
 		}
 	} else if len(s.methods) <= i {
+		res.SetCode(uint32(codes.Unimplemented))
 		return s.tx.Handle(ctx, res)
 	} else {
 		desc = s.methods[i]
@@ -147,7 +148,13 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 				return
 			}
 
+			transport := serverTransportUnary{}
+			ctx = grpc.NewContextWithServerTransportStream(ctx, &transport)
+			ctx = mdIn(ctx, req)
+
 			v, err := desc.method.Handler(desc.impl, ctx, dec, s.unary_int)
+			res.SetHeader(newMd(transport.header))
+			res.SetTrailer(newMd(transport.trailer))
 			if err != nil {
 				fill_err(err)
 				return
@@ -172,6 +179,10 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 			s.tx.Handle(ctx, res)
 			return nil
 		}
+
+		stream.ctx = grpc.NewContextWithServerTransportStream(stream.ctx, serverTransportStream{stream})
+		stream.ctx = mdIn(stream.ctx, req)
+
 		s.wg.Go(func() {
 			defer stream.Close()
 			defer s.tx.Handle(ctx, res)
@@ -191,8 +202,13 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 			} else {
 				err = desc.stream.Handler(desc.impl, stream)
 			}
+
+			res.SetSeq(stream.tx_seq.next())
+			res.SetHeader(newMd(stream.header))
+			res.SetTrailer(newMd(stream.trailer))
 			if err != nil {
 				fill_err(err)
+				return
 			}
 
 			res.SetCode(uint32(codes.OK))

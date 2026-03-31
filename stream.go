@@ -14,32 +14,61 @@ import (
 var (
 	_ grpc.ServerStream = &serverStream{}
 	_ grpc.ClientStream = &clientStream{}
+
+	_ grpc.ServerTransportStream = &serverTransportUnary{}
+	_ grpc.ServerTransportStream = &serverTransportStream{}
 )
 
+type serverTransportUnary struct {
+	method  string
+	header  metadata.MD
+	trailer metadata.MD
+}
+
+func (t *serverTransportUnary) Method() string {
+	return t.method
+}
+func (t *serverTransportUnary) SetHeader(md metadata.MD) error {
+	t.header = md
+	return nil
+}
+func (t *serverTransportUnary) SendHeader(md metadata.MD) error {
+	t.header = md
+	return nil
+}
+func (t *serverTransportUnary) SetTrailer(md metadata.MD) error {
+	t.trailer = md
+	return nil
+}
+
+type serverTransportStream struct {
+	*serverStream
+}
+
+func (t serverTransportStream) Method() string {
+	return t.serverStream.method
+}
+
+func (t serverTransportStream) SetTrailer(md metadata.MD) error {
+	t.serverStream.SetTrailer(md)
+	return nil
+}
+
 type serverStream struct {
-	server *Server
 	stream
+	server *Server
 }
 
 func newServerStream(ctx context.Context, server *Server, sid uint32, desc *serviceDesc) *serverStream {
 	return &serverStream{
-		server: server,
 		stream: newStream(ctx, server.tx, sid, desc.fullname, desc.index),
+		server: server,
 	}
-}
-
-func (s *serverStream) SetHeader(md metadata.MD) error {
-	// TODO:
-	return nil
 }
 
 func (s *serverStream) SendHeader(md metadata.MD) error {
 	// TODO:
 	return nil
-}
-
-func (s *serverStream) SetTrailer(md metadata.MD) {
-	// TODO:
 }
 
 func (s *serverStream) RecvMsg(m any) error {
@@ -74,8 +103,9 @@ func (s *serverStream) Close() error {
 }
 
 type clientStream struct {
-	conn *Conn
 	stream
+	conn *Conn
+	last *Frame
 }
 
 func newClientStream(ctx context.Context, conn *Conn, sid uint32, method string) *clientStream {
@@ -85,19 +115,9 @@ func newClientStream(ctx context.Context, conn *Conn, sid uint32, method string)
 	}
 
 	return &clientStream{
-		conn:   conn,
 		stream: newStream(ctx, conn.tx, sid, method, method_index),
+		conn:   conn,
 	}
-}
-
-func (s *clientStream) Header() (metadata.MD, error) {
-	// TODO:
-	return metadata.MD{}, nil
-}
-
-func (s *clientStream) Trailer() metadata.MD {
-	// TODO:
-	return metadata.MD{}
 }
 
 func (s *clientStream) CloseSend() error {
@@ -112,6 +132,7 @@ func (s *clientStream) RecvMsg(m any) error {
 		case <-s.ctx.Done():
 			return io.EOF
 		case v := <-s.rx:
+			s.last = v
 			if s.method_index == 0 {
 				i := v.GetMethodIndex()
 				s.method_index = i
@@ -122,6 +143,11 @@ func (s *clientStream) RecvMsg(m any) error {
 			}
 			if !s.rx_seq.checkAndSet(rx_seq(v.GetSeq())) {
 				continue
+			}
+
+			if v.HasCode() {
+				s.trailer = v.GetTrailer().MD()
+				s.cancel()
 			}
 
 			return v.unmarshal(m)
@@ -151,6 +177,9 @@ type stream struct {
 	tx_seq tx_seq
 	rx     chan *Frame
 	rx_seq rx_seq
+
+	header  metadata.MD
+	trailer metadata.MD
 }
 
 func newStream(ctx context.Context, tx FrameHandler, sid uint32, method string, method_index uint32) stream {
@@ -188,11 +217,16 @@ func (s *stream) SendMsg(m any) error {
 func (s *stream) nextFrame() *Frame {
 	f := &Frame{}
 	f.SetSid(s.sid)
-	f.SetSeq(s.tx_seq.next())
+	f.SetSeq(s.tx_seq.next()) // seq starts with 1.
 	if s.method_index == 0 {
 		f.SetMethod(s.method)
 	} else {
 		f.SetMethodIndex(s.method_index)
+	}
+
+	if s.header != nil {
+		f.SetHeader(newMd(s.header))
+		s.header = nil
 	}
 
 	return f
@@ -207,4 +241,21 @@ func (s *stream) put(ctx context.Context, f *Frame) error {
 	case s.rx <- f:
 		return nil
 	}
+}
+
+func (s *stream) SetHeader(md metadata.MD) error {
+	s.header = md
+	return nil
+}
+
+func (s *stream) Header() (metadata.MD, error) {
+	return s.header, nil
+}
+
+func (s *stream) SetTrailer(md metadata.MD) {
+	s.trailer = md
+}
+
+func (s *stream) Trailer() metadata.MD {
+	return s.trailer
 }

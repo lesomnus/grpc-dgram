@@ -11,6 +11,7 @@ import (
 	"github.com/lesomnu/grpc-dgram/internal/x"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -73,11 +74,19 @@ func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
 	}
 }
 
-func (o PipeOption) Use(t *testing.T) (echo.EchoServiceClient, func()) {
+func (o PipeOption) Use(t *testing.T) (*Client, func()) {
 	server, conn, cancel := o.Build(t)
 
-	echo.RegisterEchoServiceServer(server, echo.EchoServer{})
-	return echo.NewEchoServiceClient(conn), cancel
+	s := &echo.EchoServer{}
+	c := &Client{echo.NewEchoServiceClient(conn), s}
+	echo.RegisterEchoServiceServer(server, s)
+
+	return c, cancel
+}
+
+type Client struct {
+	echo.EchoServiceClient
+	server *echo.EchoServer
 }
 
 func TestE2E(t *testing.T) {
@@ -199,6 +208,7 @@ func TestE2E(t *testing.T) {
 
 		err = stream.Send(echo.EchoRequest_builder{
 			Message:       "bar",
+			Repeat:        1,
 			CircularShift: 1,
 		}.Build())
 		x.NoError(t, err)
@@ -238,6 +248,7 @@ func TestE2E(t *testing.T) {
 
 		err = stream.Send(echo.EchoRequest_builder{
 			Message:       "bar",
+			Repeat:        1,
 			CircularShift: 1,
 		}.Build())
 		x.NoError(t, err)
@@ -298,6 +309,7 @@ func TestE2E(t *testing.T) {
 
 		err = stream.Send(echo.EchoRequest_builder{
 			Message:       "bar",
+			Repeat:        1,
 			CircularShift: 1,
 		}.Build())
 		x.NoError(t, err)
@@ -326,5 +338,86 @@ func TestE2E(t *testing.T) {
 			"[S:I] /echo.EchoService/Live",
 			"[S:O] /echo.EchoService/Live",
 		}, msgs)
+	})
+
+	t.Run("metadata", func(t *testing.T) {
+		t.Run("Unary", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			md := metadata.Pairs("foo", "bar")
+			ctx = metadata.NewOutgoingContext(ctx, md)
+
+			header := metadata.MD{}
+			trailer := metadata.MD{}
+
+			_, err := client.Once(ctx, &echo.EchoRequest{},
+				grpc.Header(&header),
+				grpc.Trailer(&trailer),
+			)
+			x.NoError(t, err)
+			x.Equal(t, md, client.server.MD)
+			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "header"), header)
+			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "trailer"), trailer)
+		})
+		t.Run("Server streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			md := metadata.Pairs("foo", "bar")
+			ctx = metadata.NewOutgoingContext(ctx, md)
+
+			stream, err := client.Many(ctx, &echo.EchoRequest{})
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
+			x.NoError(t, err)
+			x.Equal(t, md, client.server.MD)
+
+			trailer := stream.Trailer()
+			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "trailer"), trailer)
+		})
+		t.Run("Client streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			md := metadata.Pairs("foo", "bar")
+			ctx = metadata.NewOutgoingContext(ctx, md)
+
+			stream, err := client.Buff(ctx)
+			x.NoError(t, err)
+
+			_, err = stream.CloseAndRecv()
+			x.NoError(t, err)
+			x.Equal(t, md, client.server.MD)
+		})
+		t.Run("Bidi streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			md := metadata.Pairs("foo", "bar")
+			ctx = metadata.NewOutgoingContext(ctx, md)
+
+			stream, err := client.Live(ctx)
+			x.NoError(t, err)
+
+			err = stream.CloseSend()
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
+			x.NoError(t, err)
+			x.Equal(t, md, client.server.MD)
+
+			trailer := stream.Trailer()
+			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "trailer"), trailer)
+		})
 	})
 }

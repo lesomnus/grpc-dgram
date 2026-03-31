@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -23,20 +24,12 @@ func (x *EchoRequest) Error() error {
 
 type EchoServer struct {
 	UnimplementedEchoServiceServer
+	MD         metadata.MD
+	LazyHeader bool
 }
 
-func (EchoServer) Once(ctx context.Context, req *EchoRequest) (*EchoResponse, error) {
-	if md, has_md := metadata.FromIncomingContext(ctx); has_md {
-		md := md.Copy()
-		md.Set("timing", "header")
-		if err := grpc.SendHeader(ctx, md); err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to send header: %v", err)
-		}
-		md.Set("timing", "trailer")
-		if err := grpc.SetTrailer(ctx, md); err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to set trailer: %v", err)
-		}
-	}
+func (s *EchoServer) Once(ctx context.Context, req *EchoRequest) (*EchoResponse, error) {
+	s.handleMd(ctx)
 
 	if err := req.Error(); err != nil {
 		return nil, err
@@ -55,16 +48,13 @@ func (EchoServer) Once(ctx context.Context, req *EchoRequest) (*EchoResponse, er
 	}.Build(), nil
 }
 
-func (EchoServer) many(seq *uint32, req *EchoRequest, h func(res *EchoResponse) error) error {
+func (s *EchoServer) many(seq *uint32, req *EchoRequest, h func(res *EchoResponse) error) error {
 	if err := req.Error(); err != nil {
 		return err
 	}
 
 	v := req.GetMessage()
 	n := req.GetRepeat()
-	if n == 0 {
-		n = 1
-	}
 	for range n {
 		v = CircularShift(v, int(req.GetCircularShift()))
 		if err := h(EchoResponse_builder{
@@ -80,17 +70,23 @@ func (EchoServer) many(seq *uint32, req *EchoRequest, h func(res *EchoResponse) 
 	return nil
 }
 
-func (s EchoServer) Many(req *EchoRequest, stream grpc.ServerStreamingServer[EchoResponse]) error {
+func (s *EchoServer) Many(req *EchoRequest, stream grpc.ServerStreamingServer[EchoResponse]) error {
+	ctx := stream.Context()
+	s.handleMd(ctx)
+
 	if req.GetOverVoid() {
-		<-stream.Context().Done()
-		return stream.Context().Err()
+		<-ctx.Done()
+		return ctx.Err()
 	}
 
 	seq := uint32(0)
 	return s.many(&seq, req, stream.Send)
 }
 
-func (s EchoServer) Buff(stream grpc.ClientStreamingServer[EchoRequest, EchoBatchResponse]) error {
+func (s *EchoServer) Buff(stream grpc.ClientStreamingServer[EchoRequest, EchoBatchResponse]) error {
+	ctx := stream.Context()
+	s.handleMd(ctx)
+
 	items := []*EchoResponse{}
 
 	seq := uint32(0)
@@ -115,17 +111,9 @@ func (s EchoServer) Buff(stream grpc.ClientStreamingServer[EchoRequest, EchoBatc
 	}.Build())
 }
 
-func (s EchoServer) Live(stream grpc.BidiStreamingServer[EchoRequest, EchoResponse]) error {
+func (s *EchoServer) Live(stream grpc.BidiStreamingServer[EchoRequest, EchoResponse]) error {
 	ctx := stream.Context()
-	if md, has_md := metadata.FromIncomingContext(ctx); has_md {
-		md := md.Copy()
-		md.Set("timing", "header")
-		if err := stream.SendHeader(md); err != nil {
-			return status.Errorf(codes.Internal, "failed to send header: %v", err)
-		}
-		md.Set("timing", "trailer")
-		stream.SetTrailer(md)
-	}
+	s.handleMd(ctx)
 
 	seq := uint32(0)
 	for {
@@ -140,6 +128,32 @@ func (s EchoServer) Live(stream grpc.BidiStreamingServer[EchoRequest, EchoRespon
 			return err
 		}
 	}
+}
+
+func (s *EchoServer) handleMd(ctx context.Context) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return
+	}
+
+	s.MD = md
+
+	stream := grpc.ServerTransportStreamFromContext(ctx)
+	if stream == nil {
+		return
+	}
+
+	header := maps.Clone(md)
+	header.Set("timing", "header")
+	if s.LazyHeader {
+		stream.SetHeader(header)
+	} else {
+		stream.SendHeader(header)
+	}
+
+	trailer := maps.Clone(md)
+	trailer.Set("timing", "trailer")
+	stream.SetTrailer(trailer)
 }
 
 func CircularShift(s string, n int) string {

@@ -32,8 +32,9 @@ message Frame {
 
   // Status code and error description.
   // See https://grpc.io/docs/guides/status-codes/.
-  uint32 code = 9;
+  uint32 code = 9 [features.field_presence = EXPLICIT];
   string desc = 10;
 
-  Metadata metadata = 11;
+  Metadata header = 11;
+  Metadata trailer = 12;
 }

@@ -31,7 +31,10 @@ type Frame struct {
 	xxx_hidden_Payload     []byte                 `protobuf:"bytes,8,opt,name=payload"`
 	xxx_hidden_Code        uint32                 `protobuf:"varint,9,opt,name=code"`
 	xxx_hidden_Desc        string                 `protobuf:"bytes,10,opt,name=desc"`
-	xxx_hidden_Metadata    *Metadata              `protobuf:"bytes,11,opt,name=metadata"`
+	xxx_hidden_Header      *Metadata              `protobuf:"bytes,11,opt,name=header"`
+	xxx_hidden_Trailer     *Metadata              `protobuf:"bytes,12,opt,name=trailer"`
+	XXX_raceDetectHookData protoimpl.RaceDetectHookData
+	XXX_presence           [1]uint32
 	unknownFields          protoimpl.UnknownFields
 	sizeCache              protoimpl.SizeCache
 }
@@ -117,9 +120,16 @@ func (x *Frame) GetDesc() string {
 	return ""
 }
 
-func (x *Frame) GetMetadata() *Metadata {
+func (x *Frame) GetHeader() *Metadata {
 	if x != nil {
-		return x.xxx_hidden_Metadata
+		return x.xxx_hidden_Header
+	}
+	return nil
+}
+
+func (x *Frame) GetTrailer() *Metadata {
+	if x != nil {
+		return x.xxx_hidden_Trailer
 	}
 	return nil
 }
@@ -153,14 +163,19 @@ func (x *Frame) SetPayload(v []byte) {
 
 func (x *Frame) SetCode(v uint32) {
 	x.xxx_hidden_Code = v
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 6, 10)
 }
 
 func (x *Frame) SetDesc(v string) {
 	x.xxx_hidden_Desc = v
 }
 
-func (x *Frame) SetMetadata(v *Metadata) {
-	x.xxx_hidden_Metadata = v
+func (x *Frame) SetHeader(v *Metadata) {
+	x.xxx_hidden_Header = v
+}
+
+func (x *Frame) SetTrailer(v *Metadata) {
+	x.xxx_hidden_Trailer = v
 }
 
 func (x *Frame) HasDeadline() bool {
@@ -170,19 +185,42 @@ func (x *Frame) HasDeadline() bool {
 	return x.xxx_hidden_Deadline != nil
 }
 
-func (x *Frame) HasMetadata() bool {
+func (x *Frame) HasCode() bool {
 	if x == nil {
 		return false
 	}
-	return x.xxx_hidden_Metadata != nil
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 6)
+}
+
+func (x *Frame) HasHeader() bool {
+	if x == nil {
+		return false
+	}
+	return x.xxx_hidden_Header != nil
+}
+
+func (x *Frame) HasTrailer() bool {
+	if x == nil {
+		return false
+	}
+	return x.xxx_hidden_Trailer != nil
 }
 
 func (x *Frame) ClearDeadline() {
 	x.xxx_hidden_Deadline = nil
 }
 
-func (x *Frame) ClearMetadata() {
-	x.xxx_hidden_Metadata = nil
+func (x *Frame) ClearCode() {
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 6)
+	x.xxx_hidden_Code = 0
+}
+
+func (x *Frame) ClearHeader() {
+	x.xxx_hidden_Header = nil
+}
+
+func (x *Frame) ClearTrailer() {
+	x.xxx_hidden_Trailer = nil
 }
 
 type Frame_builder struct {
@@ -199,9 +237,10 @@ type Frame_builder struct {
 	Payload     []byte
 	// Status code and error description.
 	// See https://grpc.io/docs/guides/status-codes/.
-	Code     uint32
-	Desc     string
-	Metadata *Metadata
+	Code    *uint32
+	Desc    string
+	Header  *Metadata
+	Trailer *Metadata
 }
 
 func (b0 Frame_builder) Build() *Frame {
@@ -214,9 +253,13 @@ func (b0 Frame_builder) Build() *Frame {
 	x.xxx_hidden_MethodIndex = b.MethodIndex
 	x.xxx_hidden_Deadline = b.Deadline
 	x.xxx_hidden_Payload = b.Payload
-	x.xxx_hidden_Code = b.Code
+	if b.Code != nil {
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 6, 10)
+		x.xxx_hidden_Code = *b.Code
+	}
 	x.xxx_hidden_Desc = b.Desc
-	x.xxx_hidden_Metadata = b.Metadata
+	x.xxx_hidden_Header = b.Header
+	x.xxx_hidden_Trailer = b.Trailer
 	return m0
 }
 
@@ -224,18 +267,19 @@ var File_drpc_frame_proto protoreflect.FileDescriptor
 
 const file_drpc_frame_proto_rawDesc = "" +
 	"\n" +
-	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x8c\x02\n" +
+	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xb9\x02\n" +
 	"\x05Frame\x12\x10\n" +
 	"\x03sid\x18\x01 \x01(\aR\x03sid\x12\x10\n" +
 	"\x03seq\x18\x02 \x01(\aR\x03seq\x12\x16\n" +
 	"\x06method\x18\x04 \x01(\tR\x06method\x12!\n" +
 	"\fmethod_index\x18\x05 \x01(\rR\vmethodIndex\x126\n" +
 	"\bdeadline\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\bdeadline\x12\x18\n" +
-	"\apayload\x18\b \x01(\fR\apayload\x12\x12\n" +
-	"\x04code\x18\t \x01(\rR\x04code\x12\x12\n" +
+	"\apayload\x18\b \x01(\fR\apayload\x12\x19\n" +
+	"\x04code\x18\t \x01(\rB\x05\xaa\x01\x02\b\x01R\x04code\x12\x12\n" +
 	"\x04desc\x18\n" +
-	" \x01(\tR\x04desc\x12*\n" +
-	"\bmetadata\x18\v \x01(\v2\x0e.drpc.MetadataR\bmetadataB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
+	" \x01(\tR\x04desc\x12&\n" +
+	"\x06header\x18\v \x01(\v2\x0e.drpc.MetadataR\x06header\x12(\n" +
+	"\atrailer\x18\f \x01(\v2\x0e.drpc.MetadataR\atrailerB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
 
 var file_drpc_frame_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_drpc_frame_proto_goTypes = []any{
@@ -245,12 +289,13 @@ var file_drpc_frame_proto_goTypes = []any{
 }
 var file_drpc_frame_proto_depIdxs = []int32{
 	1, // 0: drpc.Frame.deadline:type_name -> google.protobuf.Timestamp
-	2, // 1: drpc.Frame.metadata:type_name -> drpc.Metadata
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	2, // 1: drpc.Frame.header:type_name -> drpc.Metadata
+	2, // 2: drpc.Frame.trailer:type_name -> drpc.Metadata
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_drpc_frame_proto_init() }

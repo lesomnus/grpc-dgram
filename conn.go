@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/metadata"
 )
 
 var _ grpc.ClientConnInterface = &Conn{}
@@ -86,11 +87,6 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 }
 
 func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...grpc.CallOption) error {
-	// // Metadata
-	// if md, ok := metadata.FromOutgoingContext(ctx); ok {
-	// 	req.SetMetadata(newMd(md))
-	// }
-
 	// // Deadline.
 	// if deadline, ok := ctx.Deadline(); ok {
 	// 	req.SetDeadline(timestamppb.New(deadline))
@@ -117,8 +113,17 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 			return err
 		}
 
+		for _, opt := range opts {
+			switch opt := opt.(type) {
+			case grpc.HeaderCallOption:
+				*opt.HeaderAddr = stream.last.GetHeader().MD()
+			case grpc.TrailerCallOption:
+				*opt.TrailerAddr = stream.last.GetTrailer().MD()
+			}
+		}
+
 		return nil
-	})
+	}, opts...)
 }
 
 func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
@@ -133,6 +138,8 @@ func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method stri
 }
 
 func (c *Conn) newStream(ctx context.Context, method string) *clientStream {
+	md, ok := metadata.FromOutgoingContext(ctx)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -146,6 +153,9 @@ func (c *Conn) newStream(ctx context.Context, method string) *clientStream {
 		}
 
 		sid = c.sid.Add(1)
+	}
+	if ok {
+		stream.header = md
 	}
 
 	return stream
