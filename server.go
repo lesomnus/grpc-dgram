@@ -180,12 +180,22 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 			return nil
 		}
 
+		tx := stream.tx
+		if !desc.stream.ServerStreams {
+			// In client-streaming RPC, SendMsg is called before the stream handler
+			// returns so keep it and send it with the trailer.
+			stream.tx = FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
+				res.SetPayload(f.GetPayload())
+				return nil
+			})
+		}
+
 		stream.ctx = grpc.NewContextWithServerTransportStream(stream.ctx, serverTransportStream{stream})
 		stream.ctx = mdIn(stream.ctx, req)
 
 		s.wg.Go(func() {
 			defer stream.Close()
-			defer s.tx.Handle(ctx, res)
+			defer tx.Handle(ctx, res)
 			if s.drain.Load() {
 				res.SetCode(uint32(codes.Unavailable))
 				return

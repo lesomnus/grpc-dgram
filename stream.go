@@ -3,6 +3,7 @@ package drpc
 import (
 	"context"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -60,10 +61,20 @@ type serverStream struct {
 }
 
 func newServerStream(ctx context.Context, server *Server, sid uint32, desc *serviceDesc) *serverStream {
-	return &serverStream{
-		stream: newStream(ctx, server.tx, sid, desc.fullname, desc.index),
+	s := &serverStream{
+		stream: stream{
+			sid: sid,
+
+			method:       desc.fullname,
+			method_index: desc.index,
+
+			tx: server.tx,
+			rx: make(chan *Frame, 10),
+		},
 		server: server,
 	}
+	s.ctx, s.cancel = context.WithCancel(ctx)
+	return s
 }
 
 func (s *serverStream) SendHeader(md metadata.MD) error {
@@ -98,8 +109,7 @@ func (s *serverStream) Close() error {
 	defer s.server.mu.Unlock()
 
 	delete(s.server.ss, s.sid)
-	s.cancel()
-	return nil
+	return s.close()
 }
 
 type clientStream struct {
@@ -114,10 +124,21 @@ func newClientStream(ctx context.Context, conn *Conn, sid uint32, method string)
 		method_index = v.(uint32)
 	}
 
-	return &clientStream{
-		stream: newStream(ctx, conn.tx, sid, method, method_index),
-		conn:   conn,
+	s := &clientStream{
+		stream: stream{
+			sid: sid,
+
+			method:       method,
+			method_index: method_index,
+
+			tx: conn.tx,
+			rx: make(chan *Frame, 10),
+		},
+		conn: conn,
 	}
+	s.ctx, s.cancel = context.WithCancel(ctx)
+
+	return s
 }
 
 func (s *clientStream) CloseSend() error {
@@ -146,8 +167,7 @@ func (s *clientStream) RecvMsg(m any) error {
 			}
 
 			if v.HasCode() {
-				s.trailer = v.GetTrailer().MD()
-				s.cancel()
+				s.close()
 			}
 
 			return v.unmarshal(m)
@@ -160,8 +180,7 @@ func (s *clientStream) Close() error {
 	defer s.conn.mu.Unlock()
 
 	delete(s.conn.ss, s.sid)
-	s.cancel()
-	return nil
+	return s.close()
 }
 
 type stream struct {
@@ -178,24 +197,13 @@ type stream struct {
 	rx     chan *Frame
 	rx_seq rx_seq
 
+	// Server may close the stream while client is sending.
+	// If the client noticed that, this value is set to true and
+	// the client should stop sending more frames.
+	tx_closed atomic.Bool
+
 	header  metadata.MD
 	trailer metadata.MD
-}
-
-func newStream(ctx context.Context, tx FrameHandler, sid uint32, method string, method_index uint32) stream {
-	s := stream{
-		sid: sid,
-
-		method:       method,
-		method_index: method_index,
-
-		tx: tx,
-		rx: make(chan *Frame, 10),
-	}
-
-	s.ctx, s.cancel = context.WithCancel(ctx)
-
-	return s
 }
 
 func (s *stream) Context() context.Context {
@@ -203,6 +211,12 @@ func (s *stream) Context() context.Context {
 }
 
 func (s *stream) SendMsg(m any) error {
+	if s.tx_closed.Load() {
+		// In the case of unary or server-streaming RPC, nil must be returned.
+		// However, in that case, shouldn’t SendMsg not be called more than once in the first place?
+		return io.EOF
+	}
+
 	// TODO: codec
 	payload, err := proto.Marshal(m.(proto.Message))
 	if err != nil {
@@ -258,4 +272,10 @@ func (s *stream) SetTrailer(md metadata.MD) {
 
 func (s *stream) Trailer() metadata.MD {
 	return s.trailer
+}
+
+func (s *stream) close() error {
+	s.tx_closed.Store(true)
+	s.cancel()
+	return nil
 }

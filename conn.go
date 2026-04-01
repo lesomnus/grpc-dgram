@@ -83,6 +83,16 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 		return io.EOF
 	}
 
+	if f.HasCode() {
+		// Stream should NOT be closed until the rx queue is empty.
+		s.tx_closed.Store(true)
+		s.trailer = f.GetTrailer().MD()
+	} else if s.tx_closed.Load() {
+		// Stream is being closed but there are still frames in the rx queue.
+		// Drop the extra frames.
+		return io.EOF
+	}
+
 	return s.put(ctx, f)
 }
 

@@ -24,12 +24,16 @@ func (x *EchoRequest) Error() error {
 
 type EchoServer struct {
 	UnimplementedEchoServiceServer
+	Err        error
 	MD         metadata.MD
 	LazyHeader bool
 }
 
 func (s *EchoServer) Once(ctx context.Context, req *EchoRequest) (*EchoResponse, error) {
 	s.handleMd(ctx)
+	if s.Err != nil {
+		return nil, s.Err
+	}
 
 	if err := req.Error(); err != nil {
 		return nil, err
@@ -73,6 +77,9 @@ func (s *EchoServer) many(seq *uint32, req *EchoRequest, h func(res *EchoRespons
 func (s *EchoServer) Many(req *EchoRequest, stream grpc.ServerStreamingServer[EchoResponse]) error {
 	ctx := stream.Context()
 	s.handleMd(ctx)
+	if s.Err != nil {
+		return s.Err
+	}
 
 	if req.GetOverVoid() {
 		<-ctx.Done()
@@ -98,6 +105,9 @@ func (s *EchoServer) Buff(stream grpc.ClientStreamingServer[EchoRequest, EchoBat
 			}
 			return err
 		}
+		if s.Err != nil {
+			return s.Err
+		}
 		if err := s.many(&seq, req, func(res *EchoResponse) error {
 			items = append(items, res)
 			return nil
@@ -106,9 +116,8 @@ func (s *EchoServer) Buff(stream grpc.ClientStreamingServer[EchoRequest, EchoBat
 		}
 	}
 
-	return stream.SendAndClose(EchoBatchResponse_builder{
-		Items: items,
-	}.Build())
+	res := EchoBatchResponse_builder{Items: items}.Build()
+	return stream.SendAndClose(res)
 }
 
 func (s *EchoServer) Live(stream grpc.BidiStreamingServer[EchoRequest, EchoResponse]) error {
@@ -123,6 +132,9 @@ func (s *EchoServer) Live(stream grpc.BidiStreamingServer[EchoRequest, EchoRespo
 				return nil
 			}
 			return err
+		}
+		if s.Err != nil {
+			return s.Err
 		}
 		if err := s.many(&seq, req, stream.Send); err != nil {
 			return err

@@ -3,8 +3,10 @@ package drpc_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"testing"
+	"time"
 
 	drpc "github.com/lesomnu/grpc-dgram"
 	"github.com/lesomnu/grpc-dgram/internal/echo"
@@ -92,18 +94,203 @@ type Client struct {
 func TestE2E(t *testing.T) {
 	pipe := PipeOption{}.Use
 
-	t.Run("Unary", func(t *testing.T) {
-		ctx := t.Context()
+	t.Run("call", func(t *testing.T) {
+		t.Run("Unary", func(t *testing.T) {
+			ctx := t.Context()
 
-		client, stop := pipe(t)
-		defer stop()
+			client, stop := pipe(t)
+			defer stop()
 
-		res, err := client.Once(ctx, echo.EchoRequest_builder{
-			Message:       "Royale with Cheese",
-			CircularShift: 3,
-		}.Build())
-		x.NoError(t, err)
-		x.Equal(t, "ale with CheeseRoy", res.GetMessage())
+			res, err := client.Once(ctx, echo.EchoRequest_builder{
+				Message:       "Royale with Cheese",
+				CircularShift: 3,
+			}.Build())
+			x.NoError(t, err)
+			x.Equal(t, "ale with CheeseRoy", res.GetMessage())
+		})
+		t.Run("Server Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			stream, err := client.Many(ctx, echo.EchoRequest_builder{
+				Message:       "bar",
+				CircularShift: 1,
+				Repeat:        2,
+			}.Build())
+			x.NoError(t, err)
+
+			res, err := stream.Recv()
+			x.NoError(t, err)
+			x.Equal(t, "arb", res.GetMessage())
+			x.Equal(t, 0, res.GetSequence())
+
+			res, err = stream.Recv()
+			x.NoError(t, err)
+			x.Equal(t, "rba", res.GetMessage())
+			x.Equal(t, 1, res.GetSequence())
+		})
+		t.Run("Client Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			stream, err := client.Buff(ctx)
+			x.NoError(t, err)
+			defer stream.CloseSend()
+
+			err = stream.Send(echo.EchoRequest_builder{
+				Message:       "bar",
+				Repeat:        1,
+				CircularShift: 1,
+			}.Build())
+			x.NoError(t, err)
+
+			err = stream.Send(echo.EchoRequest_builder{
+				Message:       "baz",
+				Repeat:        2,
+				CircularShift: 1,
+			}.Build())
+			x.NoError(t, err)
+
+			res, err := stream.CloseAndRecv()
+			x.NoError(t, err)
+			x.Equal(t, 3, len(res.GetItems()))
+
+			item := res.GetItems()[0]
+			x.Equal(t, "arb", item.GetMessage())
+			x.Equal(t, 0, item.GetSequence())
+
+			item = res.GetItems()[1]
+			x.Equal(t, "azb", item.GetMessage())
+			x.Equal(t, 1, item.GetSequence())
+
+			item = res.GetItems()[2]
+			x.Equal(t, "zba", item.GetMessage())
+			x.Equal(t, 2, item.GetSequence())
+		})
+		t.Run("Bidi Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			stream, err := client.Live(ctx)
+			x.NoError(t, err)
+			defer stream.CloseSend()
+
+			err = stream.Send(echo.EchoRequest_builder{
+				Message:       "bar",
+				Repeat:        1,
+				CircularShift: 1,
+			}.Build())
+			x.NoError(t, err)
+
+			res, err := stream.Recv()
+			x.NoError(t, err)
+			x.Equal(t, "arb", res.GetMessage())
+			x.Equal(t, 0, res.GetSequence())
+
+			err = stream.Send(echo.EchoRequest_builder{
+				Message:       "bar",
+				Repeat:        2,
+				CircularShift: 1,
+			}.Build())
+			x.NoError(t, err)
+
+			res, err = stream.Recv()
+			x.NoError(t, err)
+			x.Equal(t, "arb", res.GetMessage())
+			x.Equal(t, 1, res.GetSequence())
+
+			res, err = stream.Recv()
+			x.NoError(t, err)
+			x.Equal(t, "rba", res.GetMessage())
+			x.Equal(t, 2, res.GetSequence())
+		})
+	})
+	t.Run("server responded not ok", func(t *testing.T) {
+		st := status.New(codes.OutOfRange, "foo")
+
+		t.Run("Unary", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			client.server.Err = st.Err()
+			_, err := client.Once(ctx, &echo.EchoRequest{})
+			x.Error(t, err)
+
+			st_, ok := status.FromError(err)
+			x.True(t, ok)
+			x.Equal(t, st, st_)
+		})
+		t.Run("Server Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			client.server.Err = st.Err()
+			stream, err := client.Many(ctx, &echo.EchoRequest{})
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
+			x.Error(t, err)
+
+			st_, ok := status.FromError(err)
+			x.True(t, ok)
+			x.Equal(t, st, st_)
+		})
+		t.Run("Client Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			client.server.Err = st.Err()
+			stream, err := client.Buff(ctx)
+			x.NoError(t, err)
+
+			err = stream.Send(&echo.EchoRequest{})
+			x.NoError(t, err)
+
+			// Wait for the client to receive the error from the server.
+			time.Sleep(300 * time.Millisecond)
+
+			err = stream.Send(&echo.EchoRequest{})
+			x.ErrorIs(t, err, io.EOF)
+
+			_, err = stream.CloseAndRecv()
+			x.Error(t, err)
+
+			st_, ok := status.FromError(err)
+			x.True(t, ok)
+			x.Equal(t, st, st_)
+		})
+		t.Run("Bidi Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			client.server.Err = st.Err()
+			stream, err := client.Live(ctx)
+			x.NoError(t, err)
+
+			err = stream.Send(&echo.EchoRequest{})
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
+			x.Error(t, err)
+
+			st_, ok := status.FromError(err)
+			x.True(t, ok)
+			x.Equal(t, st, st_)
+		})
 	})
 	t.Run("Unary unknown service", func(t *testing.T) {
 		ctx := t.Context()
@@ -118,228 +305,127 @@ func TestE2E(t *testing.T) {
 		code := status.Code(err)
 		x.Equal(t, codes.Unimplemented, code)
 	})
-	t.Run("Unary interceptor", func(t *testing.T) {
-		ctx := t.Context()
+	t.Run("interceptor", func(t *testing.T) {
+		t.Run("Unary interceptor", func(t *testing.T) {
+			ctx := t.Context()
 
-		msgs := []string{}
-		client, stop := PipeOption{
-			ServerOpts: []drpc.ServerOption{
-				drpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
-					msgs = append(msgs, fmt.Sprintf("[S] %s", req.(*echo.EchoRequest).GetMessage()))
-					res, err := handler(ctx, req)
-					if err != nil {
-						return nil, err
-					}
+			msgs := []string{}
+			client, stop := PipeOption{
+				ServerOpts: []drpc.ServerOption{
+					drpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
+						msgs = append(msgs, fmt.Sprintf("[S] %s", req.(*echo.EchoRequest).GetMessage()))
+						res, err := handler(ctx, req)
+						if err != nil {
+							return nil, err
+						}
 
-					msgs = append(msgs, fmt.Sprintf("[S] %s", res.(*echo.EchoResponse).GetMessage()))
-					return res, nil
-				}),
-			},
-			ConnOpts: []drpc.ConnOption{
-				drpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-					msgs = append(msgs, fmt.Sprintf("[C] %s", req.(*echo.EchoRequest).GetMessage()))
-					err := invoker(ctx, method, req, reply, cc, opts...)
-					if err != nil {
+						msgs = append(msgs, fmt.Sprintf("[S] %s", res.(*echo.EchoResponse).GetMessage()))
+						return res, nil
+					}),
+				},
+				ConnOpts: []drpc.ConnOption{
+					drpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+						msgs = append(msgs, fmt.Sprintf("[C] %s", req.(*echo.EchoRequest).GetMessage()))
+						err := invoker(ctx, method, req, reply, cc, opts...)
+						if err != nil {
+							return err
+						}
+
+						msgs = append(msgs, fmt.Sprintf("[C] %s", reply.(*echo.EchoResponse).GetMessage()))
+						return nil
+					}),
+				},
+			}.Use(t)
+			defer stop()
+
+			_, err := client.Once(ctx, echo.EchoRequest_builder{
+				Message:       "Royale with Cheese",
+				CircularShift: 3,
+			}.Build())
+			x.NoError(t, err)
+
+			_, err = client.Once(ctx, echo.EchoRequest_builder{
+				Message:       "Le Big Mac",
+				CircularShift: 3,
+			}.Build())
+			x.NoError(t, err)
+
+			x.Equal(t, []string{
+				"[C] Royale with Cheese",
+				"[S] Royale with Cheese",
+				"[S] ale with CheeseRoy",
+				"[C] ale with CheeseRoy",
+				"[C] Le Big Mac",
+				"[S] Le Big Mac",
+				"[S] Big MacLe ",
+				"[C] Big MacLe ",
+			}, msgs)
+		})
+		t.Run("Stream interceptor", func(t *testing.T) {
+			ctx := t.Context()
+
+			msgs := []string{}
+			client, stop := PipeOption{
+				ServerOpts: []drpc.ServerOption{
+					drpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+						msgs = append(msgs, fmt.Sprintf("[S:I] %s", info.FullMethod))
+						err := handler(srv, ss)
+						msgs = append(msgs, fmt.Sprintf("[S:O] %s", info.FullMethod))
 						return err
-					}
+					}),
+				},
+				ConnOpts: []drpc.ConnOption{
+					drpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+						msgs = append(msgs, fmt.Sprintf("[C:I] %s", method))
+						stream, err := streamer(ctx, desc, cc, method, opts...)
+						if err != nil {
+							return nil, err
+						}
 
-					msgs = append(msgs, fmt.Sprintf("[C] %s", reply.(*echo.EchoResponse).GetMessage()))
-					return nil
-				}),
-			},
-		}.Use(t)
-		defer stop()
+						msgs = append(msgs, fmt.Sprintf("[C:O] %s", method))
+						return stream, nil
+					}),
+				},
+			}.Use(t)
+			defer stop()
 
-		_, err := client.Once(ctx, echo.EchoRequest_builder{
-			Message:       "Royale with Cheese",
-			CircularShift: 3,
-		}.Build())
-		x.NoError(t, err)
+			stream, err := client.Live(ctx)
+			x.NoError(t, err)
+			defer stream.CloseSend()
 
-		_, err = client.Once(ctx, echo.EchoRequest_builder{
-			Message:       "Le Big Mac",
-			CircularShift: 3,
-		}.Build())
-		x.NoError(t, err)
+			err = stream.Send(echo.EchoRequest_builder{
+				Message:       "bar",
+				Repeat:        1,
+				CircularShift: 1,
+			}.Build())
+			x.NoError(t, err)
 
-		x.Equal(t, []string{
-			"[C] Royale with Cheese",
-			"[S] Royale with Cheese",
-			"[S] ale with CheeseRoy",
-			"[C] ale with CheeseRoy",
-			"[C] Le Big Mac",
-			"[S] Le Big Mac",
-			"[S] Big MacLe ",
-			"[C] Big MacLe ",
-		}, msgs)
+			_, err = stream.Recv()
+			x.NoError(t, err)
+
+			err = stream.Send(echo.EchoRequest_builder{
+				Message:       "bar",
+				Repeat:        2,
+				CircularShift: 1,
+			}.Build())
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
+			x.NoError(t, err)
+			stream.CloseSend()
+			stop()
+
+			x.Equal(t, []string{
+				"[C:I] /echo.EchoService/Live",
+				"[C:O] /echo.EchoService/Live",
+				"[S:I] /echo.EchoService/Live",
+				"[S:O] /echo.EchoService/Live",
+			}, msgs)
+		})
 	})
-	t.Run("Server Streaming", func(t *testing.T) {
-		ctx := t.Context()
-
-		client, stop := pipe(t)
-		defer stop()
-
-		stream, err := client.Many(ctx, echo.EchoRequest_builder{
-			Message:       "bar",
-			CircularShift: 1,
-			Repeat:        2,
-		}.Build())
-		x.NoError(t, err)
-
-		res, err := stream.Recv()
-		x.NoError(t, err)
-		x.Equal(t, "arb", res.GetMessage())
-		x.Equal(t, 0, res.GetSequence())
-
-		res, err = stream.Recv()
-		x.NoError(t, err)
-		x.Equal(t, "rba", res.GetMessage())
-		x.Equal(t, 1, res.GetSequence())
-	})
-	t.Run("Client Streaming", func(t *testing.T) {
-		ctx := t.Context()
-
-		client, stop := pipe(t)
-		defer stop()
-
-		stream, err := client.Buff(ctx)
-		x.NoError(t, err)
-		defer stream.CloseSend()
-
-		err = stream.Send(echo.EchoRequest_builder{
-			Message:       "bar",
-			Repeat:        1,
-			CircularShift: 1,
-		}.Build())
-		x.NoError(t, err)
-
-		err = stream.Send(echo.EchoRequest_builder{
-			Message:       "baz",
-			Repeat:        2,
-			CircularShift: 1,
-		}.Build())
-		x.NoError(t, err)
-
-		res, err := stream.CloseAndRecv()
-		x.NoError(t, err)
-		x.Equal(t, 3, len(res.GetItems()))
-
-		item := res.GetItems()[0]
-		x.Equal(t, "arb", item.GetMessage())
-		x.Equal(t, 0, item.GetSequence())
-
-		item = res.GetItems()[1]
-		x.Equal(t, "azb", item.GetMessage())
-		x.Equal(t, 1, item.GetSequence())
-
-		item = res.GetItems()[2]
-		x.Equal(t, "zba", item.GetMessage())
-		x.Equal(t, 2, item.GetSequence())
-	})
-	t.Run("Bidi Streaming", func(t *testing.T) {
-		ctx := t.Context()
-
-		client, stop := pipe(t)
-		defer stop()
-
-		stream, err := client.Live(ctx)
-		x.NoError(t, err)
-		defer stream.CloseSend()
-
-		err = stream.Send(echo.EchoRequest_builder{
-			Message:       "bar",
-			Repeat:        1,
-			CircularShift: 1,
-		}.Build())
-		x.NoError(t, err)
-
-		res, err := stream.Recv()
-		x.NoError(t, err)
-		x.Equal(t, "arb", res.GetMessage())
-		x.Equal(t, 0, res.GetSequence())
-
-		err = stream.Send(echo.EchoRequest_builder{
-			Message:       "bar",
-			Repeat:        2,
-			CircularShift: 1,
-		}.Build())
-		x.NoError(t, err)
-
-		res, err = stream.Recv()
-		x.NoError(t, err)
-		x.Equal(t, "arb", res.GetMessage())
-		x.Equal(t, 1, res.GetSequence())
-
-		res, err = stream.Recv()
-		x.NoError(t, err)
-		x.Equal(t, "rba", res.GetMessage())
-		x.Equal(t, 2, res.GetSequence())
-	})
-	t.Run("Stream interceptor", func(t *testing.T) {
-		ctx := t.Context()
-
-		msgs := []string{}
-		client, stop := PipeOption{
-			ServerOpts: []drpc.ServerOption{
-				drpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-					msgs = append(msgs, fmt.Sprintf("[S:I] %s", info.FullMethod))
-					err := handler(srv, ss)
-					msgs = append(msgs, fmt.Sprintf("[S:O] %s", info.FullMethod))
-					return err
-				}),
-			},
-			ConnOpts: []drpc.ConnOption{
-				drpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-					msgs = append(msgs, fmt.Sprintf("[C:I] %s", method))
-					stream, err := streamer(ctx, desc, cc, method, opts...)
-					if err != nil {
-						return nil, err
-					}
-
-					msgs = append(msgs, fmt.Sprintf("[C:O] %s", method))
-					return stream, nil
-				}),
-			},
-		}.Use(t)
-		defer stop()
-
-		stream, err := client.Live(ctx)
-		x.NoError(t, err)
-		defer stream.CloseSend()
-
-		err = stream.Send(echo.EchoRequest_builder{
-			Message:       "bar",
-			Repeat:        1,
-			CircularShift: 1,
-		}.Build())
-		x.NoError(t, err)
-
-		_, err = stream.Recv()
-		x.NoError(t, err)
-
-		err = stream.Send(echo.EchoRequest_builder{
-			Message:       "bar",
-			Repeat:        2,
-			CircularShift: 1,
-		}.Build())
-		x.NoError(t, err)
-
-		_, err = stream.Recv()
-		x.NoError(t, err)
-
-		_, err = stream.Recv()
-		x.NoError(t, err)
-		stream.CloseSend()
-		stop()
-
-		x.Equal(t, []string{
-			"[C:I] /echo.EchoService/Live",
-			"[C:O] /echo.EchoService/Live",
-			"[S:I] /echo.EchoService/Live",
-			"[S:O] /echo.EchoService/Live",
-		}, msgs)
-	})
-
 	t.Run("metadata", func(t *testing.T) {
 		t.Run("Unary", func(t *testing.T) {
 			ctx := t.Context()
