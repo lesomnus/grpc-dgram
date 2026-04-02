@@ -153,8 +153,12 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 			ctx = mdIn(ctx, req)
 
 			v, err := desc.method.Handler(desc.impl, ctx, dec, s.unary_int)
-			res.SetHeader(newMd(transport.header))
-			res.SetTrailer(newMd(transport.trailer))
+			if transport.header != nil {
+				res.SetHeader(newMd(transport.header))
+			}
+			if transport.trailer != nil {
+				res.SetTrailer(newMd(transport.trailer))
+			}
 			if err != nil {
 				fill_err(err)
 				return
@@ -184,8 +188,11 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 		if !desc.stream.ServerStreams {
 			// In client-streaming RPC, SendMsg is called before the stream handler
 			// returns so keep it and send it with the trailer.
+			// TODO: It would be nice if we have some flag to send header immediately
+			// without waiting for the first SendMsg in this case.
 			stream.tx = FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
 				res.SetPayload(f.GetPayload())
+				res.SetHeader(f.GetHeader())
 				return nil
 			})
 		}
@@ -214,8 +221,12 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 			}
 
 			res.SetSeq(stream.tx_seq.next())
-			res.SetHeader(newMd(stream.header))
-			res.SetTrailer(newMd(stream.trailer))
+			if stream.header != nil {
+				res.SetHeader(newMd(stream.header))
+			}
+			if stream.trailer != nil {
+				res.SetTrailer(newMd(stream.trailer))
+			}
 			if err != nil {
 				fill_err(err)
 				return

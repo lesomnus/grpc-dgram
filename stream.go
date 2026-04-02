@@ -78,7 +78,9 @@ func newServerStream(ctx context.Context, server *Server, sid uint32, desc *serv
 }
 
 func (s *serverStream) SendHeader(md metadata.MD) error {
-	// TODO:
+	// Header is piggybacked to the first frame, so it is
+	// set to the stream and will be sent with the next frame.
+	s.header = md
 	return nil
 }
 
@@ -229,16 +231,18 @@ func (s *stream) SendMsg(m any) error {
 }
 
 func (s *stream) nextFrame() *Frame {
+	seq := s.tx_seq.next() // seq starts with 1.
+
 	f := &Frame{}
 	f.SetSid(s.sid)
-	f.SetSeq(s.tx_seq.next()) // seq starts with 1.
+	f.SetSeq(seq)
 	if s.method_index == 0 {
 		f.SetMethod(s.method)
 	} else {
 		f.SetMethodIndex(s.method_index)
 	}
 
-	if s.header != nil {
+	if seq == 1 && s.header != nil {
 		f.SetHeader(newMd(s.header))
 		s.header = nil
 	}

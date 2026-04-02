@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 type PipeOption struct {
@@ -25,9 +26,14 @@ type PipeOption struct {
 func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
 	ctx, cancel := context.WithCancel(t.Context())
 
+	const PrintBody = false
+
 	ca := make(chan *drpc.Frame, 10)
 	server := drpc.NewServer(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
 		t.Logf("server->client %d:%d", f.GetSid(), f.GetSeq())
+		if PrintBody {
+			fmt.Printf("%v\n", protojson.Format(f))
+		}
 		ca <- f
 		return nil
 	}), o.ServerOpts...)
@@ -35,6 +41,9 @@ func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
 	cb := make(chan *drpc.Frame, 10)
 	conn := drpc.NewConn(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
 		t.Logf("client->server %d:%d", f.GetSid(), f.GetSeq())
+		if PrintBody {
+			fmt.Printf("%v\n", protojson.Format(f))
+		}
 		cb <- f
 		return nil
 	}), o.ConnOpts...)
@@ -292,18 +301,80 @@ func TestE2E(t *testing.T) {
 			x.Equal(t, st, st_)
 		})
 	})
-	t.Run("Unary unknown service", func(t *testing.T) {
-		ctx := t.Context()
+	t.Run("unknown service", func(t *testing.T) {
+		t.Run("Unary", func(t *testing.T) {
+			ctx := t.Context()
 
-		_, conn, stop := PipeOption{}.Build(t)
-		defer stop()
+			_, conn, stop := PipeOption{}.Build(t)
+			defer stop()
 
-		client := echo.NewEchoServiceClient(conn)
-		_, err := client.Once(ctx, &echo.EchoRequest{})
-		x.Error(t, err)
+			client := echo.NewEchoServiceClient(conn)
+			_, err := client.Once(ctx, &echo.EchoRequest{})
+			x.Error(t, err)
 
-		code := status.Code(err)
-		x.Equal(t, codes.Unimplemented, code)
+			code := status.Code(err)
+			x.Equal(t, codes.Unimplemented, code)
+		})
+		t.Run("Server Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			_, conn, stop := PipeOption{}.Build(t)
+			defer stop()
+
+			client := echo.NewEchoServiceClient(conn)
+			stream, err := client.Many(ctx, &echo.EchoRequest{})
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
+			x.Error(t, err)
+
+			code := status.Code(err)
+			x.Equal(t, codes.Unimplemented, code)
+		})
+		t.Run("Client Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			_, conn, stop := PipeOption{}.Build(t)
+			defer stop()
+
+			client := echo.NewEchoServiceClient(conn)
+			stream, err := client.Buff(ctx)
+			x.NoError(t, err)
+
+			err = stream.Send(&echo.EchoRequest{})
+			x.NoError(t, err)
+
+			// Wait for the client to receive the error from the server.
+			time.Sleep(300 * time.Millisecond)
+
+			err = stream.Send(&echo.EchoRequest{})
+			x.ErrorIs(t, err, io.EOF)
+
+			_, err = stream.CloseAndRecv()
+			x.Error(t, err)
+
+			code := status.Code(err)
+			x.Equal(t, codes.Unimplemented, code)
+		})
+		t.Run("Bidi Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			_, conn, stop := PipeOption{}.Build(t)
+			defer stop()
+
+			client := echo.NewEchoServiceClient(conn)
+			stream, err := client.Live(ctx)
+			x.NoError(t, err)
+
+			err = stream.Send(&echo.EchoRequest{})
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
+			x.Error(t, err)
+
+			code := status.Code(err)
+			x.Equal(t, codes.Unimplemented, code)
+		})
 	})
 	t.Run("interceptor", func(t *testing.T) {
 		t.Run("Unary interceptor", func(t *testing.T) {
@@ -464,6 +535,10 @@ func TestE2E(t *testing.T) {
 			x.NoError(t, err)
 			x.Equal(t, md, client.server.MD)
 
+			header, err := stream.Header()
+			x.NoError(t, err)
+			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "header"), header)
+
 			trailer := stream.Trailer()
 			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "trailer"), trailer)
 		})
@@ -482,6 +557,13 @@ func TestE2E(t *testing.T) {
 			_, err = stream.CloseAndRecv()
 			x.NoError(t, err)
 			x.Equal(t, md, client.server.MD)
+
+			header, err := stream.Header()
+			x.NoError(t, err)
+			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "header"), header)
+
+			trailer := stream.Trailer()
+			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "trailer"), trailer)
 		})
 		t.Run("Bidi streaming", func(t *testing.T) {
 			ctx := t.Context()
@@ -501,6 +583,10 @@ func TestE2E(t *testing.T) {
 			_, err = stream.Recv()
 			x.NoError(t, err)
 			x.Equal(t, md, client.server.MD)
+
+			header, err := stream.Header()
+			x.NoError(t, err)
+			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "header"), header)
 
 			trailer := stream.Trailer()
 			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "trailer"), trailer)

@@ -16,10 +16,6 @@ func (x *Metadata) MD() metadata.MD {
 }
 
 func newMd(md metadata.MD) *Metadata {
-	if md == nil {
-		return nil
-	}
-
 	es := map[string]*Metadata_Entry{}
 	for k, v := range md {
 		es[k] = Metadata_Entry_builder{Values: v}.Build()

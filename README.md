@@ -23,8 +23,8 @@ In other words, the goal is not "gRPC over datagram" in the protocol-spec sense,
 - [x] Client-side Streaming Call
 - [x] Bidirectional Streaming Call
 - [x] Metadata
-- [ ] Header
-- [ ] Trailer
+- [x] Header
+- [x] Trailer
 - [ ] Codecs
 - [x] Interceptors
 - [ ] Stats Handler

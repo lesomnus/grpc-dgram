@@ -93,6 +93,10 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 		return io.EOF
 	}
 
+	if f.HasHeader() {
+		s.header = f.GetHeader().MD()
+	}
+
 	return s.put(ctx, f)
 }
 
