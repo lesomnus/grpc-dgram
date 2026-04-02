@@ -4,8 +4,9 @@ import (
 	"context"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 )
 
 type FrameHandler interface {
@@ -26,10 +27,31 @@ func (x *Frame) Err() error {
 	return x.Status().Err()
 }
 
-func (x *Frame) unmarshal(m any /*, codec encoding.CodecV2*/) error {
+func (x *Frame) unmarshal(m any, codec encoding.CodecV2) error {
 	if x.GetCode() != uint32(codes.OK) {
 		return x.Err()
 	}
 
-	return proto.Unmarshal(x.GetPayload(), m.(proto.Message))
+	buf := mem.SliceBuffer(x.GetPayload())
+	return codec.Unmarshal(mem.BufferSlice{buf}, m)
+}
+
+func (x *Frame) getCodec() encoding.CodecV2 {
+	name := x.GetCodec()
+	if name == "" {
+		return defaultCodec
+	}
+
+	return encoding.GetCodecV2(name)
+}
+
+func (x *Frame) setError(err error) {
+	st, ok := status.FromError(err)
+	if ok {
+		x.SetCode(uint32(st.Code()))
+		x.SetDesc(st.Message())
+	} else {
+		x.SetCode(uint32(codes.Unknown))
+		x.SetDesc(err.Error())
+	}
 }

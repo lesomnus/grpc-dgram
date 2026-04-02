@@ -25,6 +25,7 @@ type Frame struct {
 	state                  protoimpl.MessageState `protogen:"opaque.v1"`
 	xxx_hidden_Sid         uint32                 `protobuf:"fixed32,1,opt,name=sid"`
 	xxx_hidden_Seq         uint32                 `protobuf:"fixed32,2,opt,name=seq"`
+	xxx_hidden_Codec       string                 `protobuf:"bytes,3,opt,name=codec"`
 	xxx_hidden_Method      string                 `protobuf:"bytes,4,opt,name=method"`
 	xxx_hidden_MethodIndex uint32                 `protobuf:"varint,5,opt,name=method_index,json=methodIndex"`
 	xxx_hidden_Deadline    *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=deadline"`
@@ -76,6 +77,13 @@ func (x *Frame) GetSeq() uint32 {
 		return x.xxx_hidden_Seq
 	}
 	return 0
+}
+
+func (x *Frame) GetCodec() string {
+	if x != nil {
+		return x.xxx_hidden_Codec
+	}
+	return ""
 }
 
 func (x *Frame) GetMethod() string {
@@ -142,6 +150,10 @@ func (x *Frame) SetSeq(v uint32) {
 	x.xxx_hidden_Seq = v
 }
 
+func (x *Frame) SetCodec(v string) {
+	x.xxx_hidden_Codec = v
+}
+
 func (x *Frame) SetMethod(v string) {
 	x.xxx_hidden_Method = v
 }
@@ -163,7 +175,7 @@ func (x *Frame) SetPayload(v []byte) {
 
 func (x *Frame) SetCode(v uint32) {
 	x.xxx_hidden_Code = v
-	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 6, 10)
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 7, 11)
 }
 
 func (x *Frame) SetDesc(v string) {
@@ -189,7 +201,7 @@ func (x *Frame) HasCode() bool {
 	if x == nil {
 		return false
 	}
-	return protoimpl.X.Present(&(x.XXX_presence[0]), 6)
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 7)
 }
 
 func (x *Frame) HasHeader() bool {
@@ -211,7 +223,7 @@ func (x *Frame) ClearDeadline() {
 }
 
 func (x *Frame) ClearCode() {
-	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 6)
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 7)
 	x.xxx_hidden_Code = 0
 }
 
@@ -226,8 +238,9 @@ func (x *Frame) ClearTrailer() {
 type Frame_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
-	Sid uint32
-	Seq uint32
+	Sid   uint32
+	Seq   uint32
+	Codec string
 	// Method is mapped to numeric index at the server.
 	// Server always respond only with `method_index` so the client can learn which
 	// service is mapped to what number during communication.
@@ -249,12 +262,13 @@ func (b0 Frame_builder) Build() *Frame {
 	_, _ = b, x
 	x.xxx_hidden_Sid = b.Sid
 	x.xxx_hidden_Seq = b.Seq
+	x.xxx_hidden_Codec = b.Codec
 	x.xxx_hidden_Method = b.Method
 	x.xxx_hidden_MethodIndex = b.MethodIndex
 	x.xxx_hidden_Deadline = b.Deadline
 	x.xxx_hidden_Payload = b.Payload
 	if b.Code != nil {
-		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 6, 10)
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 7, 11)
 		x.xxx_hidden_Code = *b.Code
 	}
 	x.xxx_hidden_Desc = b.Desc
@@ -267,10 +281,11 @@ var File_drpc_frame_proto protoreflect.FileDescriptor
 
 const file_drpc_frame_proto_rawDesc = "" +
 	"\n" +
-	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xb9\x02\n" +
+	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xcf\x02\n" +
 	"\x05Frame\x12\x10\n" +
 	"\x03sid\x18\x01 \x01(\aR\x03sid\x12\x10\n" +
-	"\x03seq\x18\x02 \x01(\aR\x03seq\x12\x16\n" +
+	"\x03seq\x18\x02 \x01(\aR\x03seq\x12\x14\n" +
+	"\x05codec\x18\x03 \x01(\tR\x05codec\x12\x16\n" +
 	"\x06method\x18\x04 \x01(\tR\x06method\x12!\n" +
 	"\fmethod_index\x18\x05 \x01(\rR\vmethodIndex\x126\n" +
 	"\bdeadline\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\bdeadline\x12\x18\n" +

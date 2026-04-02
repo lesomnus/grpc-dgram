@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 type PipeOption struct {
@@ -23,7 +24,7 @@ type PipeOption struct {
 	ConnOpts   []drpc.ConnOption
 }
 
-func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
+func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 	ctx, cancel := context.WithCancel(t.Context())
 
 	const PrintBody = false
@@ -48,6 +49,15 @@ func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
 		return nil
 	}), o.ConnOpts...)
 
+	s := &echo.EchoServer{}
+	c := &Client{
+		EchoServiceClient: echo.NewEchoServiceClient(conn),
+
+		conn:    conn,
+		server:  server,
+		service: s,
+	}
+
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		for {
@@ -55,6 +65,7 @@ func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
 			case <-ctx.Done():
 				return
 			case f := <-ca:
+				c.rx = append(c.rx, proto.CloneOf(f))
 				if err := conn.Handle(ctx, f); err != nil {
 					if err != ctx.Err() {
 						panic(err)
@@ -69,6 +80,7 @@ func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
 			case <-ctx.Done():
 				return
 			case f := <-cb:
+				c.tx = append(c.tx, proto.CloneOf(f))
 				if err := server.Handle(ctx, f); err != nil {
 					if err != ctx.Err() {
 						panic(err)
@@ -78,7 +90,7 @@ func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
 		}
 	})
 
-	return server, conn, func() {
+	return c, func() {
 		server.GracefulStop()
 		cancel()
 		wg.Wait()
@@ -86,18 +98,21 @@ func (o PipeOption) Build(t *testing.T) (*drpc.Server, *drpc.Conn, func()) {
 }
 
 func (o PipeOption) Use(t *testing.T) (*Client, func()) {
-	server, conn, cancel := o.Build(t)
+	c, stop := o.Build(t)
+	echo.RegisterEchoServiceServer(c.server, c.service)
 
-	s := &echo.EchoServer{}
-	c := &Client{echo.NewEchoServiceClient(conn), s}
-	echo.RegisterEchoServiceServer(server, s)
-
-	return c, cancel
+	return c, stop
 }
 
 type Client struct {
 	echo.EchoServiceClient
-	server *echo.EchoServer
+
+	conn    *drpc.Conn
+	server  *drpc.Server
+	service *echo.EchoServer
+
+	tx []*drpc.Frame
+	rx []*drpc.Frame
 }
 
 func TestE2E(t *testing.T) {
@@ -229,7 +244,7 @@ func TestE2E(t *testing.T) {
 			client, stop := pipe(t)
 			defer stop()
 
-			client.server.Err = st.Err()
+			client.service.Err = st.Err()
 			_, err := client.Once(ctx, &echo.EchoRequest{})
 			x.Error(t, err)
 
@@ -243,7 +258,7 @@ func TestE2E(t *testing.T) {
 			client, stop := pipe(t)
 			defer stop()
 
-			client.server.Err = st.Err()
+			client.service.Err = st.Err()
 			stream, err := client.Many(ctx, &echo.EchoRequest{})
 			x.NoError(t, err)
 
@@ -260,7 +275,7 @@ func TestE2E(t *testing.T) {
 			client, stop := pipe(t)
 			defer stop()
 
-			client.server.Err = st.Err()
+			client.service.Err = st.Err()
 			stream, err := client.Buff(ctx)
 			x.NoError(t, err)
 
@@ -286,7 +301,7 @@ func TestE2E(t *testing.T) {
 			client, stop := pipe(t)
 			defer stop()
 
-			client.server.Err = st.Err()
+			client.service.Err = st.Err()
 			stream, err := client.Live(ctx)
 			x.NoError(t, err)
 
@@ -305,10 +320,9 @@ func TestE2E(t *testing.T) {
 		t.Run("Unary", func(t *testing.T) {
 			ctx := t.Context()
 
-			_, conn, stop := PipeOption{}.Build(t)
+			client, stop := PipeOption{}.Build(t)
 			defer stop()
 
-			client := echo.NewEchoServiceClient(conn)
 			_, err := client.Once(ctx, &echo.EchoRequest{})
 			x.Error(t, err)
 
@@ -318,10 +332,9 @@ func TestE2E(t *testing.T) {
 		t.Run("Server Streaming", func(t *testing.T) {
 			ctx := t.Context()
 
-			_, conn, stop := PipeOption{}.Build(t)
+			client, stop := PipeOption{}.Build(t)
 			defer stop()
 
-			client := echo.NewEchoServiceClient(conn)
 			stream, err := client.Many(ctx, &echo.EchoRequest{})
 			x.NoError(t, err)
 
@@ -334,10 +347,9 @@ func TestE2E(t *testing.T) {
 		t.Run("Client Streaming", func(t *testing.T) {
 			ctx := t.Context()
 
-			_, conn, stop := PipeOption{}.Build(t)
+			client, stop := PipeOption{}.Build(t)
 			defer stop()
 
-			client := echo.NewEchoServiceClient(conn)
 			stream, err := client.Buff(ctx)
 			x.NoError(t, err)
 
@@ -359,10 +371,9 @@ func TestE2E(t *testing.T) {
 		t.Run("Bidi Streaming", func(t *testing.T) {
 			ctx := t.Context()
 
-			_, conn, stop := PipeOption{}.Build(t)
+			client, stop := PipeOption{}.Build(t)
 			defer stop()
 
-			client := echo.NewEchoServiceClient(conn)
 			stream, err := client.Live(ctx)
 			x.NoError(t, err)
 
@@ -515,7 +526,7 @@ func TestE2E(t *testing.T) {
 				grpc.Trailer(&trailer),
 			)
 			x.NoError(t, err)
-			x.Equal(t, md, client.server.MD)
+			x.Equal(t, md, client.service.MD)
 			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "header"), header)
 			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "trailer"), trailer)
 		})
@@ -533,7 +544,7 @@ func TestE2E(t *testing.T) {
 
 			_, err = stream.Recv()
 			x.NoError(t, err)
-			x.Equal(t, md, client.server.MD)
+			x.Equal(t, md, client.service.MD)
 
 			header, err := stream.Header()
 			x.NoError(t, err)
@@ -556,7 +567,7 @@ func TestE2E(t *testing.T) {
 
 			_, err = stream.CloseAndRecv()
 			x.NoError(t, err)
-			x.Equal(t, md, client.server.MD)
+			x.Equal(t, md, client.service.MD)
 
 			header, err := stream.Header()
 			x.NoError(t, err)
@@ -582,7 +593,7 @@ func TestE2E(t *testing.T) {
 
 			_, err = stream.Recv()
 			x.NoError(t, err)
-			x.Equal(t, md, client.server.MD)
+			x.Equal(t, md, client.service.MD)
 
 			header, err := stream.Header()
 			x.NoError(t, err)
@@ -590,6 +601,32 @@ func TestE2E(t *testing.T) {
 
 			trailer := stream.Trailer()
 			x.Equal(t, metadata.Pairs("foo", "bar", "timing", "trailer"), trailer)
+		})
+	})
+	t.Run("codec", func(t *testing.T) {
+
+		t.Run("Unary", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			_, err := client.Once(ctx,
+				echo.EchoRequest_builder{Message: "abc", CircularShift: 1}.Build(),
+				grpc.ForceCodecV2(&x.JsonCodecV2{}))
+			x.NoError(t, err)
+			x.Len(t, client.tx, 1)
+			x.Len(t, client.rx, 1)
+
+			req := &echo.EchoRequest{}
+			err = protojson.Unmarshal(client.tx[0].GetPayload(), req)
+			x.NoError(t, err)
+			x.Equal(t, "abc", req.GetMessage())
+
+			res := &echo.EchoResponse{}
+			err = protojson.Unmarshal(client.rx[0].GetPayload(), res)
+			x.NoError(t, err)
+			x.Equal(t, "bca", res.GetMessage())
 		})
 	})
 }

@@ -27,6 +27,16 @@ func False(t *testing.T, condition bool, msgAndArgs ...interface{}) {
 	}
 }
 
+func Len[T any](t *testing.T, v []T, length int, msgAndArgs ...interface{}) {
+	t.Helper()
+	if len(v) != length {
+		if len(msgAndArgs) > 0 {
+			t.Fatalf("assert length failed: expected=%d actual=%d: %s", length, len(v), fmt.Sprint(msgAndArgs...))
+		}
+		t.Fatalf("assert length failed: expected=%d actual=%d", length, len(v))
+	}
+}
+
 func Equal[T any](t *testing.T, expected, actual T, msgAndArgs ...interface{}) {
 	t.Helper()
 	if !reflect.DeepEqual(expected, actual) {

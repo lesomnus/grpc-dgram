@@ -8,8 +8,8 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -65,6 +65,8 @@ func newServerStream(ctx context.Context, server *Server, sid uint32, desc *serv
 		stream: stream{
 			sid: sid,
 
+			codec: defaultCodec,
+
 			method:       desc.fullname,
 			method_index: desc.index,
 
@@ -101,7 +103,7 @@ func (s *serverStream) RecvMsg(m any) error {
 				continue
 			}
 
-			return v.unmarshal(m)
+			return v.unmarshal(m, s.codec)
 		}
 	}
 }
@@ -129,6 +131,8 @@ func newClientStream(ctx context.Context, conn *Conn, sid uint32, method string)
 	s := &clientStream{
 		stream: stream{
 			sid: sid,
+
+			codec: defaultCodec,
 
 			method:       method,
 			method_index: method_index,
@@ -172,7 +176,7 @@ func (s *clientStream) RecvMsg(m any) error {
 				s.close()
 			}
 
-			return v.unmarshal(m)
+			return v.unmarshal(m, s.codec)
 		}
 	}
 }
@@ -187,6 +191,9 @@ func (s *clientStream) Close() error {
 
 type stream struct {
 	sid uint32
+
+	codec      encoding.CodecV2
+	codec_name string
 
 	method       string
 	method_index uint32
@@ -219,14 +226,14 @@ func (s *stream) SendMsg(m any) error {
 		return io.EOF
 	}
 
-	// TODO: codec
-	payload, err := proto.Marshal(m.(proto.Message))
+	buf, err := s.codec.Marshal(m)
 	if err != nil {
 		return err
 	}
+	defer buf.Free()
 
 	f := s.nextFrame()
-	f.SetPayload(payload)
+	f.SetPayload(buf.Materialize())
 	return s.tx.Handle(s.ctx, f)
 }
 
@@ -236,6 +243,7 @@ func (s *stream) nextFrame() *Frame {
 	f := &Frame{}
 	f.SetSid(s.sid)
 	f.SetSeq(seq)
+	f.SetCodec(s.codec_name)
 	if s.method_index == 0 {
 		f.SetMethod(s.method)
 	} else {

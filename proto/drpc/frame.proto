@@ -11,7 +11,7 @@ option go_package = "github.com/lesomnus/grpc-dgram;drpc";
 message Frame {
   fixed32 sid = 1;
   fixed32 seq = 2;
-  // bytes nonce = 3;
+  string codec = 3;
 
   // Method is mapped to numeric index at the server.
   // Server always respond only with `method_index` so the client can learn which

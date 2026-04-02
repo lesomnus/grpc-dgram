@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -29,7 +28,6 @@ type Conn struct {
 	// timeout specifies a time limit for requests.
 	// No deadline will be set if timeout is zero.
 	timeout time.Duration
-	codec   encoding.CodecV2
 
 	unary_int  grpc.UnaryClientInterceptor
 	stream_int grpc.StreamClientInterceptor
@@ -116,6 +114,14 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 	return c.unary_int(ctx, method, in, out, nil, func(ctx context.Context, method string, in, out any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
 		stream := c.newStream(ctx, method)
 		defer stream.Close()
+
+		for _, opt := range opts {
+			switch opt := opt.(type) {
+			case grpc.ForceCodecV2CallOption:
+				stream.codec = opt.CodecV2
+				stream.codec_name = opt.CodecV2.Name()
+			}
+		}
 
 		if err := stream.SendMsg(in); err != nil {
 			return err

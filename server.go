@@ -8,8 +8,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
+	"google.golang.org/grpc/mem"
 )
 
 var _ grpc.ServiceRegistrar = &Server{}
@@ -100,48 +99,52 @@ func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
 
 func (s *Server) Handle(ctx context.Context, req *Frame) error {
 	sid := req.GetSid()
-	res := Frame_builder{
-		Sid: sid,
-		Seq: 1,
-	}.Build()
+	if stream, ok := s.getStream(sid); ok {
+		return stream.put(ctx, req)
+	}
+
+	res_err := func(code codes.Code, msg string, args ...any) error {
+		c := uint32(code)
+		res := Frame_builder{
+			Sid:  sid,
+			Seq:  1,
+			Code: &c,
+			Desc: fmt.Sprintf(msg, args...),
+		}
+		return s.tx.Handle(ctx, res.Build())
+	}
 	if s.closed.Load() {
-		res.SetCode(uint32(codes.Unavailable))
-		s.tx.Handle(ctx, res)
-		return nil
+		return res_err(codes.Unavailable, "server is closed")
+	}
+	if s.drain.Load() {
+		return res_err(codes.Unavailable, "server is draining")
 	}
 
 	var desc *serviceDesc
-	if i := int(req.GetMethodIndex()); i == 0 {
-		desc = s.services[req.GetMethod()]
-		if desc == nil {
-			res.SetCode(uint32(codes.Unimplemented))
-			return s.tx.Handle(ctx, res)
-		}
-	} else if len(s.methods) <= i {
-		res.SetCode(uint32(codes.Unimplemented))
-		return s.tx.Handle(ctx, res)
-	} else {
-		desc = s.methods[i]
-	}
-
-	fill_err := func(err error) {
-		st, ok := status.FromError(err)
-		if ok {
-			res.SetCode(uint32(st.Code()))
-			res.SetDesc(st.Message())
+	if i := req.GetMethodIndex(); i > 0 {
+		if len(s.methods) <= int(i) {
+			return res_err(codes.Unimplemented, "method not found: %d", i)
 		} else {
-			res.SetCode(uint32(codes.Unknown))
-			res.SetDesc(err.Error())
+			desc = s.methods[i]
 		}
+	} else if desc = s.services[req.GetMethod()]; desc == nil {
+		return res_err(codes.Unimplemented, "method not found")
 	}
 
-	if desc.method != nil {
-		// TODO: use codec.
+	codec := req.getCodec()
+	if codec == nil {
+		return res_err(codes.Unimplemented, "unsupported codec: %s", req.GetCodec())
+	}
+
+	if desc.IsUnary() {
 		dec := func(v any) error {
-			return proto.Unmarshal(req.GetPayload(), v.(proto.Message))
+			buf := mem.SliceBuffer(req.GetPayload())
+			return codec.Unmarshal(mem.BufferSlice{buf}, v)
 		}
 
 		s.wg.Go(func() {
+			res := Frame_builder{Sid: sid, Seq: 1}.Build()
+
 			defer s.tx.Handle(ctx, res)
 			if s.drain.Load() {
 				res.SetCode(uint32(codes.Unavailable))
@@ -160,52 +163,51 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 				res.SetTrailer(newMd(transport.trailer))
 			}
 			if err != nil {
-				fill_err(err)
+				res.setError(err)
 				return
 			}
 
-			payload, err := proto.Marshal(v.(proto.Message))
+			buf, err := codec.Marshal(v)
 			if err != nil {
-				fill_err(err)
+				res.setError(err)
 				return
 			}
+			defer buf.Free()
 
-			res.SetPayload(payload)
+			res.SetPayload(buf.Materialize())
 			res.SetCode(uint32(codes.OK))
 		})
-		return nil
-	}
-
-	stream, ok := s.getStream(sid, desc)
-	if !ok {
-		if s.drain.Load() {
-			res.SetCode(uint32(codes.Unavailable))
-			s.tx.Handle(ctx, res)
-			return nil
-		}
-
-		tx := stream.tx
-		if !desc.stream.ServerStreams {
-			// In client-streaming RPC, SendMsg is called before the stream handler
-			// returns so keep it and send it with the trailer.
-			// TODO: It would be nice if we have some flag to send header immediately
-			// without waiting for the first SendMsg in this case.
-			stream.tx = FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
-				res.SetPayload(f.GetPayload())
-				res.SetHeader(f.GetHeader())
-				return nil
-			})
-		}
-
+	} else {
+		stream := s.newStream(sid, desc)
+		stream.codec = codec
 		stream.ctx = grpc.NewContextWithServerTransportStream(stream.ctx, serverTransportStream{stream})
 		stream.ctx = mdIn(stream.ctx, req)
+		if err := stream.put(ctx, req); err != nil {
+			stream.close()
+			return err
+		}
 
 		s.wg.Go(func() {
+			res := Frame_builder{Sid: sid, Seq: 1}.Build()
+
+			tx := stream.tx
 			defer stream.Close()
 			defer tx.Handle(ctx, res)
 			if s.drain.Load() {
 				res.SetCode(uint32(codes.Unavailable))
 				return
+			}
+
+			if !desc.stream.ServerStreams {
+				// In client-streaming RPC, SendMsg is called before the stream handler
+				// returns so keep it and send it with the trailer.
+				// TODO: It would be nice if we have some flag to send header immediately
+				// without waiting for the first SendMsg in this case.
+				stream.tx = FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
+					res.SetPayload(f.GetPayload())
+					res.SetHeader(f.GetHeader())
+					return nil
+				})
 			}
 
 			var err error
@@ -228,29 +230,32 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 				res.SetTrailer(newMd(stream.trailer))
 			}
 			if err != nil {
-				fill_err(err)
+				res.setError(err)
 				return
 			}
 
 			res.SetCode(uint32(codes.OK))
 		})
 	}
-
-	stream.put(ctx, req)
 	return nil
 }
 
-func (s *Server) getStream(sid uint32, desc *serviceDesc) (*serverStream, bool) {
+func (s *Server) getStream(sid uint32) (*serverStream, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	stream, ok := s.ss[sid]
-	if !ok {
-		stream = newServerStream(context.Background(), s, sid, desc)
-		s.ss[sid] = stream
-	}
-
 	return stream, ok
+}
+
+func (s *Server) newStream(sid uint32, desc *serviceDesc) *serverStream {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stream := newServerStream(context.Background(), s, sid, desc)
+	s.ss[sid] = stream
+
+	return stream
 }
 
 // GracefulStop stops the dRPC server gracefully.
@@ -274,6 +279,10 @@ type serviceDesc struct {
 	stream  *grpc.StreamDesc
 
 	impl any
+}
+
+func (d *serviceDesc) IsUnary() bool {
+	return d.method != nil
 }
 
 type ServerOption interface {
