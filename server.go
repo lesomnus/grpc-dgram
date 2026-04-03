@@ -16,8 +16,6 @@ var _ grpc.ServiceRegistrar = &Server{}
 type Server struct {
 	mu sync.Mutex
 	tx FrameHandler
-
-	// Holds active streams except for the stream of server-streaming RPC.
 	ss map[uint32]*serverStream
 
 	// methods is a mapping from method name to index.
@@ -107,6 +105,9 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 
 	stream, ok := s.ss[sid]
 	if ok {
+		if req.GetCode() == uint32(codes.Canceled) {
+			stream.close()
+		}
 		return stream.put(ctx, req)
 	}
 
@@ -143,6 +144,10 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 		return res_err(codes.Unimplemented, "unsupported codec: %s", req.GetCodec())
 	}
 
+	stream = s.newStream(sid, desc)
+	stream.codec = codec
+	stream.rx <- req
+
 	if desc.IsUnary() {
 		dec := func(v any) error {
 			buf := mem.SliceBuffer(req.GetPayload())
@@ -152,17 +157,24 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 		s.wg.Go(func() {
 			res := Frame_builder{Sid: sid, Seq: 1}.Build()
 
-			defer s.tx.Handle(ctx, res)
+			defer stream.close()
 			if s.drain.Load() {
 				res.SetCode(uint32(codes.Unavailable))
+				s.tx.Handle(stream.ctx, res)
 				return
 			}
 
 			transport := serverTransportUnary{}
-			ctx = grpc.NewContextWithServerTransportStream(ctx, &transport)
-			ctx = newIncomingContext(ctx, req)
+			stream.ctx = grpc.NewContextWithServerTransportStream(stream.ctx, &transport)
+			stream.ctx = newIncomingContext(stream.ctx, req)
 
-			v, err := desc.method.Handler(desc.impl, ctx, dec, s.unary_int)
+			v, err := desc.method.Handler(desc.impl, stream.ctx, dec, s.unary_int)
+			if stream.ctx.Err() != nil {
+				// Client abort the request, so we can just return without sending response.
+				return
+			}
+
+			defer s.tx.Handle(stream.ctx, res)
 			if transport.header != nil {
 				res.SetHeader(newMd(transport.header))
 			}
@@ -185,22 +197,20 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 			res.SetCode(uint32(codes.OK))
 		})
 	} else {
-		stream := s.newStream(sid, desc)
-		stream.codec = codec
-		stream.ctx = grpc.NewContextWithServerTransportStream(stream.ctx, serverTransportStream{stream})
-		stream.ctx = newIncomingContext(stream.ctx, req)
-		stream.rx <- req
-
 		s.wg.Go(func() {
 			res := Frame_builder{Sid: sid, Seq: 1}.Build()
 
 			tx := stream.tx
 			defer stream.Close()
-			defer tx.Handle(ctx, res)
+			defer tx.Handle(stream.ctx, res)
 			if s.drain.Load() {
 				res.SetCode(uint32(codes.Unavailable))
 				return
 			}
+
+			transport := serverTransportStream{stream}
+			stream.ctx = grpc.NewContextWithServerTransportStream(stream.ctx, transport)
+			stream.ctx = newIncomingContext(stream.ctx, req)
 
 			if !desc.stream.ServerStreams {
 				// In client-streaming RPC, SendMsg is called before the stream handler
@@ -242,14 +252,6 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 		})
 	}
 	return nil
-}
-
-func (s *Server) getStream(sid uint32) (*serverStream, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	stream, ok := s.ss[sid]
-	return stream, ok
 }
 
 func (s *Server) newStream(sid uint32, desc *serviceDesc) (stream *serverStream) {

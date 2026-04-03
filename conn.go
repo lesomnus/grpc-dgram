@@ -2,8 +2,6 @@ package drpc
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -134,10 +132,14 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 		if err := stream.SendMsg(in); err != nil {
 			return err
 		}
+
+		stop := context.AfterFunc(ctx, func() {
+			f := stream.nextFrame()
+			f.SetCode(uint32(codes.Canceled))
+			c.tx.Handle(context.TODO(), f)
+		})
+		defer stop()
 		if err := stream.RecvMsg(out); err != nil {
-			if errors.Is(err, io.EOF) {
-				return fmt.Errorf("unexpected close of stream")
-			}
 			return err
 		}
 
@@ -177,7 +179,7 @@ func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method stri
 			// a frame to abort remote stream after the first frame is sent.
 			stream.tx = SkipNextFrame(&stream.tx, tx)
 
-			f.SetCode(uint32(codes.Canceled))
+			f.SetCode(uint32(codes.OK))
 			return tx.Handle(ctx, f)
 		})
 	}

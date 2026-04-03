@@ -24,9 +24,23 @@ func (x *EchoRequest) Error() error {
 
 type EchoServer struct {
 	UnimplementedEchoServiceServer
-	Err        error
-	MD         metadata.MD
+	// If set, the server will return this error for all requests.
+	Err error
+	// MD holds the metadata from the incoming context of the request.
+	MD metadata.MD
+	// It is called when the request.OverVoid is set.
+	Hit context.CancelFunc
+
 	LazyHeader bool
+}
+
+func (s *EchoServer) hit(ctx context.Context) {
+	if s.Hit == nil {
+		panic("Hit is not set for void request")
+	}
+
+	s.Hit()
+	<-ctx.Done()
 }
 
 func (s *EchoServer) Once(ctx context.Context, req *EchoRequest) (*EchoResponse, error) {
@@ -39,7 +53,7 @@ func (s *EchoServer) Once(ctx context.Context, req *EchoRequest) (*EchoResponse,
 		return nil, err
 	}
 	if req.GetOverVoid() {
-		<-ctx.Done()
+		s.hit(ctx)
 		return nil, ctx.Err()
 	}
 
@@ -82,7 +96,7 @@ func (s *EchoServer) Many(req *EchoRequest, stream grpc.ServerStreamingServer[Ec
 	}
 
 	if req.GetOverVoid() {
-		<-ctx.Done()
+		s.hit(ctx)
 		return ctx.Err()
 	}
 
@@ -180,4 +194,8 @@ func CircularShift(s string, n int) string {
 	}
 
 	return s[n:] + s[:n]
+}
+
+func Void() *EchoRequest {
+	return EchoRequest_builder{OverVoid: true}.Build()
 }

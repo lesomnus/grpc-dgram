@@ -730,4 +730,19 @@ func TestE2E(t *testing.T) {
 			x.Equal(t, "bca", res.GetMessage())
 		})
 	})
+	t.Run("cancel", func(t *testing.T) {
+		t.Run("Unary", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			client.service.Hit = cancel
+			_, err := client.Once(ctx, echo.Void())
+			x.ErrorIs(t, err, ctx.Err())
+		})
+	})
 }

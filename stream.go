@@ -102,7 +102,7 @@ func (s *serverStream) RecvMsg(m any) error {
 		case <-s.ctx.Done():
 			return io.EOF
 		case v := <-s.rx:
-			if v.GetCode() == uint32(codes.Canceled) {
+			if v.HasCode() && v.GetCode() == uint32(codes.OK) {
 				if v.GetPayload() == nil {
 					// Client closes the stream.
 					return io.EOF
@@ -164,7 +164,7 @@ func newClientStream(ctx context.Context, conn *Conn, sid uint32, method string)
 
 func (s *clientStream) CloseSend() error {
 	f := s.nextFrame()
-	f.SetCode(uint32(codes.Canceled))
+	f.SetCode(uint32(codes.OK))
 	return s.tx.Handle(s.ctx, f)
 }
 
@@ -172,7 +172,7 @@ func (s *clientStream) RecvMsg(m any) error {
 	for {
 		select {
 		case <-s.ctx.Done():
-			return io.EOF
+			return s.ctx.Err()
 		case v := <-s.rx:
 			s.rx_last = v
 
