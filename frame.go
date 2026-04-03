@@ -19,6 +19,13 @@ func (f FrameHandlerFunc) Handle(ctx context.Context, frame *Frame) error {
 	return f(ctx, frame)
 }
 
+func SkipNextFrame(hp *FrameHandler, h FrameHandler) FrameHandler {
+	return FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
+		*hp = h
+		return nil
+	})
+}
+
 func (x *Frame) Status() *status.Status {
 	return status.New(codes.Code(x.GetCode()), x.GetDesc())
 }
@@ -28,10 +35,6 @@ func (x *Frame) Err() error {
 }
 
 func (x *Frame) unmarshal(m any, codec encoding.CodecV2) error {
-	if x.GetCode() != uint32(codes.OK) {
-		return x.Err()
-	}
-
 	buf := mem.SliceBuffer(x.GetPayload())
 	return codec.Unmarshal(mem.BufferSlice{buf}, m)
 }

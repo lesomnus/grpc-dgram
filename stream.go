@@ -57,7 +57,8 @@ func (t serverTransportStream) SetTrailer(md metadata.MD) error {
 
 type serverStream struct {
 	stream
-	server *Server
+	server    *Server
+	rx_retain *Frame
 }
 
 func newServerStream(ctx context.Context, server *Server, sid uint32, desc *serviceDesc) *serverStream {
@@ -87,14 +88,28 @@ func (s *serverStream) SendHeader(md metadata.MD) error {
 }
 
 func (s *serverStream) RecvMsg(m any) error {
+	if s.rx_retain != nil {
+		// `s.rx_retain` is mean to be used for keep last frame that
+		// should be handled in next [RecvMsg] call.
+		// However, currently it is only used for handling piggybacked
+		// close frame in unary RPC so we can just return EOF without
+		// handling the frame.
+		return io.EOF
+	}
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			return io.EOF
 		case v := <-s.rx:
 			if v.GetCode() == uint32(codes.Canceled) {
-				// Client closes the stream.
-				return io.EOF
+				if v.GetPayload() == nil {
+					// Client closes the stream.
+					return io.EOF
+				}
+
+				s.rx_retain = v
+				return v.unmarshal(m, s.codec)
 			}
 			if v.HasDeadline() && time.Now().After(v.GetDeadline().AsTime()) {
 				continue
@@ -118,8 +133,8 @@ func (s *serverStream) Close() error {
 
 type clientStream struct {
 	stream
-	conn *Conn
-	last *Frame
+	conn    *Conn
+	rx_last *Frame
 }
 
 func newClientStream(ctx context.Context, conn *Conn, sid uint32, method string) *clientStream {
@@ -159,7 +174,8 @@ func (s *clientStream) RecvMsg(m any) error {
 		case <-s.ctx.Done():
 			return io.EOF
 		case v := <-s.rx:
-			s.last = v
+			s.rx_last = v
+
 			if s.method_index == 0 {
 				i := v.GetMethodIndex()
 				s.method_index = i
@@ -171,9 +187,9 @@ func (s *clientStream) RecvMsg(m any) error {
 			if !s.rx_seq.checkAndSet(rx_seq(v.GetSeq())) {
 				continue
 			}
-
-			if v.HasCode() {
+			if v.GetCode() != uint32(codes.OK) {
 				s.close()
+				return v.Err()
 			}
 
 			return v.unmarshal(m, s.codec)

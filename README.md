@@ -25,7 +25,7 @@ In other words, the goal is not "gRPC over datagram" in the protocol-spec sense,
 - [x] Metadata
 - [x] Header
 - [x] Trailer
-- [ ] Codecs
+- [x] Codecs
 - [x] Interceptors
 - [ ] Stats Handler
 - [ ] Adaptor for [net#PacketConn](https://pkg.go.dev/net#PacketConn)

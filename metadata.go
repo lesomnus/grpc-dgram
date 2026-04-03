@@ -24,7 +24,7 @@ func newMd(md metadata.MD) *Metadata {
 	return Metadata_builder{Entries: es}.Build()
 }
 
-func mdIn(ctx context.Context, req *Frame) context.Context {
+func newIncomingContext(ctx context.Context, req *Frame) context.Context {
 	h := req.GetHeader()
 	if h == nil {
 		return ctx

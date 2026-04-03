@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -29,6 +30,7 @@ type Conn struct {
 	// No deadline will be set if timeout is zero.
 	timeout time.Duration
 
+	call_opts  []grpc.CallOption
 	unary_int  grpc.UnaryClientInterceptor
 	stream_int grpc.StreamClientInterceptor
 }
@@ -44,6 +46,11 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 		ss: map[uint32]*clientStream{},
 
 		timeout: 5 * time.Second,
+
+		call_opts: []grpc.CallOption{},
+	}
+	if opt.call_opts != nil {
+		v.call_opts = append(v.call_opts, opt.call_opts...)
 	}
 	if opt.unary_int != nil {
 		opt.unary_ints = append([]grpc.UnaryClientInterceptor{opt.unary_int}, opt.unary_ints...)
@@ -111,6 +118,7 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 	// 	ctx = ctx_
 	// }
 
+	opts = append(c.call_opts, opts...)
 	return c.unary_int(ctx, method, in, out, nil, func(ctx context.Context, method string, in, out any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
 		stream := c.newStream(ctx, method)
 		defer stream.Close()
@@ -136,9 +144,9 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 		for _, opt := range opts {
 			switch opt := opt.(type) {
 			case grpc.HeaderCallOption:
-				*opt.HeaderAddr = stream.last.GetHeader().MD()
+				*opt.HeaderAddr = stream.rx_last.GetHeader().MD()
 			case grpc.TrailerCallOption:
-				*opt.TrailerAddr = stream.last.GetTrailer().MD()
+				*opt.TrailerAddr = stream.rx_last.GetTrailer().MD()
 			}
 		}
 
@@ -147,7 +155,32 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 }
 
 func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	opts = append(c.call_opts, opts...)
+
 	stream := c.newStream(ctx, method)
+	for _, opt := range opts {
+		switch opt := opt.(type) {
+		case grpc.ForceCodecV2CallOption:
+			stream.codec = opt.CodecV2
+			stream.codec_name = opt.CodecV2.Name()
+		}
+	}
+
+	if !desc.ClientStreams {
+		// Server streaming is closed right after the first tx frame
+		// so piggyback the close indicator to the first tx frame and drop
+		// the second tx frame.
+		tx := stream.tx
+		stream.tx = FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
+			// Next frame must be the stream close so skip it since we piggybacked the one
+			// and store original handler for the next frame since it is possible to send
+			// a frame to abort remote stream after the first frame is sent.
+			stream.tx = SkipNextFrame(&stream.tx, tx)
+
+			f.SetCode(uint32(codes.Canceled))
+			return tx.Handle(ctx, f)
+		})
+	}
 	if c.stream_int == nil {
 		return stream, nil
 	}
@@ -182,6 +215,7 @@ func (c *Conn) newStream(ctx context.Context, method string) *clientStream {
 }
 
 type connOption struct {
+	call_opts   []grpc.CallOption
 	unary_int   grpc.UnaryClientInterceptor
 	unary_ints  []grpc.UnaryClientInterceptor
 	stream_int  grpc.StreamClientInterceptor
@@ -196,6 +230,12 @@ type connOptionFunc func(*connOption)
 
 func (f connOptionFunc) apply(o *connOption) {
 	f(o)
+}
+
+func WithDefaultCallOptions(opts ...grpc.CallOption) ConnOption {
+	return connOptionFunc(func(o *connOption) {
+		o.call_opts = append(o.call_opts, opts...)
+	})
 }
 
 func WithUnaryInterceptor(i grpc.UnaryClientInterceptor) ConnOption {

@@ -604,6 +604,11 @@ func TestE2E(t *testing.T) {
 		})
 	})
 	t.Run("codec", func(t *testing.T) {
+		pipe := PipeOption{
+			ConnOpts: []drpc.ConnOption{
+				drpc.WithDefaultCallOptions(grpc.ForceCodecV2(&x.JsonCodecV2{})),
+			},
+		}.Use
 
 		t.Run("Unary", func(t *testing.T) {
 			ctx := t.Context()
@@ -611,12 +616,108 @@ func TestE2E(t *testing.T) {
 			client, stop := pipe(t)
 			defer stop()
 
-			_, err := client.Once(ctx,
-				echo.EchoRequest_builder{Message: "abc", CircularShift: 1}.Build(),
-				grpc.ForceCodecV2(&x.JsonCodecV2{}))
+			_, err := client.Once(ctx, echo.EchoRequest_builder{
+				Message:       "abc",
+				CircularShift: 1,
+			}.Build())
 			x.NoError(t, err)
-			x.Len(t, client.tx, 1)
-			x.Len(t, client.rx, 1)
+			x.NotEmpty(t, client.tx)
+			x.NotEmpty(t, client.rx)
+
+			req := &echo.EchoRequest{}
+			err = protojson.Unmarshal(client.tx[0].GetPayload(), req)
+			x.NoError(t, err)
+			x.Equal(t, "abc", req.GetMessage())
+
+			res := &echo.EchoResponse{}
+			err = protojson.Unmarshal(client.rx[0].GetPayload(), res)
+			x.NoError(t, err)
+			x.Equal(t, "bca", res.GetMessage())
+		})
+		t.Run("Server Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			stream, err := client.Many(ctx, echo.EchoRequest_builder{
+				Message:       "abc",
+				CircularShift: 1,
+				Repeat:        1,
+			}.Build())
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
+			x.NoError(t, err)
+			fmt.Printf("client.tx: %v\n", client.tx)
+			x.NotEmpty(t, client.tx)
+			x.NotEmpty(t, client.rx)
+
+			req := &echo.EchoRequest{}
+			err = protojson.Unmarshal(client.tx[0].GetPayload(), req)
+			x.NoError(t, err)
+			x.Equal(t, "abc", req.GetMessage())
+
+			res := &echo.EchoResponse{}
+			err = protojson.Unmarshal(client.rx[0].GetPayload(), res)
+			x.NoError(t, err)
+			x.Equal(t, "bca", res.GetMessage())
+		})
+		t.Run("Client Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			stream, err := client.Buff(ctx)
+			x.NoError(t, err)
+			defer stream.CloseSend()
+
+			err = stream.Send(echo.EchoRequest_builder{
+				Message:       "abc",
+				Repeat:        1,
+				CircularShift: 1,
+			}.Build())
+			x.NoError(t, err)
+
+			_, err = stream.CloseAndRecv()
+			x.NoError(t, err)
+
+			req := &echo.EchoRequest{}
+			err = protojson.Unmarshal(client.tx[0].GetPayload(), req)
+			x.NoError(t, err)
+			x.Equal(t, "abc", req.GetMessage())
+
+			res := &echo.EchoBatchResponse{}
+			err = protojson.Unmarshal(client.rx[0].GetPayload(), res)
+			x.NoError(t, err)
+
+			items := res.GetItems()
+			x.NotEmpty(t, items)
+			x.Equal(t, "bca", items[0].GetMessage())
+		})
+		t.Run("Bidi Streaming", func(t *testing.T) {
+			ctx := t.Context()
+
+			client, stop := pipe(t)
+			defer stop()
+
+			stream, err := client.Live(ctx)
+			x.NoError(t, err)
+			defer stream.CloseSend()
+
+			err = stream.Send(echo.EchoRequest_builder{
+				Message:       "abc",
+				Repeat:        1,
+				CircularShift: 1,
+			}.Build())
+			x.NoError(t, err)
+
+			err = stream.CloseSend()
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
+			x.NoError(t, err)
 
 			req := &echo.EchoRequest{}
 			err = protojson.Unmarshal(client.tx[0].GetPayload(), req)

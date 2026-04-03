@@ -16,6 +16,8 @@ var _ grpc.ServiceRegistrar = &Server{}
 type Server struct {
 	mu sync.Mutex
 	tx FrameHandler
+
+	// Holds active streams except for the stream of server-streaming RPC.
 	ss map[uint32]*serverStream
 
 	// methods is a mapping from method name to index.
@@ -99,7 +101,12 @@ func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
 
 func (s *Server) Handle(ctx context.Context, req *Frame) error {
 	sid := req.GetSid()
-	if stream, ok := s.getStream(sid); ok {
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stream, ok := s.ss[sid]
+	if ok {
 		return stream.put(ctx, req)
 	}
 
@@ -153,7 +160,7 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 
 			transport := serverTransportUnary{}
 			ctx = grpc.NewContextWithServerTransportStream(ctx, &transport)
-			ctx = mdIn(ctx, req)
+			ctx = newIncomingContext(ctx, req)
 
 			v, err := desc.method.Handler(desc.impl, ctx, dec, s.unary_int)
 			if transport.header != nil {
@@ -181,11 +188,8 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 		stream := s.newStream(sid, desc)
 		stream.codec = codec
 		stream.ctx = grpc.NewContextWithServerTransportStream(stream.ctx, serverTransportStream{stream})
-		stream.ctx = mdIn(stream.ctx, req)
-		if err := stream.put(ctx, req); err != nil {
-			stream.close()
-			return err
-		}
+		stream.ctx = newIncomingContext(stream.ctx, req)
+		stream.rx <- req
 
 		s.wg.Go(func() {
 			res := Frame_builder{Sid: sid, Seq: 1}.Build()
@@ -248,14 +252,10 @@ func (s *Server) getStream(sid uint32) (*serverStream, bool) {
 	return stream, ok
 }
 
-func (s *Server) newStream(sid uint32, desc *serviceDesc) *serverStream {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	stream := newServerStream(context.Background(), s, sid, desc)
+func (s *Server) newStream(sid uint32, desc *serviceDesc) (stream *serverStream) {
+	stream = newServerStream(context.Background(), s, sid, desc)
 	s.ss[sid] = stream
-
-	return stream
+	return
 }
 
 // GracefulStop stops the dRPC server gracefully.

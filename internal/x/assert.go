@@ -37,6 +37,22 @@ func Len[T any](t *testing.T, v []T, length int, msgAndArgs ...interface{}) {
 	}
 }
 
+func NotEmpty(t *testing.T, v any, msgAndArgs ...interface{}) {
+	t.Helper()
+	typ := reflect.TypeOf(v)
+	switch typ.Kind() {
+	case reflect.String, reflect.Slice, reflect.Array, reflect.Map, reflect.Chan:
+		if reflect.ValueOf(v).Len() == 0 {
+			if len(msgAndArgs) > 0 {
+				t.Fatalf("assert not empty failed: expected non-empty %v: %s", typ, fmt.Sprint(msgAndArgs...))
+			}
+			t.Fatalf("assert not empty failed: expected non-empty %v", typ)
+		}
+	default:
+		t.Fatalf("assert not empty failed: unsupported type %v", typ)
+	}
+}
+
 func Equal[T any](t *testing.T, expected, actual T, msgAndArgs ...interface{}) {
 	t.Helper()
 	if !reflect.DeepEqual(expected, actual) {
