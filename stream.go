@@ -136,7 +136,9 @@ func (s *serverStream) Close() error {
 
 type clientStream struct {
 	stream
-	conn    *Conn
+	conn *Conn
+	stop func() bool
+
 	rx_last *Frame
 }
 
@@ -162,7 +164,19 @@ func newClientStream(ctx context.Context, conn *Conn, sid uint32, method string)
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
+	// `ctx` is used here instead of `s.ctx`, because a cancellation
+	// of `ctx` can also indicate a normal close of the stream.
+	// In such cases, there is no need to send a cancellation code.
+	s.stop = context.AfterFunc(ctx, s.cancelOp)
+
 	return s
+}
+
+func (s *clientStream) cancelOp() {
+	defer s.Close()
+	f := s.nextFrame()
+	f.SetCode(uint32(codes.Canceled))
+	s.tx.Handle(context.TODO(), f)
 }
 
 func (s *clientStream) CloseSend() error {
@@ -206,6 +220,11 @@ func (s *clientStream) Close() error {
 
 	delete(s.conn.ss, s.sid)
 	return s.close()
+}
+
+func (s *clientStream) close() error {
+	s.stop()
+	return s.stream.close()
 }
 
 type stream struct {

@@ -735,17 +735,59 @@ func TestE2E(t *testing.T) {
 		})
 	})
 	t.Run("cancel", func(t *testing.T) {
-		t.Run("Unary", func(t *testing.T) {
-			ctx := t.Context()
-
+		pipe := func(t *testing.T) (*Client, context.Context, func()) {
 			client, stop := pipe(t)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			client.service.Hit = cancel
+
+			return client, ctx, func() {
+				cancel()
+				stop()
+			}
+		}
+
+		t.Run("Unary", func(t *testing.T) {
+			client, ctx, stop := pipe(t)
 			defer stop()
 
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
-			client.service.Hit = cancel
 			_, err := client.Once(ctx, echo.Void())
+			x.ErrorIs(t, err, ctx.Err())
+		})
+		t.Run("Server Streaming", func(t *testing.T) {
+			client, ctx, stop := pipe(t)
+			defer stop()
+
+			stream, err := client.Many(ctx, echo.Void())
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
+			x.ErrorIs(t, err, ctx.Err())
+		})
+		t.Run("Client Streaming", func(t *testing.T) {
+			client, ctx, stop := pipe(t)
+			defer stop()
+
+			stream, err := client.Buff(ctx)
+			x.NoError(t, err)
+
+			err = stream.Send(echo.Void())
+			x.NoError(t, err)
+
+			_, err = stream.CloseAndRecv()
+			x.ErrorIs(t, err, ctx.Err())
+		})
+		t.Run("Bidi Streaming", func(t *testing.T) {
+			client, ctx, stop := pipe(t)
+			defer stop()
+
+			stream, err := client.Live(ctx)
+			x.NoError(t, err)
+
+			err = stream.Send(echo.Void())
+			x.NoError(t, err)
+
+			_, err = stream.Recv()
 			x.ErrorIs(t, err, ctx.Err())
 		})
 	})

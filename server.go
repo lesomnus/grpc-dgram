@@ -201,7 +201,13 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 
 			tx := stream.tx
 			defer stream.Close()
-			defer tx.Handle(stream.ctx, res)
+			defer func() {
+				if stream.tx_closed.Load() {
+					// Client canceled the stream, so we can just return without sending response.
+					return
+				}
+				tx.Handle(stream.ctx, res)
+			}()
 			if s.drain.Load() {
 				res.SetCode(uint32(codes.Unavailable))
 				return

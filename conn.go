@@ -132,13 +132,6 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 		if err := stream.SendMsg(in); err != nil {
 			return err
 		}
-
-		stop := context.AfterFunc(ctx, func() {
-			f := stream.nextFrame()
-			f.SetCode(uint32(codes.Canceled))
-			c.tx.Handle(context.TODO(), f)
-		})
-		defer stop()
 		if err := stream.RecvMsg(out); err != nil {
 			return err
 		}

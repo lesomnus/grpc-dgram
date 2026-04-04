@@ -6,5 +6,6 @@
 		"**/.DS_Store": true,
 		"**/Thumbs.db": true,
 		"**/*.pb.go": true
-	}
+	},
+	"go.testTimeout": "3s"
 }

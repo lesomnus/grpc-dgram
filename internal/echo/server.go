@@ -126,6 +126,10 @@ func (s *EchoServer) Buff(stream grpc.ClientStreamingServer[EchoRequest, EchoBat
 		if s.Err != nil {
 			return s.Err
 		}
+		if req.GetOverVoid() {
+			s.hit(ctx)
+			return ctx.Err()
+		}
 		if err := s.many(&seq, req, func(res *EchoResponse) error {
 			items = append(items, res)
 			return nil
@@ -153,6 +157,10 @@ func (s *EchoServer) Live(stream grpc.BidiStreamingServer[EchoRequest, EchoRespo
 		}
 		if s.Err != nil {
 			return s.Err
+		}
+		if req.GetOverVoid() {
+			s.hit(ctx)
+			return ctx.Err()
 		}
 		if err := s.many(&seq, req, stream.Send); err != nil {
 			return err
