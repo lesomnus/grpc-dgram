@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test -v -timeout 10s -bench='^$' ./...
+
+      - name: Lookup last successful commit
+        id: last-success
+        continue-on-error: true
+        run: |
+          WF_REF="${{ github.workflow_ref }}"
+          FILENAME=$(basename "${WF_REF%%@*}")
+          gh run list \
+            --workflow=$FILENAME \
+            --status=success \
+            --limit=1 \
+            --json headSha \
+            --jq '.[0].headSha' > sha
+
+          echo "LAST_SUCCESS=$(cat sha)" >> $GITHUB_ENV
+
+      - name: Run benchmark on current
+        if: steps.last-success.outcome == 'success'
+        run: |
+          go test -bench=. -benchmem -count=10 -run='^$' ./... > new.txt
+
+      - name: Run benchmark on last successful commit
+        if: steps.last-success.outcome == 'success'
+        run: |
+          git fetch origin main
+          git checkout $LAST_SUCCESS
+          go mod download
+          go test -bench=. -benchmem -count=10 -run='^$' ./... > old.txt
+
+      - name: Install benchstat
+        if: steps.last-success.outcome == 'success'
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: Compare
+        if: steps.last-success.outcome == 'success'
+        run: |
+          benchstat old.txt new.txt | tee -a $GITHUB_STEP_SUMMARY

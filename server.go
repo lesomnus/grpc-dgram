@@ -103,8 +103,7 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	stream, ok := s.ss[sid]
-	if ok {
+	if stream, ok := s.ss[sid]; ok {
 		if req.GetCode() == uint32(codes.Canceled) {
 			stream.close()
 		}
@@ -144,7 +143,7 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 		return res_err(codes.Unimplemented, "unsupported codec: %s", req.GetCodec())
 	}
 
-	stream = s.newStream(sid, desc)
+	stream := s.newStream(sid, desc)
 	stream.codec = codec
 	stream.rx <- req
 

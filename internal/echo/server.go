@@ -43,6 +43,10 @@ func (s *EchoServer) hit(ctx context.Context) {
 	<-ctx.Done()
 }
 
+func (s *EchoServer) Noop(ctx context.Context, req *EchoRequest) (*EchoRequest, error) {
+	return req, nil
+}
+
 func (s *EchoServer) Once(ctx context.Context, req *EchoRequest) (*EchoResponse, error) {
 	s.handleMd(ctx)
 	if s.Err != nil {

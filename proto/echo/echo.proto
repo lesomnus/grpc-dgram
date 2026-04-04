@@ -8,6 +8,7 @@ option features.field_presence = IMPLICIT;
 option go_package = "github.com/lesomnus/grpc-dgram/internal/echo";
 
 service EchoService {
+  rpc Noop(EchoRequest) returns (EchoRequest) {}
   rpc Once(EchoRequest) returns (EchoResponse) {}
   rpc Many(EchoRequest) returns (stream EchoResponse) {}
   rpc Buff(stream EchoRequest) returns (EchoBatchResponse) {}

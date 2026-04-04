@@ -423,8 +423,9 @@ const file_echo_echo_proto_rawDesc = "" +
 	"\x05items\x18\x01 \x03(\v2\x12.echo.EchoResponseR\x05items\"6\n" +
 	"\x06Status\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\x05R\x04code\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage2\xde\x01\n" +
-	"\vEchoService\x12/\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage2\x8e\x02\n" +
+	"\vEchoService\x12.\n" +
+	"\x04Noop\x12\x11.echo.EchoRequest\x1a\x11.echo.EchoRequest\"\x00\x12/\n" +
 	"\x04Once\x12\x11.echo.EchoRequest\x1a\x12.echo.EchoResponse\"\x00\x121\n" +
 	"\x04Many\x12\x11.echo.EchoRequest\x1a\x12.echo.EchoResponse\"\x000\x01\x126\n" +
 	"\x04Buff\x12\x11.echo.EchoRequest\x1a\x17.echo.EchoBatchResponse\"\x00(\x01\x123\n" +
@@ -443,16 +444,18 @@ var file_echo_echo_proto_depIdxs = []int32{
 	4, // 1: echo.EchoRequest.date_created:type_name -> google.protobuf.Timestamp
 	4, // 2: echo.EchoResponse.date_created:type_name -> google.protobuf.Timestamp
 	1, // 3: echo.EchoBatchResponse.items:type_name -> echo.EchoResponse
-	0, // 4: echo.EchoService.Once:input_type -> echo.EchoRequest
-	0, // 5: echo.EchoService.Many:input_type -> echo.EchoRequest
-	0, // 6: echo.EchoService.Buff:input_type -> echo.EchoRequest
-	0, // 7: echo.EchoService.Live:input_type -> echo.EchoRequest
-	1, // 8: echo.EchoService.Once:output_type -> echo.EchoResponse
-	1, // 9: echo.EchoService.Many:output_type -> echo.EchoResponse
-	2, // 10: echo.EchoService.Buff:output_type -> echo.EchoBatchResponse
-	1, // 11: echo.EchoService.Live:output_type -> echo.EchoResponse
-	8, // [8:12] is the sub-list for method output_type
-	4, // [4:8] is the sub-list for method input_type
+	0, // 4: echo.EchoService.Noop:input_type -> echo.EchoRequest
+	0, // 5: echo.EchoService.Once:input_type -> echo.EchoRequest
+	0, // 6: echo.EchoService.Many:input_type -> echo.EchoRequest
+	0, // 7: echo.EchoService.Buff:input_type -> echo.EchoRequest
+	0, // 8: echo.EchoService.Live:input_type -> echo.EchoRequest
+	0, // 9: echo.EchoService.Noop:output_type -> echo.EchoRequest
+	1, // 10: echo.EchoService.Once:output_type -> echo.EchoResponse
+	1, // 11: echo.EchoService.Many:output_type -> echo.EchoResponse
+	2, // 12: echo.EchoService.Buff:output_type -> echo.EchoBatchResponse
+	1, // 13: echo.EchoService.Live:output_type -> echo.EchoResponse
+	9, // [9:14] is the sub-list for method output_type
+	4, // [4:9] is the sub-list for method input_type
 	4, // [4:4] is the sub-list for extension type_name
 	4, // [4:4] is the sub-list for extension extendee
 	0, // [0:4] is the sub-list for field type_name

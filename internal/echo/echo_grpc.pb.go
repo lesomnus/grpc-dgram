@@ -19,6 +19,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	EchoService_Noop_FullMethodName = "/echo.EchoService/Noop"
 	EchoService_Once_FullMethodName = "/echo.EchoService/Once"
 	EchoService_Many_FullMethodName = "/echo.EchoService/Many"
 	EchoService_Buff_FullMethodName = "/echo.EchoService/Buff"
@@ -29,6 +30,7 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type EchoServiceClient interface {
+	Noop(ctx context.Context, in *EchoRequest, opts ...grpc.CallOption) (*EchoRequest, error)
 	Once(ctx context.Context, in *EchoRequest, opts ...grpc.CallOption) (*EchoResponse, error)
 	Many(ctx context.Context, in *EchoRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EchoResponse], error)
 	Buff(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[EchoRequest, EchoBatchResponse], error)
@@ -41,6 +43,16 @@ type echoServiceClient struct {
 
 func NewEchoServiceClient(cc grpc.ClientConnInterface) EchoServiceClient {
 	return &echoServiceClient{cc}
+}
+
+func (c *echoServiceClient) Noop(ctx context.Context, in *EchoRequest, opts ...grpc.CallOption) (*EchoRequest, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EchoRequest)
+	err := c.cc.Invoke(ctx, EchoService_Noop_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *echoServiceClient) Once(ctx context.Context, in *EchoRequest, opts ...grpc.CallOption) (*EchoResponse, error) {
@@ -102,6 +114,7 @@ type EchoService_LiveClient = grpc.BidiStreamingClient[EchoRequest, EchoResponse
 // All implementations must embed UnimplementedEchoServiceServer
 // for forward compatibility.
 type EchoServiceServer interface {
+	Noop(context.Context, *EchoRequest) (*EchoRequest, error)
 	Once(context.Context, *EchoRequest) (*EchoResponse, error)
 	Many(*EchoRequest, grpc.ServerStreamingServer[EchoResponse]) error
 	Buff(grpc.ClientStreamingServer[EchoRequest, EchoBatchResponse]) error
@@ -116,6 +129,9 @@ type EchoServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedEchoServiceServer struct{}
 
+func (UnimplementedEchoServiceServer) Noop(context.Context, *EchoRequest) (*EchoRequest, error) {
+	return nil, status.Error(codes.Unimplemented, "method Noop not implemented")
+}
 func (UnimplementedEchoServiceServer) Once(context.Context, *EchoRequest) (*EchoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Once not implemented")
 }
@@ -147,6 +163,24 @@ func RegisterEchoServiceServer(s grpc.ServiceRegistrar, srv EchoServiceServer) {
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&EchoService_ServiceDesc, srv)
+}
+
+func _EchoService_Noop_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EchoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EchoServiceServer).Noop(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EchoService_Noop_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EchoServiceServer).Noop(ctx, req.(*EchoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _EchoService_Once_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -199,6 +233,10 @@ var EchoService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "echo.EchoService",
 	HandlerType: (*EchoServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Noop",
+			Handler:    _EchoService_Noop_Handler,
+		},
 		{
 			MethodName: "Once",
 			Handler:    _EchoService_Once_Handler,

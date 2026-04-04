@@ -124,6 +124,9 @@ func (s *serverStream) RecvMsg(m any) error {
 }
 
 func (s *serverStream) Close() error {
+	// TODO: can I collect closed streams and clean them up in server.Handle?
+	// Maybe server.Handle does not have to lock at all and make user to decide
+	// whether to use lock or not.
 	s.server.mu.Lock()
 	defer s.server.mu.Unlock()
 

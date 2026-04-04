@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -28,10 +29,14 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 	ctx, cancel := context.WithCancel(t.Context())
 
 	const PrintBody = false
+	var l x.Logger = t
+	if os.Getenv("CI") != "" {
+		l = x.NopLogger{}
+	}
 
 	ca := make(chan *drpc.Frame, 10)
 	server := drpc.NewServer(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
-		t.Logf("server->client %d:%d", f.GetSid(), f.GetSeq())
+		l.Logf("server->client %d:%d", f.GetSid(), f.GetSeq())
 		if PrintBody {
 			fmt.Printf("%v\n", protojson.Format(f))
 		}
@@ -41,7 +46,7 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 
 	cb := make(chan *drpc.Frame, 10)
 	conn := drpc.NewConn(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
-		t.Logf("client->server %d:%d", f.GetSid(), f.GetSeq())
+		l.Logf("client->server %d:%d", f.GetSid(), f.GetSeq())
 		if PrintBody {
 			fmt.Printf("%v\n", protojson.Format(f))
 		}
@@ -649,7 +654,6 @@ func TestE2E(t *testing.T) {
 
 			_, err = stream.Recv()
 			x.NoError(t, err)
-			fmt.Printf("client.tx: %v\n", client.tx)
 			x.NotEmpty(t, client.tx)
 			x.NotEmpty(t, client.rx)
 
