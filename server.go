@@ -143,6 +143,8 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 		return res_err(codes.Unimplemented, "unsupported codec: %s", req.GetCodec())
 	}
 
+	// Note that I was tried to use a pool to reuse the stream object, but it seems
+	// that the performance is worse than just creating a new one for each request.
 	stream := s.newStream(sid, desc)
 	stream.codec = codec
 	stream.rx <- req
@@ -156,7 +158,7 @@ func (s *Server) Handle(ctx context.Context, req *Frame) error {
 		s.wg.Go(func() {
 			res := Frame_builder{Sid: sid, Seq: 1}.Build()
 
-			defer stream.close()
+			defer stream.Close()
 			if s.drain.Load() {
 				res.SetCode(uint32(codes.Unavailable))
 				s.tx.Handle(stream.ctx, res)
