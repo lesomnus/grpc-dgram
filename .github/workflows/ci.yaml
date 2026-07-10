@@ -4,13 +4,37 @@ on:
   pull_request:
     paths: &paths
       - "**/*.go"
+      - "**/*.proto"
       - ".github/workflows/ci.yaml"
       - "go.mod"
       - "go.sum"
+      - "buf.yaml"
+      - "buf.gen.yaml"
   push:
     paths: *paths
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+
+      - name: Lint protos
+        run: buf lint
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -timeout 120s -count=1 ./...
+
   bench:
     runs-on: ubuntu-latest
 
@@ -19,9 +43,6 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-
-      - name: Run tests
-        run: go test -v -timeout 10s -bench='^$' ./...
 
       - name: Lookup last successful commit
         id: last-success

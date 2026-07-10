@@ -23,6 +23,12 @@ import (
 type PipeOption struct {
 	ServerOpts []drpc.ServerOption
 	ConnOpts   []drpc.ConnOption
+
+	// C2S and S2C decorate the frame path of each direction, e.g. with
+	// x.NewLossy for fault injection. The decorated handler sits on the
+	// wire side: frames it drops are never recorded nor delivered.
+	C2S func(next drpc.FrameHandler) drpc.FrameHandler
+	S2C func(next drpc.FrameHandler) drpc.FrameHandler
 }
 
 func (o PipeOption) Build(t *testing.T) (*Client, func()) {
@@ -34,25 +40,24 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 		l = x.NopLogger{}
 	}
 
-	ca := make(chan *drpc.Frame, 256)
-	server := drpc.NewServer(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
-		l.Logf("server->client %d:%d", f.GetSid(), f.GetSeq())
-		if PrintBody {
-			fmt.Printf("%v\n", protojson.Format(f))
-		}
-		ca <- f
-		return nil
-	}), o.ServerOpts...)
+	// The wire carries one marshaled Envelop per message (PROTOCOL.md §4.1),
+	// so frames round-trip through real serialization.
+	ca := make(chan []byte, 256) // server -> client
+	cb := make(chan []byte, 256) // client -> server
 
-	cb := make(chan *drpc.Frame, 256)
-	conn := drpc.NewConn(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
-		l.Logf("client->server %d:%d", f.GetSid(), f.GetSeq())
-		if PrintBody {
-			fmt.Printf("%v\n", protojson.Format(f))
-		}
-		cb <- f
-		return nil
-	}), o.ConnOpts...)
+	wire := func(ch chan []byte) drpc.FrameHandler {
+		return drpc.Wrap1(drpc.EnvelopHandlerFunc(func(_ context.Context, e *drpc.Envelop) error {
+			data, err := proto.Marshal(e)
+			if err != nil {
+				return err
+			}
+			ch <- data
+			return nil
+		}))
+	}
+
+	server := drpc.NewServer(wire(ca), o.ServerOpts...)
+	conn := drpc.NewConn(wire(cb), o.ConnOpts...)
 
 	s := &echo.EchoServer{}
 	c := &Client{
@@ -63,37 +68,51 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 		service: s,
 	}
 
+	var s2c drpc.FrameHandler = drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
+		l.Logf("server->client %d:%d", f.GetSid(), f.GetSeq())
+		if PrintBody {
+			fmt.Printf("%v\n", protojson.Format(f))
+		}
+		c.recordRx(f)
+		return conn.Handle(ctx, f)
+	})
+	if o.S2C != nil {
+		s2c = o.S2C(s2c)
+	}
+	var c2s drpc.FrameHandler = drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
+		l.Logf("client->server %d:%d", f.GetSid(), f.GetSeq())
+		if PrintBody {
+			fmt.Printf("%v\n", protojson.Format(f))
+		}
+		c.recordTx(f)
+		return server.Handle(ctx, f)
+	})
+	if o.C2S != nil {
+		c2s = o.C2S(c2s)
+	}
+
+	pump := func(ch chan []byte, h drpc.FrameHandler) func() {
+		return func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case data := <-ch:
+					e := &drpc.Envelop{}
+					if err := proto.Unmarshal(data, e); err != nil {
+						panic(err)
+					}
+					if err := drpc.Unpack(ctx, e, h); err != nil && err != ctx.Err() {
+						panic(err)
+					}
+				}
+			}
+		}
+	}
+
 	var wg sync.WaitGroup
-	wg.Go(func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case f := <-ca:
-				c.recordRx(f)
-				if err := conn.Handle(ctx, f); err != nil {
-					if err != ctx.Err() {
-						panic(err)
-					}
-				}
-			}
-		}
-	})
-	wg.Go(func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case f := <-cb:
-				c.recordTx(f)
-				if err := server.Handle(ctx, f); err != nil {
-					if err != ctx.Err() {
-						panic(err)
-					}
-				}
-			}
-		}
-	})
+	wg.Go(pump(ca, s2c))
+	wg.Go(pump(cb, c2s))
 
 	return c, func() {
 		server.GracefulStop()
