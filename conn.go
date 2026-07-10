@@ -2,6 +2,7 @@ package drpc
 
 import (
 	"context"
+	"io"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -24,11 +25,20 @@ type Conn struct {
 	// epoch is this Conn incarnation's nonce (PROTOCOL.md §6.1).
 	epoch uint32
 	tx    FrameHandler
+	mode  mode
 
 	mu        sync.Mutex
 	ss        map[uint32]*clientStream
+	tombs     map[uint32]*clientTomb
+	resetAt   map[uint32]int64
 	sidNext   uint32
 	exhausted bool
+
+	// Peer-liveness clocks (unreliable mode, PROTOCOL.md §10.4).
+	lastRx   atomic.Int64
+	lastTx   atomic.Int64
+	lastPing atomic.Int64
+	sw       sweeper
 
 	// serverEpoch tracks the peer incarnation; learned method indices are
 	// keyed by it (PROTOCOL.md §6.1, §13).
@@ -49,7 +59,11 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 	v := &Conn{
 		epoch: rand.Uint32(),
 		tx:    tx,
+		mode:  resolveMode(tx, opt.reliable, opt.timing),
 		ss:    map[uint32]*clientStream{},
+
+		tombs:   map[uint32]*clientTomb{},
+		resetAt: map[uint32]int64{},
 
 		call_opts: []grpc.CallOption{},
 	}
@@ -83,60 +97,74 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 // Handle delivers one server frame to this Conn. Adapters call it for each
 // frame of a received envelop, in order (PROTOCOL.md §9.1).
 func (c *Conn) Handle(ctx context.Context, f *Frame) error {
+	sid := f.GetSid()
+
 	if f.isReset() {
-		// Act only if the echoed epoch is ours (PROTOCOL.md §9.3).
+		// Act only if the echoed epoch is ours; RESET never refreshes
+		// liveness (PROTOCOL.md §9.1, §9.3).
 		if f.GetEpoch() != c.epoch {
 			return nil
 		}
-		if s := c.lookup(f.GetSid()); s != nil {
+		if s := c.lookup(sid); s != nil {
 			s.finishReset()
+			return nil
 		}
+		// Obligation-clear at tombstones (PROTOCOL.md §10.3).
+		c.clearTombAbort(sid)
 		return nil
 	}
 	if f.isPing() {
-		// Liveness and stream probes arrive with the timeout system (M3).
+		// Well-formed PINGs are validated: refresh peer liveness
+		// (PROTOCOL.md §9.1, §10.4).
+		c.lastRx.Store(nowNano())
+		if sid == 0 {
+			return nil
+		}
+		// Stream probe (§10.5): live stream → no-op; tombstoned or unknown
+		// → RESET so the prober fails fast.
+		if s := c.lookup(sid); s != nil {
+			return nil
+		}
+		return c.sendReset(ctx, f)
+	}
+
+	if s := c.lookup(sid); s != nil {
+		s.handleRx(f)
 		return nil
 	}
 
-	s := c.lookup(f.GetSid())
-	if s == nil {
-		// Unknown sid: tell a desynced server to stop, immediately —
-		// no OPEN can ever arrive at a client (PROTOCOL.md §9.3).
-		return c.tx.Handle(ctx, resetFor(f))
+	c.mu.Lock()
+	tomb := c.tombs[sid]
+	c.mu.Unlock()
+	if tomb != nil {
+		// Straggler for a finished call: validated, dropped. A matching
+		// terminal clears the pending abort (PROTOCOL.md §9.1-4b, §10.3).
+		c.lastRx.Store(nowNano())
+		if f.isTerminal() {
+			c.clearTombAbort(sid)
+		}
+		return nil
 	}
-	s.handleRx(f)
-	return nil
+
+	// Unknown sid: tell the desynced server to stop — no OPEN can ever
+	// arrive at a client (PROTOCOL.md §9.3).
+	return c.sendReset(ctx, f)
 }
 
 // Close fails every live call with UNAVAILABLE. Adapters call it when the
 // transport dies (PROTOCOL.md §4.5). Idempotent.
 func (c *Conn) Close(err error) {
-	c.mu.Lock()
-	ss := make([]*clientStream, 0, len(c.ss))
-	for _, s := range c.ss {
-		ss = append(ss, s)
-	}
-	c.mu.Unlock()
-
 	st := status.Error(codes.Unavailable, "transport closed")
 	if err != nil {
 		st = status.Errorf(codes.Unavailable, "transport closed: %v", err)
 	}
-	for _, s := range ss {
-		s.finishLocal(st)
-	}
+	c.failAll(st)
 }
 
 func (c *Conn) lookup(sid uint32) *clientStream {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.ss[sid]
-}
-
-func (c *Conn) remove(sid uint32) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.ss, sid)
 }
 
 // noteServerFrame runs for every frame accepted by a live stream: it tracks
@@ -157,6 +185,15 @@ func (c *Conn) noteServerFrame(f *Frame, method string) {
 }
 
 func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...grpc.CallOption) error {
+	if !c.mode.reliable {
+		if _, ok := ctx.Deadline(); !ok {
+			// T_call: the default unary deadline (PROTOCOL.md §10.2).
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeoutCause(ctx, c.mode.timing.Call,
+				status.Error(codes.DeadlineExceeded, "drpc: default call timeout"))
+			defer cancel()
+		}
+	}
 	opts = append(c.call_opts, opts...)
 	return c.unary_int(ctx, method, in, out, nil, func(ctx context.Context, method string, in, out any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
 		s, err := c.newStream(ctx, method, false, false)
@@ -172,13 +209,22 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 			}
 		}
 
-		if err := s.send(in); err != nil {
-			return err
+		err = nil
+		if serr := s.send(in); serr != nil && serr != io.EOF {
+			// io.EOF means the call already ended (a racing abort or
+			// teardown); the terminal outcome surfaces via RecvMsg below.
+			err = toStatusErr(serr)
 		}
-		if err := s.RecvMsg(out); err != nil {
-			return err
+		if err == nil {
+			err = s.RecvMsg(out)
+			if err == io.EOF {
+				// A unary terminal without a payload is a protocol anomaly.
+				err = status.Error(codes.Internal, "unary call ended without a response")
+			}
 		}
 
+		// grpc-go populates Header/Trailer call options on finish regardless
+		// of the status.
 		for _, opt := range opts {
 			switch opt := opt.(type) {
 			case grpc.HeaderCallOption:
@@ -187,7 +233,7 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 				*opt.TrailerAddr = s.Trailer()
 			}
 		}
-		return nil
+		return err
 	}, opts...)
 }
 
@@ -224,20 +270,30 @@ func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method stri
 
 func (c *Conn) newStream(ctx context.Context, method string, clientStreams, serverStreams bool) (*clientStream, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if c.exhausted {
+		c.mu.Unlock()
 		return nil, status.Error(codes.ResourceExhausted, "sid space exhausted; create a new Conn")
 	}
 	c.sidNext++
 	if c.sidNext == 0 {
 		// The sid space is never recycled within an epoch (PROTOCOL.md §6.2).
 		c.exhausted = true
+		c.mu.Unlock()
 		return nil, status.Error(codes.ResourceExhausted, "sid space exhausted; create a new Conn")
 	}
 
+	if !c.mode.reliable && len(c.ss) == 0 {
+		// Arm the peer-liveness clocks with the first live call (§10.4).
+		n := nowNano()
+		c.lastRx.Store(n)
+		c.lastTx.Store(n)
+	}
 	s := newClientStream(ctx, c, c.sidNext, method, clientStreams, serverStreams)
 	c.ss[s.sid] = s
+	c.mu.Unlock()
+
+	c.kickSweep()
 	return s, nil
 }
 
@@ -247,6 +303,9 @@ type connOption struct {
 	unary_ints  []grpc.UnaryClientInterceptor
 	stream_int  grpc.StreamClientInterceptor
 	stream_ints []grpc.StreamClientInterceptor
+
+	reliable *bool
+	timing   Timing
 }
 
 type ConnOption interface {

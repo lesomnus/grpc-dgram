@@ -20,8 +20,11 @@ type rxVerdict int
 const (
 	// rxAccept: in-window forward step; deliver.
 	rxAccept rxVerdict = iota
-	// rxDrop: duplicate, older, or lone beyond-window frame; drop silently.
-	rxDrop
+	// rxDup: duplicate or older frame; dropped, but still a validated frame
+	// from the peer (it refreshes liveness/idle clocks, PROTOCOL.md §9.1).
+	rxDup
+	// rxBeyond: lone beyond-window frame; dropped, NOT validated.
+	rxBeyond
 	// rxDataLoss: kLoud consistent beyond-window arrivals; fail the call.
 	rxDataLoss
 )
@@ -40,12 +43,12 @@ func (w *rxWindow) check(seq uint32) rxVerdict {
 	if seq == 0 {
 		// Stateless frames (RESET, PING) never reach seq validation;
 		// a sequenced frame with seq 0 is malformed.
-		return rxDrop
+		return rxBeyond
 	}
 	switch d := seq - w.l; { // mod 2^32
 	case d == 0 || d >= 1<<31:
 		// Duplicate or older: dedup. Neutral for the beyond-run (§6.3).
-		return rxDrop
+		return rxDup
 	case d <= wFwd:
 		w.l = seq
 		w.beyondN = 0
@@ -63,6 +66,6 @@ func (w *rxWindow) check(seq uint32) rxVerdict {
 		if w.beyondN >= kLoud {
 			return rxDataLoss
 		}
-		return rxDrop
+		return rxBeyond
 	}
 }

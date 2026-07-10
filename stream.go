@@ -7,12 +7,14 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 var (
@@ -80,6 +82,19 @@ type clientStream struct {
 	txClosed bool
 	openHdr  metadata.MD // outgoing request MD; rides the OPEN frame only
 
+	// Retransmission obligations (unreliable mode, PROTOCOL.md §10.3);
+	// guarded by txMu. Frames are stored for byte-identical resends.
+	retxOpen   *Frame
+	retxClose  *Frame
+	retxAt     time.Time
+	retxIval   time.Duration
+	abortFrame *Frame
+
+	// Idle clocks (unreliable mode, PROTOCOL.md §10.5).
+	lastRx    atomic.Int64
+	lastTx    atomic.Int64
+	lastProbe atomic.Int64
+
 	// rx sequencing, guarded by rxMu (transport side).
 	rxMu  sync.Mutex
 	rxWin rxWindow
@@ -129,6 +144,10 @@ func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, cl
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
+	n := nowNano()
+	s.lastRx.Store(n)
+	s.lastTx.Store(n)
+
 	// The caller's ctx ending is the abort trigger (PROTOCOL.md §8): send a
 	// terminal CLOSE and finish the call locally at once.
 	s.stopAfter = context.AfterFunc(ctx, s.abortFromCtx)
@@ -149,7 +168,12 @@ func (s *clientStream) handleRx(f *Frame) {
 	s.rxMu.Unlock()
 
 	switch v {
-	case rxDrop:
+	case rxDup:
+		// Validated: any server frame for the sid clears the OPEN
+		// retransmission obligation (PROTOCOL.md §10.3).
+		s.noteValidatedRx()
+		return
+	case rxBeyond:
 		return
 	case rxDataLoss:
 		// Window overrun on a live stream: fail loudly (PROTOCOL.md §6.3)
@@ -159,6 +183,7 @@ func (s *clientStream) handleRx(f *Frame) {
 		s.finishLocal(err)
 		return
 	}
+	s.noteValidatedRx()
 
 	// Accepted: epoch tracking and method-index learning (PROTOCOL.md §13).
 	s.conn.noteServerFrame(f, s.method)
@@ -223,6 +248,14 @@ func (s *clientStream) openFrame() *Frame {
 	if s.openHdr != nil {
 		f.SetHeader(newMd(s.openHdr))
 	}
+	if dl, ok := s.ctx.Deadline(); ok {
+		// The remaining call budget travels on OPEN (PROTOCOL.md §10.2).
+		f.SetTimeout(durationpb.New(time.Until(dl)))
+	}
+	if !s.conn.mode.reliable {
+		s.retxOpen = f
+		s.scheduleRetxLocked()
+	}
 	return f
 }
 
@@ -238,9 +271,15 @@ func (s *clientStream) nextFrame() *Frame {
 // (PROTOCOL.md §8).
 func (s *clientStream) sendOpen() error {
 	s.txMu.Lock()
+	if s.txOpened || s.txClosed {
+		// A racing abort already closed the call; an OPEN now would be a
+		// protocol violation (its seq would not be 1).
+		s.txMu.Unlock()
+		return nil
+	}
 	f := s.openFrame()
 	s.txMu.Unlock()
-	return s.conn.tx.Handle(s.ctx, f)
+	return s.transmit(s.ctx, f)
 }
 
 // send marshals and transmits one message, returning any error. The public
@@ -254,7 +293,18 @@ func (s *clientStream) send(m any) error {
 
 	s.txMu.Lock()
 	defer s.txMu.Unlock()
+	// Re-check under the lock: an abort may have won the race between the
+	// done-check above and here.
+	select {
+	case <-s.done:
+		return io.EOF
+	default:
+	}
 	if s.txClosed {
+		if s.abortFrame != nil {
+			// Closed by an abort, not by the user: not a contract violation.
+			return io.EOF
+		}
 		return status.Error(codes.Internal, "SendMsg called after CloseSend")
 	}
 
@@ -277,11 +327,19 @@ func (s *clientStream) send(m any) error {
 		f = s.nextFrame()
 	}
 	f.SetPayload(buf.Materialize())
-	return s.conn.tx.Handle(s.ctx, f)
+	return s.transmit(s.ctx, f)
 }
 
 func (s *clientStream) SendMsg(m any) error {
 	err := s.send(m)
+	if err != nil && err != io.EOF {
+		// Marshal or transport failure: end the call (grpc-go does the
+		// same), or a swallowed error would leave RecvMsg waiting for a
+		// response that can never come.
+		err = toStatusErr(err)
+		s.sendAbort(codes.Canceled)
+		s.finishLocal(err)
+	}
 	if !s.clientStreams {
 		// grpc-go contract: SendMsg on a ClientStreams=false RPC returns nil
 		// unconditionally; the status surfaces via RecvMsg.
@@ -310,10 +368,15 @@ func (s *clientStream) CloseSend() error {
 	s.txClosed = true
 	f := s.nextFrame()
 	f.SetFlags(FlagClose) // no code: half-close
+	if !s.conn.mode.reliable {
+		// Retransmit until the terminal or a RESET (PROTOCOL.md §10.3).
+		s.retxClose = f
+		s.scheduleRetxLocked()
+	}
 	s.txMu.Unlock()
 
 	// grpc-go contract: CloseSend always returns nil.
-	s.conn.tx.Handle(s.ctx, f)
+	s.transmit(s.ctx, f)
 	return nil
 }
 
@@ -410,10 +473,13 @@ func (s *clientStream) sendAbort(code codes.Code) {
 	f := s.nextFrame()
 	f.SetFlags(FlagClose)
 	f.SetCode(uint32(code))
+	// The abort obligation outlives the call on its tombstone
+	// (PROTOCOL.md §10.3); retire() picks it up.
+	s.abortFrame = f
 	s.txMu.Unlock()
 
 	// The stream ctx is (about to be) dead; keep its values for routing.
-	s.conn.tx.Handle(context.WithoutCancel(s.ctx), f)
+	s.transmit(context.WithoutCancel(s.ctx), f)
 }
 
 // finishTerm ends the call with the server's terminal frame.
@@ -462,7 +528,7 @@ func (s *clientStream) finishReset() {
 
 func (s *clientStream) release() {
 	s.stopAfter()
-	s.conn.remove(s.sid)
+	s.conn.retire(s)
 	s.hdrOnce.Do(func() { close(s.hdrReady) })
 	s.cancel()
 }
@@ -472,7 +538,9 @@ func (s *clientStream) release() {
 // ---------------------------------------------------------------------------
 
 type serverTransportUnary struct {
-	method  string
+	method string
+
+	mu      sync.Mutex
 	header  metadata.MD
 	trailer metadata.MD
 }
@@ -480,6 +548,8 @@ type serverTransportUnary struct {
 func (t *serverTransportUnary) Method() string { return t.method }
 
 func (t *serverTransportUnary) SetHeader(md metadata.MD) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.header = metadata.Join(t.header, md)
 	return nil
 }
@@ -490,8 +560,16 @@ func (t *serverTransportUnary) SendHeader(md metadata.MD) error {
 }
 
 func (t *serverTransportUnary) SetTrailer(md metadata.MD) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.trailer = metadata.Join(t.trailer, md)
 	return nil
+}
+
+func (t *serverTransportUnary) snapshot() (header, trailer metadata.MD) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.header, t.trailer
 }
 
 type serverTransportStream struct{ *serverStream }
@@ -506,18 +584,27 @@ func (t serverTransportStream) SetTrailer(md metadata.MD) error {
 type serverStream struct {
 	server *Server
 	key    callKey
+	ps     *peerState // container of this client incarnation; set at open
 
 	desc  *serviceDesc
 	codec encoding.CodecV2
 
-	ctx    context.Context
-	cancel context.CancelCauseFunc
+	ctx           context.Context
+	cancel        context.CancelCauseFunc
+	cancelTimeout context.CancelFunc // releases the handler-deadline timer
+
+	// Idle clocks and ack-replay limiter (unreliable, PROTOCOL.md §10.5, §8).
+	lastRx    atomic.Int64
+	lastTx    atomic.Int64
+	lastProbe atomic.Int64
+	hReplayAt atomic.Int64
 
 	// tx state, guarded by txMu.
 	txMu     sync.Mutex
 	txSeq    txSeq
 	txHeader metadata.MD // set via SetHeader/SendHeader
 	hdrSent  bool        // header MD already rode some frame
+	hdrFrame *Frame      // stored creation ack for byte-identical replay (§8)
 	trailer  metadata.MD
 	resp     []byte // captured SendAndClose payload (client-streaming)
 	respSet  bool
@@ -543,6 +630,9 @@ func newServerStream(ctx context.Context, srv *Server, key callKey, desc *servic
 		rxEOF: make(chan struct{}),
 	}
 	s.rxWin.l = 1 // the accepted OPEN
+	n := nowNano()
+	s.lastRx.Store(n)
+	s.lastTx.Store(n)
 	s.ctx, s.cancel = context.WithCancelCause(ctx)
 	return s
 }
@@ -551,9 +641,15 @@ func newServerStream(ctx context.Context, srv *Server, key callKey, desc *servic
 // Server.Handle; serialized per stream via rxMu for the window state.
 func (s *serverStream) handleRx(f *Frame) {
 	if f.isOpen() {
+		if f.GetSeq() != 1 {
+			// Off-shape: an OPEN's seq MUST be 1 (PROTOCOL.md §8).
+			s.rxDropped.Add(1)
+			return
+		}
 		// Duplicate OPEN (its seq 1 is always a dedup). For streaming calls
 		// it re-elicits the creation ack (PROTOCOL.md §8 ack recovery);
 		// unary is deadline-bounded and sends no ack.
+		s.noteValidatedRx()
 		if !s.desc.IsUnary() {
 			s.replayH()
 		}
@@ -565,12 +661,16 @@ func (s *serverStream) handleRx(f *Frame) {
 	s.rxMu.Unlock()
 
 	switch v {
-	case rxDrop:
+	case rxDup:
+		s.noteValidatedRx()
+		return
+	case rxBeyond:
 		return
 	case rxDataLoss:
 		s.cancel(status.Error(codes.DataLoss, "seq window overrun: >W_fwd consecutive frames lost"))
 		return
 	}
+	s.noteValidatedRx()
 
 	switch {
 	case f.isTerminal():
@@ -594,20 +694,73 @@ func (s *serverStream) handleRx(f *Frame) {
 	}
 }
 
+// noteValidatedRx runs for every validated client frame of this stream
+// (accepted or dedup-dropped, PROTOCOL.md §9.1): refresh the idle clocks.
+func (s *serverStream) noteValidatedRx() {
+	n := nowNano()
+	s.lastRx.Store(n)
+	if s.ps != nil {
+		s.ps.lastRx.Store(n)
+	}
+}
+
+// transmit sends a non-probe frame, feeding the tx idle clocks.
+func (s *serverStream) transmit(ctx context.Context, f *Frame) error {
+	n := nowNano()
+	s.lastTx.Store(n)
+	if s.ps != nil {
+		s.ps.lastTx.Store(n)
+	}
+	return s.server.tx.Handle(ctx, f)
+}
+
 // sendH emits the creation-ack header frame (PROTOCOL.md §8). The header
-// field is present only if the handler already set one.
+// field is present only if the handler already set one. The first H is
+// stored for byte-identical replay.
 func (s *serverStream) sendH() {
 	s.txMu.Lock()
 	f := s.nextFrameLocked()
 	s.attachHeaderLocked(f)
+	if s.hdrFrame == nil {
+		s.hdrFrame = f
+	}
 	s.txMu.Unlock()
-	s.server.tx.Handle(s.ctx, f)
+	s.transmit(s.ctx, f)
 }
 
-// replayH re-sends a creation ack in response to a duplicate OPEN, carrying
-// the call's current tx-header state (PROTOCOL.md §8 ack recovery).
+// replayH answers a duplicate OPEN with the creation ack, rate-limited to
+// one per RTI per call (PROTOCOL.md §8 ack recovery): the stored H replayed
+// byte-identically, else a freshly-seq'd H with the current header state.
 func (s *serverStream) replayH() {
-	s.sendH()
+	n := nowNano()
+	last := s.hReplayAt.Load()
+	if n-last < int64(s.server.mode.timing.Retransmit) || !s.hReplayAt.CompareAndSwap(last, n) {
+		return
+	}
+	s.txMu.Lock()
+	f := s.hdrFrame
+	if f == nil {
+		f = s.nextFrameLocked()
+		s.attachHeaderLocked(f)
+	}
+	s.txMu.Unlock()
+	s.transmit(context.WithoutCancel(s.ctx), f)
+}
+
+// probeDue emits a stream probe when both idle clocks passed T_probe
+// (PROTOCOL.md §10.5). Probes reset neither idle clock.
+func (s *serverStream) probeDue(now time.Time, probe time.Duration, epoch uint32) *Frame {
+	n := now.UnixNano()
+	p := int64(probe)
+	if n-s.lastRx.Load() < p || n-s.lastTx.Load() < p || n-s.lastProbe.Load() < p {
+		return nil
+	}
+	s.lastProbe.Store(n)
+	f := &Frame{}
+	f.SetEpoch(epoch)
+	f.SetSid(s.key.sid)
+	f.SetFlags(FlagPing)
+	return f
 }
 
 func (s *serverStream) nextFrameLocked() *Frame {
@@ -640,7 +793,7 @@ func (s *serverStream) SendHeader(md metadata.MD) error {
 	f := s.nextFrameLocked()
 	s.attachHeaderLocked(f)
 	s.txMu.Unlock()
-	return s.server.tx.Handle(s.ctx, f)
+	return s.transmit(s.ctx, f)
 }
 
 func (s *serverStream) SetTrailer(md metadata.MD) {
@@ -663,6 +816,10 @@ func (s *serverStream) SendMsg(m any) error {
 	if !s.desc.stream.ServerStreams {
 		// Client-streaming: SendAndClose's message rides the terminal frame
 		// (PROTOCOL.md §8).
+		if s.respSet {
+			s.txMu.Unlock()
+			return status.Error(codes.Internal, "SendAndClose called multiple times")
+		}
 		s.resp = payload
 		s.respSet = true
 		s.txMu.Unlock()
@@ -673,10 +830,11 @@ func (s *serverStream) SendMsg(m any) error {
 	s.attachHeaderLocked(f)
 	s.txMu.Unlock()
 
-	if err := s.ctx.Err(); err != nil {
-		return io.EOF
+	if s.ctx.Err() != nil {
+		// grpc-go returns the status describing why the stream ended.
+		return ctxErr(s.ctx)
 	}
-	return s.server.tx.Handle(s.ctx, f)
+	return s.transmit(s.ctx, f)
 }
 
 func (s *serverStream) RecvMsg(m any) error {

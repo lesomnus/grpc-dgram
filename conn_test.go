@@ -92,10 +92,13 @@ func TestConn(t *testing.T) {
 		ctx := t.Context()
 
 		frames := make(chan *drpc.Frame, 8)
+		// Reliable mode: no tombstones, so the late frame is answered with a
+		// RESET at once (in unreliable mode it would be silently dropped by
+		// the call's tombstone, PROTOCOL.md §9.2).
 		conn := drpc.NewConn(drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
 			frames <- f
 			return nil
-		}))
+		}), drpc.WithReliable(true))
 
 		ctx_, cancel := context.WithCancel(ctx)
 		cancel()

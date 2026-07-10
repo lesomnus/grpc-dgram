@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -32,16 +33,21 @@ type Server struct {
 	// epoch is this Server incarnation's nonce (PROTOCOL.md §6.1).
 	epoch uint32
 	tx    FrameHandler
+	mode  mode
+
+	maxHandlerTimeout time.Duration
 
 	root       context.Context
 	rootCancel context.CancelCauseFunc
 
-	mu     sync.Mutex
-	calls  map[callKey]*serverStream
-	hwm    map[epochKey]uint32 // high-water mark per client incarnation (§9.4)
-	drain  bool
-	closed bool
-	wg     sync.WaitGroup
+	mu            sync.Mutex
+	calls         map[callKey]*serverStream
+	peers         map[epochKey]*peerState // per client incarnation (§9.4)
+	pendingResets map[callKey]*pendingReset
+	drain         bool
+	closed        bool
+	wg            sync.WaitGroup
+	sw            sweeper
 
 	// serving flips on the first Handle; the registry is immutable after
 	// that (PROTOCOL.md §13).
@@ -56,15 +62,19 @@ type Server struct {
 func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 	opt := serverOption{}
 	for _, o := range opts {
-		o.apply(&opt)
+		o.applyServer(&opt)
 	}
 
 	v := &Server{
 		epoch: rand.Uint32(),
 		tx:    tx,
+		mode:  resolveMode(tx, opt.reliable, opt.timing),
 
-		calls: map[callKey]*serverStream{},
-		hwm:   map[epochKey]uint32{},
+		maxHandlerTimeout: opt.maxHandlerTimeout,
+
+		calls:         map[callKey]*serverStream{},
+		peers:         map[epochKey]*peerState{},
+		pendingResets: map[callKey]*pendingReset{},
 
 		methods:  []*serviceDesc{},
 		services: map[string]*serviceDesc{},
@@ -127,7 +137,8 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 	s.serving.Store(true)
 
 	if f.isReset() {
-		// Act only if the echoed epoch is ours (PROTOCOL.md §9.3).
+		// Act only if the echoed epoch is ours; RESET never refreshes
+		// liveness (PROTOCOL.md §9.1, §9.3).
 		if f.GetEpoch() != s.epoch {
 			return nil
 		}
@@ -135,30 +146,98 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 		s.resetByPeerSid(peer, f.GetSid())
 		return nil
 	}
-	if f.isPing() {
-		// Liveness and stream probes arrive with the timeout system (M3).
-		return nil
-	}
 
 	peer, _ := PeerFromContext(ctx)
 	key := callKey{peer: peer, epoch: f.GetEpoch(), sid: f.GetSid()}
+	ek := epochKey{peer: peer, epoch: f.GetEpoch()}
+	now := time.Now()
+
+	if f.isPing() {
+		// Well-formed PINGs are validated (PROTOCOL.md §9.1).
+		s.mu.Lock()
+		ps := s.peers[ek]
+		if ps != nil {
+			ps.lastRx.Store(now.UnixNano())
+		}
+		if f.GetSid() == 0 {
+			// Peer keepalive (§10.4).
+			s.mu.Unlock()
+			return nil
+		}
+		// Stream probe (§10.5): live → no-op; tombstone with a stored T →
+		// replay; key-only or unknown → immediate RESET (§9.3).
+		if _, live := s.calls[key]; live {
+			s.mu.Unlock()
+			return nil
+		}
+		if ps != nil {
+			if tb := ps.tombs[key.sid]; tb != nil {
+				replay := ps.replayTombLocked(tb, now, s.mode.timing.Retransmit)
+				s.mu.Unlock()
+				if replay != nil {
+					return s.tx.Handle(ctx, replay)
+				}
+				if tb.term != nil {
+					return nil // replay rate-limited; next probe retries
+				}
+				return s.tx.Handle(ctx, resetFor(f))
+			}
+		}
+		s.mu.Unlock()
+		return s.tx.Handle(ctx, resetFor(f))
+	}
 
 	s.mu.Lock()
-	st := s.calls[key]
-	s.mu.Unlock()
-	if st != nil {
+	if st := s.calls[key]; st != nil {
+		s.mu.Unlock()
 		st.handleRx(f)
 		return nil
 	}
 
+	// Tombstoned call: validated; replay the stored terminal, rate-limited
+	// (PROTOCOL.md §9.2).
+	if ps := s.peers[ek]; ps != nil {
+		if tb := ps.tombs[key.sid]; tb != nil {
+			ps.lastRx.Store(now.UnixNano())
+			replay := ps.replayTombLocked(tb, now, s.mode.timing.Retransmit)
+			s.mu.Unlock()
+			if replay != nil {
+				return s.tx.Handle(ctx, replay)
+			}
+			return nil
+		}
+	}
+
 	if f.isOpen() && f.GetSeq() == 1 {
+		// Aged-watermark admission (PROTOCOL.md §9.4): an unknown sid at or
+		// below hwm_aged is necessarily a stale straggler.
+		if ps := s.peers[ek]; ps != nil {
+			// sids never wrap (§6.2): plain comparison.
+			aged := ps.hwmAgedLocked(now, s.mode.timing.Tombstone, s.mode.reliable)
+			if key.sid <= aged {
+				s.mu.Unlock()
+				return s.tx.Handle(ctx, resetFor(f))
+			}
+		}
+		s.mu.Unlock()
 		return s.open(ctx, key, f)
 	}
 
-	// Unknown, non-OPEN: RESET so a desynced client fails fast. Delayed by
-	// T_hold in unreliable mode; immediate here until the M3 timer machinery
-	// lands (the reliable-mode reading, PROTOCOL.md §9.3, §10.6).
-	return s.tx.Handle(ctx, resetFor(f))
+	// Unknown, non-OPEN, non-PING: delayed RESET — the OPEN may merely be
+	// late (PROTOCOL.md §9.3). Reliable mode has no reordering: immediate.
+	if s.mode.reliable {
+		s.mu.Unlock()
+		return s.tx.Handle(ctx, resetFor(f))
+	}
+	if _, ok := s.pendingResets[key]; !ok && len(s.pendingResets) < maxPendingResets {
+		s.pendingResets[key] = &pendingReset{
+			due:  now.Add(s.mode.timing.Hold),
+			echo: f.GetEpoch(),
+		}
+	}
+	s.mu.Unlock()
+	s.kickSweep()
+	return nil
 }
 
 // resetByPeerSid cancels every live call from peer with the given sid,
@@ -183,18 +262,18 @@ func (s *Server) resetByPeerSid(peer any, sid uint32) {
 func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	var desc *serviceDesc
 	if i := f.GetMethodIndex(); i > 0 {
-		if int(i) <= len(s.methods) {
+		if uint64(i) <= uint64(len(s.methods)) { // 32-bit-safe bounds check
 			desc = s.methods[i-1]
 		}
 	} else if m := f.GetMethod(); m != "" {
 		desc = s.services[m]
 	}
 	if desc == nil {
-		return s.rejectOpen(ctx, f, codes.Unimplemented, "method not found")
+		return s.rejectOpen(ctx, f, 0, codes.Unimplemented, "method not found")
 	}
 	codec := f.getCodec()
 	if codec == nil {
-		return s.rejectOpen(ctx, f, codes.Unimplemented, "unsupported codec: %s", f.GetCodec())
+		return s.rejectOpen(ctx, f, desc.index, codes.Unimplemented, "unsupported codec: %s", f.GetCodec())
 	}
 
 	// The handler ctx derives from the Server root — never from the
@@ -205,7 +284,22 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	}
 	sctx = newIncomingContext(sctx, f)
 
+	// The client-asserted budget bounds the handler ctx, clamped by the
+	// server cap when configured (PROTOCOL.md §10.2).
+	var cancelTimeout context.CancelFunc
+	if f.HasTimeout() {
+		d := f.GetTimeout().AsDuration()
+		if s.maxHandlerTimeout > 0 && d > s.maxHandlerTimeout {
+			d = s.maxHandlerTimeout
+		}
+		if d > 0 {
+			sctx, cancelTimeout = context.WithTimeoutCause(sctx, d,
+				status.Error(codes.DeadlineExceeded, "call timeout"))
+		}
+	}
+
 	st := newServerStream(sctx, s, key, desc, codec)
+	st.cancelTimeout = cancelTimeout
 
 	var transport *serverTransportUnary
 	if desc.IsUnary() {
@@ -215,28 +309,44 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		st.ctx = grpc.NewContextWithServerTransportStream(st.ctx, serverTransportStream{st})
 	}
 
+	release := func() {
+		st.cancel(status.Error(codes.Unavailable, "call not admitted"))
+		if st.cancelTimeout != nil {
+			st.cancelTimeout()
+		}
+	}
 	s.mu.Lock()
 	if s.drain || s.closed {
 		s.mu.Unlock()
+		release()
 		// Draining/stopped servers refuse new calls (PROTOCOL.md §9.4).
 		return s.tx.Handle(ctx, resetFor(f))
 	}
 	if _, dup := s.calls[key]; dup {
 		// Lost the race against a concurrent duplicate OPEN.
 		s.mu.Unlock()
+		release()
 		return nil
 	}
 	s.calls[key] = st
-	ek := epochKey{peer: key.peer, epoch: key.epoch}
-	if s.hwm[ek] < key.sid {
-		s.hwm[ek] = key.sid
+	now := time.Now()
+	ps := s.ensurePeerLocked(epochKey{peer: key.peer, epoch: key.epoch}, now)
+	if ps.hwm < key.sid {
+		ps.hwm = key.sid
 	}
+	ps.liveCalls++
+	ps.dead = false // the peer is evidently back
+	ps.lastRx.Store(now.UnixNano())
+	st.ps = ps
+	// The OPEN arrived after all: cancel any RESET scheduled for its sid.
+	delete(s.pendingResets, key)
 	s.wg.Add(1)
 	s.mu.Unlock()
+	s.kickSweep()
 
 	if desc.IsUnary() {
 		go s.runUnary(st, transport, f)
-	} else {
+	} else if !desc.stream.ClientStreams {
 		// A server-streaming OPEN piggybacks the request message and the
 		// half-close (PROTOCOL.md §8); generated handlers read the request
 		// via RecvMsg.
@@ -246,19 +356,24 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		if f.isClose() {
 			st.eofOnce.Do(func() { close(st.rxEOF) })
 		}
-		if desc.stream.ClientStreams {
-			// Creation ack (PROTOCOL.md §8). Server-streaming emits its
-			// first data frame promptly instead.
-			st.sendH()
+		go s.runStream(st)
+	} else {
+		// CS/bidi OPENs are eager and bare: payload or CLOSE here is
+		// off-shape and dropped (PROTOCOL.md §8).
+		if f.HasPayload() || f.isClose() {
+			st.rxDropped.Add(1)
 		}
+		// Creation ack (PROTOCOL.md §8).
+		st.sendH()
 		go s.runStream(st)
 	}
 	return nil
 }
 
-// rejectOpen answers an OPEN that cannot start a call with a terminal frame
-// (PROTOCOL.md §9.4).
-func (s *Server) rejectOpen(ctx context.Context, f *Frame, code codes.Code, msg string, args ...any) error {
+// rejectOpen answers an OPEN that cannot start a call with a terminal frame,
+// tombstone-stored so duplicates elicit a rate-limited replay instead of a
+// fresh answer each (PROTOCOL.md §9.4).
+func (s *Server) rejectOpen(ctx context.Context, f *Frame, idx uint32, code codes.Code, msg string, args ...any) error {
 	t := &Frame{}
 	t.SetEpoch(s.epoch)
 	t.SetSid(f.GetSid())
@@ -266,12 +381,30 @@ func (s *Server) rejectOpen(ctx context.Context, f *Frame, code codes.Code, msg 
 	t.SetFlags(FlagClose)
 	t.SetCode(uint32(code))
 	t.SetDesc(fmt.Sprintf(msg, args...))
+	if idx > 0 {
+		t.SetMethodIndex(idx)
+	}
+
+	if !s.mode.reliable {
+		peer, _ := PeerFromContext(ctx)
+		now := time.Now()
+		s.mu.Lock()
+		ps := s.ensurePeerLocked(epochKey{peer: peer, epoch: f.GetEpoch()}, now)
+		ps.lastRx.Store(now.UnixNano())
+		if ps.hwm < f.GetSid() {
+			ps.hwm = f.GetSid()
+		}
+		ps.addTombLocked(f.GetSid(), t, now.Add(s.mode.timing.Tombstone))
+		s.mu.Unlock()
+		s.kickSweep()
+	}
 	return s.tx.Handle(ctx, t)
 }
 
 func (s *Server) runUnary(st *serverStream, transport *serverTransportUnary, open *Frame) {
 	defer s.wg.Done()
-	defer s.finish(st)
+	var term *Frame
+	defer func() { s.finish(st, term) }()
 
 	dec := func(v any) error {
 		return open.unmarshal(v, st.codec)
@@ -286,11 +419,12 @@ func (s *Server) runUnary(st *serverStream, transport *serverTransportUnary, ope
 	f := st.nextFrameLocked()
 	st.txMu.Unlock()
 	f.SetFlags(FlagClose)
-	if transport.header != nil {
-		f.SetHeader(newMd(transport.header))
+	header, trailer := transport.snapshot()
+	if header != nil {
+		f.SetHeader(newMd(header))
 	}
-	if transport.trailer != nil {
-		f.SetTrailer(newMd(transport.trailer))
+	if trailer != nil {
+		f.SetTrailer(newMd(trailer))
 	}
 	if err != nil {
 		f.setError(toStatusErr(err))
@@ -306,13 +440,15 @@ func (s *Server) runUnary(st *serverStream, transport *serverTransportUnary, ope
 	}
 
 	// The terminal is sent even when the handler ctx ended: the client (or
-	// its tombstone, once M3 lands) decides what to do with it.
-	s.tx.Handle(context.WithoutCancel(st.ctx), f)
+	// its tombstone) decides what to do with it.
+	term = f
+	st.transmit(context.WithoutCancel(st.ctx), f)
 }
 
 func (s *Server) runStream(st *serverStream) {
 	defer s.wg.Done()
-	defer s.finish(st)
+	var term *Frame
+	defer func() { s.finish(st, term) }()
 
 	var err error
 	if s.stream_int != nil {
@@ -330,14 +466,34 @@ func (s *Server) runStream(st *serverStream) {
 	}
 
 	f := st.terminalFrame(err)
-	s.tx.Handle(context.WithoutCancel(st.ctx), f)
+	term = f
+	st.transmit(context.WithoutCancel(st.ctx), f)
 }
 
-func (s *Server) finish(st *serverStream) {
+func (s *Server) finish(st *serverStream, term *Frame) {
+	now := time.Now()
 	s.mu.Lock()
 	delete(s.calls, st.key)
+	if ps := st.ps; ps != nil {
+		ps.liveCalls--
+		if !s.mode.reliable {
+			ttl := s.mode.timing.Tombstone
+			if dl, ok := st.ctx.Deadline(); ok {
+				// TTL floor: the propagated timeout remainder (§9.2).
+				ttl = max(ttl, time.Until(dl))
+			}
+			if ps.dead {
+				term = nil // peer lost: key-only (§10.4)
+			}
+			ps.addTombLocked(st.key.sid, term, now.Add(ttl))
+		}
+	}
 	s.mu.Unlock()
 	st.cancel(status.Error(codes.Canceled, "call finished"))
+	if st.cancelTimeout != nil {
+		st.cancelTimeout()
+	}
+	s.kickSweep()
 }
 
 // GracefulStop refuses new calls and waits for in-flight handlers.
@@ -370,6 +526,7 @@ func (s *Server) Stop() {
 		st.cancel(cause)
 	}
 	s.wg.Wait()
+	s.rootCancel(cause)
 }
 
 // DisconnectPeer fails every live call from peer. Adapters call it when a
@@ -394,7 +551,7 @@ func (s *Server) DisconnectPeer(peer any, err error) {
 }
 
 type ServerOption interface {
-	apply(*serverOption)
+	applyServer(*serverOption)
 }
 
 type serverOption struct {
@@ -402,11 +559,15 @@ type serverOption struct {
 	unary_ints  []grpc.UnaryServerInterceptor
 	stream_int  grpc.StreamServerInterceptor
 	stream_ints []grpc.StreamServerInterceptor
+
+	reliable          *bool
+	timing            Timing
+	maxHandlerTimeout time.Duration
 }
 
 type serverOptionFunc func(*serverOption)
 
-func (f serverOptionFunc) apply(o *serverOption) {
+func (f serverOptionFunc) applyServer(o *serverOption) {
 	f(o)
 }
 
