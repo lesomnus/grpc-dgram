@@ -292,16 +292,18 @@ func (s *clientStream) send(m any) error {
 	}
 
 	s.txMu.Lock()
-	defer s.txMu.Unlock()
 	// Re-check under the lock: an abort may have won the race between the
 	// done-check above and here.
 	select {
 	case <-s.done:
+		s.txMu.Unlock()
 		return io.EOF
 	default:
 	}
 	if s.txClosed {
-		if s.abortFrame != nil {
+		aborted := s.abortFrame != nil
+		s.txMu.Unlock()
+		if aborted {
 			// Closed by an abort, not by the user: not a contract violation.
 			return io.EOF
 		}
@@ -310,9 +312,9 @@ func (s *clientStream) send(m any) error {
 
 	buf, err := s.codec.Marshal(m)
 	if err != nil {
+		s.txMu.Unlock()
 		return err
 	}
-	defer buf.Free()
 
 	var f *Frame
 	if !s.txOpened {
@@ -327,6 +329,11 @@ func (s *clientStream) send(m any) error {
 		f = s.nextFrame()
 	}
 	f.SetPayload(buf.Materialize())
+	buf.Free()
+	s.txMu.Unlock()
+
+	// Transmit outside txMu: a blocking adapter must not stall the whole
+	// Conn through retire()'s c.mu -> txMu ordering.
 	return s.transmit(s.ctx, f)
 }
 
@@ -520,9 +527,16 @@ func (s *clientStream) abandon() {
 	s.finishLocal(status.Error(codes.Canceled, "call abandoned"))
 }
 
-// finishReset ends the call because the server declared it unknown
-// (PROTOCOL.md §9.3).
+// finishReset ends the call because the server declared it unknown, and
+// enters the abort path: if the RESET was stale or forged while a real
+// handler lives, the retransmitted abort reclaims it (PROTOCOL.md §9.3, §10.3).
 func (s *clientStream) finishReset() {
+	select {
+	case <-s.done:
+		return
+	default:
+	}
+	s.sendAbort(codes.Canceled)
 	s.finishLocal(status.Error(codes.Unavailable, "call reset by peer"))
 }
 
@@ -598,6 +612,10 @@ type serverStream struct {
 	lastTx    atomic.Int64
 	lastProbe atomic.Int64
 	hReplayAt atomic.Int64
+
+	// suppressTerm: the peer disowned the call (RESET) or vanished
+	// (liveness expiry) — no terminal is sent, the tombstone is key-only.
+	suppressTerm atomic.Bool
 
 	// tx state, guarded by txMu.
 	txMu     sync.Mutex

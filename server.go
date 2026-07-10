@@ -44,6 +44,7 @@ type Server struct {
 	calls         map[callKey]*serverStream
 	peers         map[epochKey]*peerState // per client incarnation (§9.4)
 	pendingResets map[callKey]*pendingReset
+	resetAt       map[callKey]int64 // immediate-RESET rate limit (§9.3)
 	drain         bool
 	closed        bool
 	wg            sync.WaitGroup
@@ -75,6 +76,7 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 		calls:         map[callKey]*serverStream{},
 		peers:         map[epochKey]*peerState{},
 		pendingResets: map[callKey]*pendingReset{},
+		resetAt:       map[callKey]int64{},
 
 		methods:  []*serviceDesc{},
 		services: map[string]*serviceDesc{},
@@ -173,18 +175,19 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 		if ps != nil {
 			if tb := ps.tombs[key.sid]; tb != nil {
 				replay := ps.replayTombLocked(tb, now, s.mode.timing.Retransmit)
+				stored := tb.term != nil
 				s.mu.Unlock()
 				if replay != nil {
 					return s.tx.Handle(ctx, replay)
 				}
-				if tb.term != nil {
+				if stored {
 					return nil // replay rate-limited; next probe retries
 				}
-				return s.tx.Handle(ctx, resetFor(f))
+				return s.sendReset(ctx, key, f)
 			}
 		}
 		s.mu.Unlock()
-		return s.tx.Handle(ctx, resetFor(f))
+		return s.sendReset(ctx, key, f)
 	}
 
 	s.mu.Lock()
@@ -216,7 +219,7 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 			aged := ps.hwmAgedLocked(now, s.mode.timing.Tombstone, s.mode.reliable)
 			if key.sid <= aged {
 				s.mu.Unlock()
-				return s.tx.Handle(ctx, resetFor(f))
+				return s.sendReset(ctx, key, f)
 			}
 		}
 		s.mu.Unlock()
@@ -227,7 +230,7 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 	// late (PROTOCOL.md §9.3). Reliable mode has no reordering: immediate.
 	if s.mode.reliable {
 		s.mu.Unlock()
-		return s.tx.Handle(ctx, resetFor(f))
+		return s.sendReset(ctx, key, f)
 	}
 	if _, ok := s.pendingResets[key]; !ok && len(s.pendingResets) < maxPendingResets {
 		s.pendingResets[key] = &pendingReset{
@@ -238,6 +241,29 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 	s.mu.Unlock()
 	s.kickSweep()
 	return nil
+}
+
+// sendReset answers a frame with an immediate RESET, rate-limited per call
+// key (PROTOCOL.md §9.3, §15).
+func (s *Server) sendReset(ctx context.Context, key callKey, f *Frame) error {
+	if !s.mode.reliable {
+		n := nowNano()
+		s.mu.Lock()
+		if last, ok := s.resetAt[key]; ok {
+			if n-last < int64(s.mode.timing.Retransmit) {
+				s.mu.Unlock()
+				return nil
+			}
+		} else if len(s.resetAt) >= maxPendingResets {
+			// Bounded: drop rather than grow (anti-amplification, §15).
+			s.mu.Unlock()
+			return nil
+		}
+		s.resetAt[key] = n
+		s.mu.Unlock()
+		s.kickSweep()
+	}
+	return s.tx.Handle(ctx, resetFor(f))
 }
 
 // resetByPeerSid cancels every live call from peer with the given sid,
@@ -255,6 +281,9 @@ func (s *Server) resetByPeerSid(peer any, sid uint32) {
 
 	cause := status.Error(codes.Unavailable, "call reset by peer")
 	for _, st := range targets {
+		// The peer disowned the call: no terminal is sent and the tombstone
+		// is key-only (PROTOCOL.md §9.3).
+		st.suppressTerm.Store(true)
 		st.cancel(cause)
 	}
 }
@@ -320,7 +349,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		s.mu.Unlock()
 		release()
 		// Draining/stopped servers refuse new calls (PROTOCOL.md §9.4).
-		return s.tx.Handle(ctx, resetFor(f))
+		return s.sendReset(ctx, key, f)
 	}
 	if _, dup := s.calls[key]; dup {
 		// Lost the race against a concurrent duplicate OPEN.
@@ -328,9 +357,19 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		release()
 		return nil
 	}
-	s.calls[key] = st
 	now := time.Now()
 	ps := s.ensurePeerLocked(epochKey{peer: key.peer, epoch: key.epoch}, now)
+	if _, tombed := ps.tombs[key.sid]; tombed ||
+		key.sid <= ps.hwmAgedLocked(now, s.mode.timing.Tombstone, s.mode.reliable) {
+		// Re-check under the registration lock: a concurrent duplicate OPEN
+		// may have run the whole call to completion since Handle's checks —
+		// admitting it here would re-execute a finished call and break
+		// at-most-once (PROTOCOL.md §9.4, §14).
+		s.mu.Unlock()
+		release()
+		return nil
+	}
+	s.calls[key] = st
 	if ps.hwm < key.sid {
 		ps.hwm = key.sid
 	}
@@ -356,6 +395,9 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		if f.isClose() {
 			st.eofOnce.Do(func() { close(st.rxEOF) })
 		}
+		// Creation ack (§8): without it, a slow producer would leave the
+		// client's OPEN|CLOSE — full request payload — retransmitting.
+		st.sendH()
 		go s.runStream(st)
 	} else {
 		// CS/bidi OPENs are eager and bare: payload or CLOSE here is
@@ -440,7 +482,11 @@ func (s *Server) runUnary(st *serverStream, transport *serverTransportUnary, ope
 	}
 
 	// The terminal is sent even when the handler ctx ended: the client (or
-	// its tombstone) decides what to do with it.
+	// its tombstone) decides what to do with it — unless the peer disowned
+	// the call (RESET) or vanished (liveness), where nothing listens (§9.3).
+	if st.suppressTerm.Load() {
+		return
+	}
 	term = f
 	st.transmit(context.WithoutCancel(st.ctx), f)
 }
@@ -466,6 +512,9 @@ func (s *Server) runStream(st *serverStream) {
 	}
 
 	f := st.terminalFrame(err)
+	if st.suppressTerm.Load() {
+		return
+	}
 	term = f
 	st.transmit(context.WithoutCancel(st.ctx), f)
 }

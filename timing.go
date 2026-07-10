@@ -48,6 +48,10 @@ func (t Timing) withDefaults() Timing {
 	if t.Tombstone == 0 {
 		t.Tombstone = 30 * time.Second
 	}
+	if t.Tombstone < 2*t.Liveness {
+		// TTL_tomb floor while liveness is enabled (PROTOCOL.md §9.2).
+		t.Tombstone = 2 * t.Liveness
+	}
 	if t.Hold == 0 {
 		t.Hold = t.Retransmit
 	}
@@ -65,12 +69,6 @@ func (t Timing) probe() time.Duration {
 func (t Timing) tick() time.Duration {
 	d := min(t.Retransmit, t.Hold) / 2
 	return max(time.Millisecond, min(d, 500*time.Millisecond))
-}
-
-// tombstoneFor is the tombstone TTL for one call: TTL_tomb floored by the
-// call's propagated timeout remainder (PROTOCOL.md §9.2).
-func (t Timing) tombstoneFor(remaining time.Duration) time.Duration {
-	return max(t.Tombstone, remaining)
 }
 
 // mode aggregates the resolved transport profile.

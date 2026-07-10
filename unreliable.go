@@ -82,15 +82,15 @@ func (s *clientStream) transmit(ctx context.Context, f *Frame) error {
 	return s.conn.tx.Handle(ctx, f)
 }
 
-// scheduleRetxLocked arms the stream's retransmission timer; txMu held.
+// scheduleRetxLocked (re)arms the stream's retransmission timer; txMu held.
+// Each control event starts a fresh RTI schedule (PROTOCOL.md §10.3) — a
+// half-close must not inherit the OPEN's backed-off cadence.
 func (s *clientStream) scheduleRetxLocked() {
 	if s.conn.mode.reliable {
 		return
 	}
-	if s.retxAt.IsZero() {
-		s.retxIval = s.conn.mode.timing.Retransmit
-		s.retxAt = time.Now().Add(s.retxIval)
-	}
+	s.retxIval = s.conn.mode.timing.Retransmit
+	s.retxAt = time.Now().Add(s.retxIval)
 }
 
 // sweepRetx returns the control frames due for retransmission and advances
@@ -184,7 +184,13 @@ func (c *Conn) sendReset(ctx context.Context, f *Frame) error {
 		sid := f.GetSid()
 		n := nowNano()
 		c.mu.Lock()
-		if last, ok := c.resetAt[sid]; ok && n-last < int64(c.mode.timing.Retransmit) {
+		if last, ok := c.resetAt[sid]; ok {
+			if n-last < int64(c.mode.timing.Retransmit) {
+				c.mu.Unlock()
+				return nil
+			}
+		} else if len(c.resetAt) >= maxPendingResets {
+			// Bounded: drop rather than grow (anti-amplification, §15).
 			c.mu.Unlock()
 			return nil
 		}

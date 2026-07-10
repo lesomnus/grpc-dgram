@@ -81,6 +81,15 @@ func (ps *peerState) addTombLocked(sid uint32, term *Frame, expire time.Time) {
 	if term != nil {
 		size = len(term.GetPayload())
 	}
+	if old := ps.tombs[sid]; old != nil {
+		// Replace in place: keep the order entry, fix the byte accounting.
+		ps.tombBytes += size - old.size
+		old.term, old.size = term, size
+		if expire.After(old.expire) {
+			old.expire = expire
+		}
+		return
+	}
 	ps.tombs[sid] = &srvTomb{sid: sid, term: term, size: size, expire: expire}
 	ps.tombOrder = append(ps.tombOrder, sid)
 	ps.tombBytes += size
@@ -181,7 +190,7 @@ func (s *Server) kickSweep() {
 func (s *Server) hasWork() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.calls) > 0 || len(s.peers) > 0 || len(s.pendingResets) > 0
+	return len(s.calls) > 0 || len(s.peers) > 0 || len(s.pendingResets) > 0 || len(s.resetAt) > 0
 }
 
 func (s *Server) sweepLoop() {
@@ -233,6 +242,13 @@ func (s *Server) sweep(now time.Time) {
 		jobs = append(jobs, txJob{ctx, r})
 	}
 
+	// Prune the immediate-RESET rate-limit history.
+	for key, at := range s.resetAt {
+		if n-at > int64(t.Tombstone) {
+			delete(s.resetAt, key)
+		}
+	}
+
 	// Containers: checkpoints, tombstone expiry, liveness, keepalive, GC.
 	for ek, ps := range s.peers {
 		ps.cps = append(ps.cps, hwmCP{at: now, hwm: ps.hwm})
@@ -249,6 +265,16 @@ func (s *Server) sweep(now time.Time) {
 				ps.removeTombLocked(sid)
 			}
 		}
+		if len(ps.tombOrder) > 2*len(ps.tombs)+16 {
+			// Compact the eviction order of expired entries.
+			kept := ps.tombOrder[:0]
+			for _, sid := range ps.tombOrder {
+				if _, ok := ps.tombs[sid]; ok {
+					kept = append(kept, sid)
+				}
+			}
+			ps.tombOrder = kept
+		}
 
 		if ps.liveCalls > 0 && !ps.dead {
 			if n-ps.lastRx.Load() >= int64(t.Liveness) {
@@ -256,6 +282,7 @@ func (s *Server) sweep(now time.Time) {
 				ps.dead = true
 				for k, st := range s.calls {
 					if k.peer == ek.peer && k.epoch == ek.epoch {
+						st.suppressTerm.Store(true)
 						lost = append(lost, st)
 					}
 				}
