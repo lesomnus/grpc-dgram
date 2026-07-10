@@ -3,8 +3,8 @@ package echo_test
 import (
 	"testing"
 
-	"github.com/lesomnu/grpc-dgram/internal/echo"
-	"github.com/lesomnu/grpc-dgram/internal/x"
+	"github.com/lesomnus/grpc-dgram/internal/echo"
+	"github.com/lesomnus/grpc-dgram/internal/x"
 )
 
 func TestCircularShift(t *testing.T) {

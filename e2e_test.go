@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	drpc "github.com/lesomnu/grpc-dgram"
-	"github.com/lesomnu/grpc-dgram/internal/echo"
-	"github.com/lesomnu/grpc-dgram/internal/x"
+	drpc "github.com/lesomnus/grpc-dgram"
+	"github.com/lesomnus/grpc-dgram/internal/echo"
+	"github.com/lesomnus/grpc-dgram/internal/x"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"

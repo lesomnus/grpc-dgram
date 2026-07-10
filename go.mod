@@ -1,4 +1,4 @@
-module github.com/lesomnu/grpc-dgram
+module github.com/lesomnus/grpc-dgram
 
 go 1.26.1
 

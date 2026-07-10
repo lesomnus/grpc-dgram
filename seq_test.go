@@ -3,7 +3,7 @@ package drpc
 import (
 	"testing"
 
-	"github.com/lesomnu/grpc-dgram/internal/x"
+	"github.com/lesomnus/grpc-dgram/internal/x"
 )
 
 func TestCheckAndSet(t *testing.T) {

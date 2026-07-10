@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	drpc "github.com/lesomnu/grpc-dgram"
-	"github.com/lesomnu/grpc-dgram/internal/echo"
+	drpc "github.com/lesomnus/grpc-dgram"
+	"github.com/lesomnus/grpc-dgram/internal/echo"
 	"google.golang.org/protobuf/proto"
 )
 
