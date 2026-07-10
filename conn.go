@@ -2,31 +2,38 @@ package drpc
 
 import (
 	"context"
-	"io"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 var _ grpc.ClientConnInterface = &Conn{}
 
+// learnedIndex is a method index learned from a server, valid only for the
+// epoch it was learned under (PROTOCOL.md §13).
+type learnedIndex struct {
+	epoch uint32
+	index uint32
+}
+
 type Conn struct {
-	mu sync.Mutex
-	tx FrameHandler
-	ss map[uint32]*clientStream
+	// epoch is this Conn incarnation's nonce (PROTOCOL.md §6.1).
+	epoch uint32
+	tx    FrameHandler
 
-	sid atomic.Uint32
+	mu        sync.Mutex
+	ss        map[uint32]*clientStream
+	sidNext   uint32
+	exhausted bool
 
-	// methods is a mapping from method name to index.
-	// Key must be a full method name (e.g. "/hday.HolderService/Add").
-	methods sync.Map // map[string]uint32
-	// timeout specifies a time limit for requests.
-	// No deadline will be set if timeout is zero.
-	timeout time.Duration
+	// serverEpoch tracks the peer incarnation; learned method indices are
+	// keyed by it (PROTOCOL.md §6.1, §13).
+	serverEpoch atomic.Uint32
+	methods     sync.Map // string -> learnedIndex
 
 	call_opts  []grpc.CallOption
 	unary_int  grpc.UnaryClientInterceptor
@@ -40,10 +47,9 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 	}
 
 	v := &Conn{
-		tx: tx,
-		ss: map[uint32]*clientStream{},
-
-		timeout: 5 * time.Second,
+		epoch: rand.Uint32(),
+		tx:    tx,
+		ss:    map[uint32]*clientStream{},
 
 		call_opts: []grpc.CallOption{},
 	}
@@ -74,77 +80,113 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 	return v
 }
 
+// Handle delivers one server frame to this Conn. Adapters call it for each
+// frame of a received envelop, in order (PROTOCOL.md §9.1).
 func (c *Conn) Handle(ctx context.Context, f *Frame) error {
+	if f.isReset() {
+		// Act only if the echoed epoch is ours (PROTOCOL.md §9.3).
+		if f.GetEpoch() != c.epoch {
+			return nil
+		}
+		if s := c.lookup(f.GetSid()); s != nil {
+			s.finishReset()
+		}
+		return nil
+	}
+	if f.isPing() {
+		// Liveness and stream probes arrive with the timeout system (M3).
+		return nil
+	}
+
+	s := c.lookup(f.GetSid())
+	if s == nil {
+		// Unknown sid: tell a desynced server to stop, immediately —
+		// no OPEN can ever arrive at a client (PROTOCOL.md §9.3).
+		return c.tx.Handle(ctx, resetFor(f))
+	}
+	s.handleRx(f)
+	return nil
+}
+
+// Close fails every live call with UNAVAILABLE. Adapters call it when the
+// transport dies (PROTOCOL.md §4.5). Idempotent.
+func (c *Conn) Close(err error) {
+	c.mu.Lock()
+	ss := make([]*clientStream, 0, len(c.ss))
+	for _, s := range c.ss {
+		ss = append(ss, s)
+	}
+	c.mu.Unlock()
+
+	st := status.Error(codes.Unavailable, "transport closed")
+	if err != nil {
+		st = status.Errorf(codes.Unavailable, "transport closed: %v", err)
+	}
+	for _, s := range ss {
+		s.finishLocal(st)
+	}
+}
+
+func (c *Conn) lookup(sid uint32) *clientStream {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.ss[sid]
+}
 
-	sid := f.GetSid()
-	s, ok := c.ss[sid]
-	if !ok {
-		// Corresponding stream not found.
-		// Maybe the f is delayed or for the previous Conn?
-		return io.EOF
+func (c *Conn) remove(sid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.ss, sid)
+}
+
+// noteServerFrame runs for every frame accepted by a live stream: it tracks
+// the server epoch (flushing learned indices on change) and learns method
+// indices (PROTOCOL.md §6.1, §13).
+func (c *Conn) noteServerFrame(f *Frame, method string) {
+	e := f.GetEpoch()
+	if c.serverEpoch.Load() != e {
+		c.serverEpoch.Store(e)
+		c.methods.Range(func(k, _ any) bool {
+			c.methods.Delete(k)
+			return true
+		})
 	}
-
-	if f.HasCode() {
-		// Stream should NOT be closed until the rx queue is empty.
-		s.tx_closed.Store(true)
-		s.trailer = f.GetTrailer().MD()
-	} else if s.tx_closed.Load() {
-		// Stream is being closed but there are still frames in the rx queue.
-		// Drop the extra frames.
-		return io.EOF
+	if idx := f.GetMethodIndex(); idx > 0 {
+		c.methods.Store(method, learnedIndex{epoch: e, index: idx})
 	}
-
-	if f.HasHeader() {
-		s.header = f.GetHeader().MD()
-	}
-
-	return s.put(ctx, f)
 }
 
 func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...grpc.CallOption) error {
-	// // Deadline.
-	// if deadline, ok := ctx.Deadline(); ok {
-	// 	req.SetDeadline(timestamppb.New(deadline))
-	// } else if c.timeout > 0 {
-	// 	deadline := time.Now().Add(c.timeout)
-	// 	req.SetDeadline(timestamppb.New(deadline))
-
-	// 	ctx_, cancel := context.WithDeadline(ctx, deadline)
-	// 	defer cancel()
-	// 	ctx = ctx_
-	// }
-
 	opts = append(c.call_opts, opts...)
 	return c.unary_int(ctx, method, in, out, nil, func(ctx context.Context, method string, in, out any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
-		stream := c.newStream(ctx, method)
-		defer stream.Close()
+		s, err := c.newStream(ctx, method, false, false)
+		if err != nil {
+			return err
+		}
+		defer s.abandon()
 
 		for _, opt := range opts {
-			switch opt := opt.(type) {
-			case grpc.ForceCodecV2CallOption:
-				stream.codec = opt.CodecV2
-				stream.codec_name = opt.CodecV2.Name()
+			if opt, ok := opt.(grpc.ForceCodecV2CallOption); ok {
+				s.codec = opt.CodecV2
+				s.codecName = opt.CodecV2.Name()
 			}
 		}
 
-		if err := stream.SendMsg(in); err != nil {
+		if err := s.send(in); err != nil {
 			return err
 		}
-		if err := stream.RecvMsg(out); err != nil {
+		if err := s.RecvMsg(out); err != nil {
 			return err
 		}
 
 		for _, opt := range opts {
 			switch opt := opt.(type) {
 			case grpc.HeaderCallOption:
-				*opt.HeaderAddr = stream.rx_last.GetHeader().MD()
+				*opt.HeaderAddr, _ = s.Header()
 			case grpc.TrailerCallOption:
-				*opt.TrailerAddr = stream.rx_last.GetTrailer().MD()
+				*opt.TrailerAddr = s.Trailer()
 			}
 		}
-
 		return nil
 	}, opts...)
 }
@@ -152,61 +194,51 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 	opts = append(c.call_opts, opts...)
 
-	stream := c.newStream(ctx, method)
-	for _, opt := range opts {
-		switch opt := opt.(type) {
-		case grpc.ForceCodecV2CallOption:
-			stream.codec = opt.CodecV2
-			stream.codec_name = opt.CodecV2.Name()
+	// The stream is created by the innermost streamer so the OPEN frame sees
+	// the interceptor-final ctx and merged call options (PROTOCOL.md §8).
+	streamer := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		s, err := c.newStream(ctx, method, desc.ClientStreams, desc.ServerStreams)
+		if err != nil {
+			return nil, err
 		}
+		for _, opt := range opts {
+			if opt, ok := opt.(grpc.ForceCodecV2CallOption); ok {
+				s.codec = opt.CodecV2
+				s.codecName = opt.CodecV2.Name()
+			}
+		}
+
+		if desc.ClientStreams {
+			// Eager OPEN: the server must be able to start the handler even
+			// if the client never sends (PROTOCOL.md §8).
+			if err := s.sendOpen(); err != nil {
+				s.finishLocal(toStatusErr(err))
+				return nil, err
+			}
+		}
+		return s, nil
 	}
 
-	if !desc.ClientStreams {
-		// Server streaming is closed right after the first tx frame
-		// so piggyback the close indicator to the first tx frame and drop
-		// the second tx frame.
-		tx := stream.tx
-		stream.tx = FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
-			// Next frame must be the stream close so skip it since we piggybacked the one
-			// and store original handler for the next frame since it is possible to send
-			// a frame to abort remote stream after the first frame is sent.
-			stream.tx = SkipNextFrame(&stream.tx, tx)
-
-			f.SetCode(uint32(codes.OK))
-			return tx.Handle(ctx, f)
-		})
-	}
-	if c.stream_int == nil {
-		return stream, nil
-	}
-
-	return c.stream_int(ctx, desc, nil, method, func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-		return stream, nil
-	}, opts...)
+	return c.stream_int(ctx, desc, nil, method, streamer, opts...)
 }
 
-func (c *Conn) newStream(ctx context.Context, method string) *clientStream {
-	md, ok := metadata.FromOutgoingContext(ctx)
-
+func (c *Conn) newStream(ctx context.Context, method string, clientStreams, serverStreams bool) (*clientStream, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var stream *clientStream
-	for {
-		sid := c.sid.Add(1)
-		if _, ok := c.ss[sid]; !ok {
-			stream = newClientStream(ctx, c, sid, method)
-			c.ss[sid] = stream
-			break
-		}
-
-		sid = c.sid.Add(1)
+	if c.exhausted {
+		return nil, status.Error(codes.ResourceExhausted, "sid space exhausted; create a new Conn")
 	}
-	if ok {
-		stream.header = md
+	c.sidNext++
+	if c.sidNext == 0 {
+		// The sid space is never recycled within an epoch (PROTOCOL.md §6.2).
+		c.exhausted = true
+		return nil, status.Error(codes.ResourceExhausted, "sid space exhausted; create a new Conn")
 	}
 
-	return stream
+	s := newClientStream(ctx, c, c.sidNext, method, clientStreams, serverStreams)
+	c.ss[s.sid] = s
+	return s, nil
 }
 
 type connOption struct {

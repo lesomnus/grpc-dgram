@@ -23,7 +23,10 @@ func BenchmarkServerHandle(b *testing.B) {
 	}
 	new_frame := func(sid uint32) *drpc.Frame {
 		return drpc.Frame_builder{
+			Epoch:   1,
 			Sid:     sid,
+			Seq:     1,
+			Flags:   drpc.FlagOpen,
 			Method:  echo.EchoService_Noop_FullMethodName,
 			Payload: data,
 		}.Build()

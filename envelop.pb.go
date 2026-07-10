@@ -20,9 +20,11 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Envelop is the wire unit: every transport message/datagram is exactly one
+// marshaled Envelop holding 1..n frames, processed in order. See PROTOCOL.md §4.1.
 type Envelop struct {
 	state             protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_Frames *[]*Frame              `protobuf:"bytes,8,rep,name=frames"`
+	xxx_hidden_Frames *[]*Frame              `protobuf:"bytes,1,rep,name=frames"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -85,7 +87,7 @@ const file_drpc_envelop_proto_rawDesc = "" +
 	"\n" +
 	"\x12drpc/envelop.proto\x12\x04drpc\x1a\x10drpc/frame.proto\".\n" +
 	"\aEnvelop\x12#\n" +
-	"\x06frames\x18\b \x03(\v2\v.drpc.FrameR\x06framesB%Z#github.com/lesomnus/grpc-dgram;drpcb\beditionsp\xe8\a"
+	"\x06frames\x18\x01 \x03(\v2\v.drpc.FrameR\x06framesB%Z#github.com/lesomnus/grpc-dgram;drpcb\beditionsp\xe8\a"
 
 var file_drpc_envelop_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_drpc_envelop_proto_goTypes = []any{

@@ -9,7 +9,7 @@ package drpc
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
-	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
+	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	reflect "reflect"
 	unsafe "unsafe"
 )
@@ -21,19 +21,29 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Frame is the unit of the drpc protocol. See PROTOCOL.md §5.
+//
+// Flags (bitmask on `flags`):
+//
+//	1 = OPEN  — creates the call; client→server only; seq MUST be 1.
+//	2 = CLOSE — sender's direction finished; with `code` it is terminal.
+//	4 = RESET — stateless "no such call"; `epoch` echoes the offending frame.
+//	8 = PING  — sid 0: peer keepalive; sid≠0: stream probe.
 type Frame struct {
 	state                  protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_Sid         uint32                 `protobuf:"fixed32,1,opt,name=sid"`
-	xxx_hidden_Seq         uint32                 `protobuf:"fixed32,2,opt,name=seq"`
-	xxx_hidden_Codec       string                 `protobuf:"bytes,3,opt,name=codec"`
-	xxx_hidden_Method      string                 `protobuf:"bytes,4,opt,name=method"`
-	xxx_hidden_MethodIndex uint32                 `protobuf:"varint,5,opt,name=method_index,json=methodIndex"`
-	xxx_hidden_Deadline    *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=deadline"`
-	xxx_hidden_Payload     []byte                 `protobuf:"bytes,8,opt,name=payload"`
-	xxx_hidden_Code        uint32                 `protobuf:"varint,9,opt,name=code"`
-	xxx_hidden_Desc        string                 `protobuf:"bytes,10,opt,name=desc"`
-	xxx_hidden_Header      *Metadata              `protobuf:"bytes,11,opt,name=header"`
-	xxx_hidden_Trailer     *Metadata              `protobuf:"bytes,12,opt,name=trailer"`
+	xxx_hidden_Epoch       uint32                 `protobuf:"fixed32,1,opt,name=epoch"`
+	xxx_hidden_Sid         uint32                 `protobuf:"fixed32,2,opt,name=sid"`
+	xxx_hidden_Seq         uint32                 `protobuf:"fixed32,3,opt,name=seq"`
+	xxx_hidden_Flags       uint32                 `protobuf:"varint,4,opt,name=flags"`
+	xxx_hidden_Method      string                 `protobuf:"bytes,5,opt,name=method"`
+	xxx_hidden_MethodIndex uint32                 `protobuf:"varint,6,opt,name=method_index,json=methodIndex"`
+	xxx_hidden_Codec       string                 `protobuf:"bytes,7,opt,name=codec"`
+	xxx_hidden_Timeout     *durationpb.Duration   `protobuf:"bytes,8,opt,name=timeout"`
+	xxx_hidden_Payload     []byte                 `protobuf:"bytes,9,opt,name=payload"`
+	xxx_hidden_Code        uint32                 `protobuf:"varint,10,opt,name=code"`
+	xxx_hidden_Desc        string                 `protobuf:"bytes,11,opt,name=desc"`
+	xxx_hidden_Header      *Metadata              `protobuf:"bytes,12,opt,name=header"`
+	xxx_hidden_Trailer     *Metadata              `protobuf:"bytes,13,opt,name=trailer"`
 	XXX_raceDetectHookData protoimpl.RaceDetectHookData
 	XXX_presence           [1]uint32
 	unknownFields          protoimpl.UnknownFields
@@ -65,6 +75,13 @@ func (x *Frame) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
+func (x *Frame) GetEpoch() uint32 {
+	if x != nil {
+		return x.xxx_hidden_Epoch
+	}
+	return 0
+}
+
 func (x *Frame) GetSid() uint32 {
 	if x != nil {
 		return x.xxx_hidden_Sid
@@ -79,11 +96,11 @@ func (x *Frame) GetSeq() uint32 {
 	return 0
 }
 
-func (x *Frame) GetCodec() string {
+func (x *Frame) GetFlags() uint32 {
 	if x != nil {
-		return x.xxx_hidden_Codec
+		return x.xxx_hidden_Flags
 	}
-	return ""
+	return 0
 }
 
 func (x *Frame) GetMethod() string {
@@ -100,9 +117,16 @@ func (x *Frame) GetMethodIndex() uint32 {
 	return 0
 }
 
-func (x *Frame) GetDeadline() *timestamppb.Timestamp {
+func (x *Frame) GetCodec() string {
 	if x != nil {
-		return x.xxx_hidden_Deadline
+		return x.xxx_hidden_Codec
+	}
+	return ""
+}
+
+func (x *Frame) GetTimeout() *durationpb.Duration {
+	if x != nil {
+		return x.xxx_hidden_Timeout
 	}
 	return nil
 }
@@ -142,6 +166,10 @@ func (x *Frame) GetTrailer() *Metadata {
 	return nil
 }
 
+func (x *Frame) SetEpoch(v uint32) {
+	x.xxx_hidden_Epoch = v
+}
+
 func (x *Frame) SetSid(v uint32) {
 	x.xxx_hidden_Sid = v
 }
@@ -150,8 +178,8 @@ func (x *Frame) SetSeq(v uint32) {
 	x.xxx_hidden_Seq = v
 }
 
-func (x *Frame) SetCodec(v string) {
-	x.xxx_hidden_Codec = v
+func (x *Frame) SetFlags(v uint32) {
+	x.xxx_hidden_Flags = v
 }
 
 func (x *Frame) SetMethod(v string) {
@@ -162,8 +190,12 @@ func (x *Frame) SetMethodIndex(v uint32) {
 	x.xxx_hidden_MethodIndex = v
 }
 
-func (x *Frame) SetDeadline(v *timestamppb.Timestamp) {
-	x.xxx_hidden_Deadline = v
+func (x *Frame) SetCodec(v string) {
+	x.xxx_hidden_Codec = v
+}
+
+func (x *Frame) SetTimeout(v *durationpb.Duration) {
+	x.xxx_hidden_Timeout = v
 }
 
 func (x *Frame) SetPayload(v []byte) {
@@ -171,11 +203,12 @@ func (x *Frame) SetPayload(v []byte) {
 		v = []byte{}
 	}
 	x.xxx_hidden_Payload = v
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 8, 13)
 }
 
 func (x *Frame) SetCode(v uint32) {
 	x.xxx_hidden_Code = v
-	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 7, 11)
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 9, 13)
 }
 
 func (x *Frame) SetDesc(v string) {
@@ -190,18 +223,25 @@ func (x *Frame) SetTrailer(v *Metadata) {
 	x.xxx_hidden_Trailer = v
 }
 
-func (x *Frame) HasDeadline() bool {
+func (x *Frame) HasTimeout() bool {
 	if x == nil {
 		return false
 	}
-	return x.xxx_hidden_Deadline != nil
+	return x.xxx_hidden_Timeout != nil
+}
+
+func (x *Frame) HasPayload() bool {
+	if x == nil {
+		return false
+	}
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 8)
 }
 
 func (x *Frame) HasCode() bool {
 	if x == nil {
 		return false
 	}
-	return protoimpl.X.Present(&(x.XXX_presence[0]), 7)
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 9)
 }
 
 func (x *Frame) HasHeader() bool {
@@ -218,12 +258,17 @@ func (x *Frame) HasTrailer() bool {
 	return x.xxx_hidden_Trailer != nil
 }
 
-func (x *Frame) ClearDeadline() {
-	x.xxx_hidden_Deadline = nil
+func (x *Frame) ClearTimeout() {
+	x.xxx_hidden_Timeout = nil
+}
+
+func (x *Frame) ClearPayload() {
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 8)
+	x.xxx_hidden_Payload = nil
 }
 
 func (x *Frame) ClearCode() {
-	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 7)
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 9)
 	x.xxx_hidden_Code = 0
 }
 
@@ -238,19 +283,35 @@ func (x *Frame) ClearTrailer() {
 type Frame_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
-	Sid   uint32
-	Seq   uint32
-	Codec string
-	// Method is mapped to numeric index at the server.
-	// Server always respond only with `method_index` so the client can learn which
-	// service is mapped to what number during communication.
-	Method      string
+	// Sender's incarnation nonce, chosen at random per Conn/Server instance.
+	// Exception: RESET frames echo the epoch of the frame they answer.
+	Epoch uint32
+	// Stream id, client-allocated, starting at 1, never reused within an
+	// epoch. 0 is reserved for peer-scope control frames (PING).
+	Sid uint32
+	// Per-stream, per-direction sequence, starting at 1.
+	// Stateless frames (RESET, PING) carry 0.
+	Seq uint32
+	// Flag bitmask; see message comment.
+	Flags uint32
+	// Full method name (e.g. "/echo.EchoService/Once"); OPEN frames only.
+	Method string
+	// 1-based method index in server registration order; 0 = unset.
+	// Servers attach it to every frame they send (the learning channel).
 	MethodIndex uint32
-	Deadline    *timestamppb.Timestamp
-	Payload     []byte
-	// Status code and error description.
+	// Codec name; OPEN frames only; "" means proto.
+	Codec string
+	// Remaining call budget at send time; OPEN frames only.
+	Timeout *durationpb.Duration
+	// One marshaled message. Presence is meaningful: a flag-less frame WITH
+	// payload is a data frame (even when the message marshals to 0 bytes);
+	// WITHOUT payload it is a header frame.
+	Payload []byte
+	// gRPC status code; meaningful only on CLOSE frames, where presence
+	// distinguishes terminal CLOSE (code set) from half-close (unset).
 	// See https://grpc.io/docs/guides/status-codes/.
-	Code    *uint32
+	Code *uint32
+	// Status description.
 	Desc    string
 	Header  *Metadata
 	Trailer *Metadata
@@ -260,15 +321,20 @@ func (b0 Frame_builder) Build() *Frame {
 	m0 := &Frame{}
 	b, x := &b0, m0
 	_, _ = b, x
+	x.xxx_hidden_Epoch = b.Epoch
 	x.xxx_hidden_Sid = b.Sid
 	x.xxx_hidden_Seq = b.Seq
-	x.xxx_hidden_Codec = b.Codec
+	x.xxx_hidden_Flags = b.Flags
 	x.xxx_hidden_Method = b.Method
 	x.xxx_hidden_MethodIndex = b.MethodIndex
-	x.xxx_hidden_Deadline = b.Deadline
-	x.xxx_hidden_Payload = b.Payload
+	x.xxx_hidden_Codec = b.Codec
+	x.xxx_hidden_Timeout = b.Timeout
+	if b.Payload != nil {
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 8, 13)
+		x.xxx_hidden_Payload = b.Payload
+	}
 	if b.Code != nil {
-		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 7, 11)
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 9, 13)
 		x.xxx_hidden_Code = *b.Code
 	}
 	x.xxx_hidden_Desc = b.Desc
@@ -281,29 +347,31 @@ var File_drpc_frame_proto protoreflect.FileDescriptor
 
 const file_drpc_frame_proto_rawDesc = "" +
 	"\n" +
-	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xcf\x02\n" +
-	"\x05Frame\x12\x10\n" +
-	"\x03sid\x18\x01 \x01(\aR\x03sid\x12\x10\n" +
-	"\x03seq\x18\x02 \x01(\aR\x03seq\x12\x14\n" +
-	"\x05codec\x18\x03 \x01(\tR\x05codec\x12\x16\n" +
-	"\x06method\x18\x04 \x01(\tR\x06method\x12!\n" +
-	"\fmethod_index\x18\x05 \x01(\rR\vmethodIndex\x126\n" +
-	"\bdeadline\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\bdeadline\x12\x18\n" +
-	"\apayload\x18\b \x01(\fR\apayload\x12\x19\n" +
-	"\x04code\x18\t \x01(\rB\x05\xaa\x01\x02\b\x01R\x04code\x12\x12\n" +
-	"\x04desc\x18\n" +
-	" \x01(\tR\x04desc\x12&\n" +
-	"\x06header\x18\v \x01(\v2\x0e.drpc.MetadataR\x06header\x12(\n" +
-	"\atrailer\x18\f \x01(\v2\x0e.drpc.MetadataR\atrailerB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
+	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x1egoogle/protobuf/duration.proto\"\xff\x02\n" +
+	"\x05Frame\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\aR\x05epoch\x12\x10\n" +
+	"\x03sid\x18\x02 \x01(\aR\x03sid\x12\x10\n" +
+	"\x03seq\x18\x03 \x01(\aR\x03seq\x12\x14\n" +
+	"\x05flags\x18\x04 \x01(\rR\x05flags\x12\x16\n" +
+	"\x06method\x18\x05 \x01(\tR\x06method\x12!\n" +
+	"\fmethod_index\x18\x06 \x01(\rR\vmethodIndex\x12\x14\n" +
+	"\x05codec\x18\a \x01(\tR\x05codec\x123\n" +
+	"\atimeout\x18\b \x01(\v2\x19.google.protobuf.DurationR\atimeout\x12\x1f\n" +
+	"\apayload\x18\t \x01(\fB\x05\xaa\x01\x02\b\x01R\apayload\x12\x19\n" +
+	"\x04code\x18\n" +
+	" \x01(\rB\x05\xaa\x01\x02\b\x01R\x04code\x12\x12\n" +
+	"\x04desc\x18\v \x01(\tR\x04desc\x12&\n" +
+	"\x06header\x18\f \x01(\v2\x0e.drpc.MetadataR\x06header\x12(\n" +
+	"\atrailer\x18\r \x01(\v2\x0e.drpc.MetadataR\atrailerB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
 
 var file_drpc_frame_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_drpc_frame_proto_goTypes = []any{
-	(*Frame)(nil),                 // 0: drpc.Frame
-	(*timestamppb.Timestamp)(nil), // 1: google.protobuf.Timestamp
-	(*Metadata)(nil),              // 2: drpc.Metadata
+	(*Frame)(nil),               // 0: drpc.Frame
+	(*durationpb.Duration)(nil), // 1: google.protobuf.Duration
+	(*Metadata)(nil),            // 2: drpc.Metadata
 }
 var file_drpc_frame_proto_depIdxs = []int32{
-	1, // 0: drpc.Frame.deadline:type_name -> google.protobuf.Timestamp
+	1, // 0: drpc.Frame.timeout:type_name -> google.protobuf.Duration
 	2, // 1: drpc.Frame.header:type_name -> drpc.Metadata
 	2, // 2: drpc.Frame.trailer:type_name -> drpc.Metadata
 	3, // [3:3] is the sub-list for method output_type

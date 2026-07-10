@@ -6,6 +6,8 @@ import "drpc/frame.proto";
 
 option go_package = "github.com/lesomnus/grpc-dgram;drpc";
 
+// Envelop is the wire unit: every transport message/datagram is exactly one
+// marshaled Envelop holding 1..n frames, processed in order. See PROTOCOL.md §4.1.
 message Envelop {
-  repeated Frame frames = 8;
+  repeated Frame frames = 1;
 }

@@ -3,32 +3,54 @@ package drpc
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/mem"
+	"google.golang.org/grpc/status"
 )
 
 var _ grpc.ServiceRegistrar = &Server{}
 
-type Server struct {
-	mu sync.Mutex
-	tx FrameHandler
-	ss map[uint32]*serverStream
+// callKey identifies a live call: streams are keyed by
+// (peer, client-epoch, sid) (PROTOCOL.md §6.2).
+type callKey struct {
+	peer  any
+	epoch uint32
+	sid   uint32
+}
 
-	// methods is a mapping from method name to index.
-	// Key must be a full method name (e.g. "/hday.HolderService/Add").
-	methods  []*serviceDesc
+// epochKey identifies one client incarnation seen from one peer.
+type epochKey struct {
+	peer  any
+	epoch uint32
+}
+
+type Server struct {
+	// epoch is this Server incarnation's nonce (PROTOCOL.md §6.1).
+	epoch uint32
+	tx    FrameHandler
+
+	root       context.Context
+	rootCancel context.CancelCauseFunc
+
+	mu     sync.Mutex
+	calls  map[callKey]*serverStream
+	hwm    map[epochKey]uint32 // high-water mark per client incarnation (§9.4)
+	drain  bool
+	closed bool
+	wg     sync.WaitGroup
+
+	// serving flips on the first Handle; the registry is immutable after
+	// that (PROTOCOL.md §13).
+	serving  atomic.Bool
+	methods  []*serviceDesc // 1-based: methods[i-1] has index i
 	services map[string]*serviceDesc
 
 	unary_int  grpc.UnaryServerInterceptor
 	stream_int grpc.StreamServerInterceptor
-
-	wg     sync.WaitGroup
-	drain  atomic.Bool
-	closed atomic.Bool
 }
 
 func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
@@ -38,14 +60,17 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 	}
 
 	v := &Server{
-		tx: tx,
-		ss: map[uint32]*serverStream{},
+		epoch: rand.Uint32(),
+		tx:    tx,
+
+		calls: map[callKey]*serverStream{},
+		hwm:   map[epochKey]uint32{},
 
 		methods:  []*serviceDesc{},
 		services: map[string]*serviceDesc{},
-
-		// unary_int: ,
 	}
+	v.root, v.rootCancel = context.WithCancelCause(context.Background())
+
 	if opt.unary_int != nil {
 		opt.unary_ints = append([]grpc.UnaryServerInterceptor{opt.unary_int}, opt.unary_ints...)
 	}
@@ -63,235 +88,309 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 }
 
 func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
-	for i, method := range desc.Methods {
-		fullname := fmt.Sprintf("/%s/%s", desc.ServiceName, method.MethodName)
+	if s.serving.Load() {
+		panic("drpc: RegisterService called after the server started serving")
+	}
+
+	register := func(fullname string) *serviceDesc {
 		d, ok := s.services[fullname]
 		if !ok {
+			s.methods = append(s.methods, nil)
 			d = &serviceDesc{
-				index:    uint32(len(s.methods)),
+				index:    uint32(len(s.methods)), // 1-based (PROTOCOL.md §13)
 				fullname: fullname,
 			}
+			s.methods[d.index-1] = d
 			s.services[fullname] = d
-			s.methods = append(s.methods, d)
 		}
+		return d
+	}
 
+	for i, method := range desc.Methods {
+		d := register(fmt.Sprintf("/%s/%s", desc.ServiceName, method.MethodName))
 		d.service = desc
 		d.method = &desc.Methods[i]
 		d.impl = impl
 	}
 	for i, stream := range desc.Streams {
-		fullname := fmt.Sprintf("/%s/%s", desc.ServiceName, stream.StreamName)
-		d, ok := s.services[fullname]
-		if !ok {
-			d = &serviceDesc{
-				index:    uint32(len(s.methods)),
-				fullname: fullname,
-			}
-			s.services[fullname] = d
-			s.methods = append(s.methods, d)
-		}
-
+		d := register(fmt.Sprintf("/%s/%s", desc.ServiceName, stream.StreamName))
 		d.service = desc
 		d.stream = &desc.Streams[i]
 		d.impl = impl
 	}
 }
 
-func (s *Server) Handle(ctx context.Context, req *Frame) error {
-	sid := req.GetSid()
+// Handle delivers one client frame to this Server. Adapters call it for each
+// frame of a received envelop, in order, with the peer attached to ctx
+// (PROTOCOL.md §9.1).
+func (s *Server) Handle(ctx context.Context, f *Frame) error {
+	s.serving.Store(true)
+
+	if f.isReset() {
+		// Act only if the echoed epoch is ours (PROTOCOL.md §9.3).
+		if f.GetEpoch() != s.epoch {
+			return nil
+		}
+		peer, _ := PeerFromContext(ctx)
+		s.resetByPeerSid(peer, f.GetSid())
+		return nil
+	}
+	if f.isPing() {
+		// Liveness and stream probes arrive with the timeout system (M3).
+		return nil
+	}
+
+	peer, _ := PeerFromContext(ctx)
+	key := callKey{peer: peer, epoch: f.GetEpoch(), sid: f.GetSid()}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	st := s.calls[key]
+	s.mu.Unlock()
+	if st != nil {
+		st.handleRx(f)
+		return nil
+	}
 
-	if stream, ok := s.ss[sid]; ok {
-		if req.GetCode() == uint32(codes.Canceled) {
-			stream.close()
+	if f.isOpen() && f.GetSeq() == 1 {
+		return s.open(ctx, key, f)
+	}
+
+	// Unknown, non-OPEN: RESET so a desynced client fails fast. Delayed by
+	// T_hold in unreliable mode; immediate here until the M3 timer machinery
+	// lands (the reliable-mode reading, PROTOCOL.md §9.3, §10.6).
+	return s.tx.Handle(ctx, resetFor(f))
+}
+
+// resetByPeerSid cancels every live call from peer with the given sid,
+// regardless of client epoch (a RESET echoes the server epoch, which does not
+// name the client incarnation).
+func (s *Server) resetByPeerSid(peer any, sid uint32) {
+	s.mu.Lock()
+	var targets []*serverStream
+	for k, st := range s.calls {
+		if k.peer == peer && k.sid == sid {
+			targets = append(targets, st)
 		}
-		return stream.put(ctx, req)
 	}
+	s.mu.Unlock()
 
-	res_err := func(code codes.Code, msg string, args ...any) error {
-		c := uint32(code)
-		res := Frame_builder{
-			Sid:  sid,
-			Seq:  1,
-			Code: &c,
-			Desc: fmt.Sprintf(msg, args...),
-		}
-		return s.tx.Handle(ctx, res.Build())
+	cause := status.Error(codes.Unavailable, "call reset by peer")
+	for _, st := range targets {
+		st.cancel(cause)
 	}
-	if s.closed.Load() {
-		return res_err(codes.Unavailable, "server is closed")
-	}
-	if s.drain.Load() {
-		return res_err(codes.Unavailable, "server is draining")
-	}
+}
 
+func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	var desc *serviceDesc
-	if i := req.GetMethodIndex(); i > 0 {
-		if len(s.methods) <= int(i) {
-			return res_err(codes.Unimplemented, "method not found: %d", i)
-		} else {
-			desc = s.methods[i]
+	if i := f.GetMethodIndex(); i > 0 {
+		if int(i) <= len(s.methods) {
+			desc = s.methods[i-1]
 		}
-	} else if desc = s.services[req.GetMethod()]; desc == nil {
-		return res_err(codes.Unimplemented, "method not found")
+	} else if m := f.GetMethod(); m != "" {
+		desc = s.services[m]
 	}
-
-	codec := req.getCodec()
+	if desc == nil {
+		return s.rejectOpen(ctx, f, codes.Unimplemented, "method not found")
+	}
+	codec := f.getCodec()
 	if codec == nil {
-		return res_err(codes.Unimplemented, "unsupported codec: %s", req.GetCodec())
+		return s.rejectOpen(ctx, f, codes.Unimplemented, "unsupported codec: %s", f.GetCodec())
 	}
 
-	// Note that I was tried to use a pool to reuse the stream object, but it seems
-	// that the performance is worse than just creating a new one for each request.
-	stream := s.newStream(sid, desc)
-	stream.codec = codec
-	stream.rx <- req
+	// The handler ctx derives from the Server root — never from the
+	// per-datagram rx ctx — with the peer re-attached (PROTOCOL.md §6.4).
+	sctx := s.root
+	if key.peer != nil {
+		sctx = NewPeerContext(sctx, key.peer)
+	}
+	sctx = newIncomingContext(sctx, f)
+
+	st := newServerStream(sctx, s, key, desc, codec)
+
+	var transport *serverTransportUnary
+	if desc.IsUnary() {
+		transport = &serverTransportUnary{method: desc.fullname}
+		st.ctx = grpc.NewContextWithServerTransportStream(st.ctx, transport)
+	} else {
+		st.ctx = grpc.NewContextWithServerTransportStream(st.ctx, serverTransportStream{st})
+	}
+
+	s.mu.Lock()
+	if s.drain || s.closed {
+		s.mu.Unlock()
+		// Draining/stopped servers refuse new calls (PROTOCOL.md §9.4).
+		return s.tx.Handle(ctx, resetFor(f))
+	}
+	if _, dup := s.calls[key]; dup {
+		// Lost the race against a concurrent duplicate OPEN.
+		s.mu.Unlock()
+		return nil
+	}
+	s.calls[key] = st
+	ek := epochKey{peer: key.peer, epoch: key.epoch}
+	if s.hwm[ek] < key.sid {
+		s.hwm[ek] = key.sid
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
 
 	if desc.IsUnary() {
-		dec := func(v any) error {
-			buf := mem.SliceBuffer(req.GetPayload())
-			return codec.Unmarshal(mem.BufferSlice{buf}, v)
-		}
-
-		s.wg.Go(func() {
-			res := Frame_builder{Sid: sid, Seq: 1}.Build()
-
-			defer stream.Close()
-			if s.drain.Load() {
-				res.SetCode(uint32(codes.Unavailable))
-				s.tx.Handle(stream.ctx, res)
-				return
-			}
-
-			transport := serverTransportUnary{}
-			stream.ctx = grpc.NewContextWithServerTransportStream(stream.ctx, &transport)
-			stream.ctx = newIncomingContext(stream.ctx, req)
-
-			v, err := desc.method.Handler(desc.impl, stream.ctx, dec, s.unary_int)
-			if stream.ctx.Err() != nil {
-				// Client abort the request, so we can just return without sending response.
-				return
-			}
-
-			defer s.tx.Handle(stream.ctx, res)
-			if transport.header != nil {
-				res.SetHeader(newMd(transport.header))
-			}
-			if transport.trailer != nil {
-				res.SetTrailer(newMd(transport.trailer))
-			}
-			if err != nil {
-				res.setError(err)
-				return
-			}
-
-			buf, err := codec.Marshal(v)
-			if err != nil {
-				res.setError(err)
-				return
-			}
-			defer buf.Free()
-
-			res.SetPayload(buf.Materialize())
-			res.SetCode(uint32(codes.OK))
-		})
+		go s.runUnary(st, transport, f)
 	} else {
-		s.wg.Go(func() {
-			res := Frame_builder{Sid: sid, Seq: 1}.Build()
-
-			tx := stream.tx
-			defer stream.Close()
-			defer func() {
-				if stream.tx_closed.Load() {
-					// Client canceled the stream, so we can just return without sending response.
-					return
-				}
-				tx.Handle(stream.ctx, res)
-			}()
-			if s.drain.Load() {
-				res.SetCode(uint32(codes.Unavailable))
-				return
-			}
-
-			transport := serverTransportStream{stream}
-			stream.ctx = grpc.NewContextWithServerTransportStream(stream.ctx, transport)
-			stream.ctx = newIncomingContext(stream.ctx, req)
-
-			if !desc.stream.ServerStreams {
-				// In client-streaming RPC, SendMsg is called before the stream handler
-				// returns so keep it and send it with the trailer.
-				// TODO: It would be nice if we have some flag to send header immediately
-				// without waiting for the first SendMsg in this case.
-				stream.tx = FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
-					res.SetPayload(f.GetPayload())
-					res.SetHeader(f.GetHeader())
-					return nil
-				})
-			}
-
-			var err error
-			if s.stream_int != nil {
-				info := grpc.StreamServerInfo{
-					FullMethod:     desc.fullname,
-					IsClientStream: desc.stream.ClientStreams,
-					IsServerStream: desc.stream.ServerStreams,
-				}
-				err = s.stream_int(desc.impl, stream, &info, desc.stream.Handler)
-			} else {
-				err = desc.stream.Handler(desc.impl, stream)
-			}
-
-			res.SetSeq(stream.tx_seq.next())
-			if stream.header != nil {
-				res.SetHeader(newMd(stream.header))
-			}
-			if stream.trailer != nil {
-				res.SetTrailer(newMd(stream.trailer))
-			}
-			if err != nil {
-				res.setError(err)
-				return
-			}
-
-			res.SetCode(uint32(codes.OK))
-		})
+		// A server-streaming OPEN piggybacks the request message and the
+		// half-close (PROTOCOL.md §8); generated handlers read the request
+		// via RecvMsg.
+		if f.HasPayload() {
+			st.rx <- f
+		}
+		if f.isClose() {
+			st.eofOnce.Do(func() { close(st.rxEOF) })
+		}
+		if desc.stream.ClientStreams {
+			// Creation ack (PROTOCOL.md §8). Server-streaming emits its
+			// first data frame promptly instead.
+			st.sendH()
+		}
+		go s.runStream(st)
 	}
 	return nil
 }
 
-func (s *Server) newStream(sid uint32, desc *serviceDesc) (stream *serverStream) {
-	stream = newServerStream(context.Background(), s, sid, desc)
-	s.ss[sid] = stream
-	return
+// rejectOpen answers an OPEN that cannot start a call with a terminal frame
+// (PROTOCOL.md §9.4).
+func (s *Server) rejectOpen(ctx context.Context, f *Frame, code codes.Code, msg string, args ...any) error {
+	t := &Frame{}
+	t.SetEpoch(s.epoch)
+	t.SetSid(f.GetSid())
+	t.SetSeq(1)
+	t.SetFlags(FlagClose)
+	t.SetCode(uint32(code))
+	t.SetDesc(fmt.Sprintf(msg, args...))
+	return s.tx.Handle(ctx, t)
 }
 
-// GracefulStop stops the dRPC server gracefully.
-// It makes future call of Handle return an error and waits for existing calls to finish.
+func (s *Server) runUnary(st *serverStream, transport *serverTransportUnary, open *Frame) {
+	defer s.wg.Done()
+	defer s.finish(st)
+
+	dec := func(v any) error {
+		return open.unmarshal(v, st.codec)
+	}
+
+	resp, err := st.desc.method.Handler(st.desc.impl, st.ctx, dec, s.unary_int)
+	if err == nil && st.ctx.Err() != nil {
+		err = context.Cause(st.ctx)
+	}
+
+	st.txMu.Lock()
+	f := st.nextFrameLocked()
+	st.txMu.Unlock()
+	f.SetFlags(FlagClose)
+	if transport.header != nil {
+		f.SetHeader(newMd(transport.header))
+	}
+	if transport.trailer != nil {
+		f.SetTrailer(newMd(transport.trailer))
+	}
+	if err != nil {
+		f.setError(toStatusErr(err))
+	} else {
+		buf, merr := st.codec.Marshal(resp)
+		if merr != nil {
+			f.setError(status.Errorf(codes.Internal, "marshal response: %v", merr))
+		} else {
+			f.SetPayload(buf.Materialize())
+			buf.Free()
+			f.SetCode(uint32(codes.OK))
+		}
+	}
+
+	// The terminal is sent even when the handler ctx ended: the client (or
+	// its tombstone, once M3 lands) decides what to do with it.
+	s.tx.Handle(context.WithoutCancel(st.ctx), f)
+}
+
+func (s *Server) runStream(st *serverStream) {
+	defer s.wg.Done()
+	defer s.finish(st)
+
+	var err error
+	if s.stream_int != nil {
+		info := grpc.StreamServerInfo{
+			FullMethod:     st.desc.fullname,
+			IsClientStream: st.desc.stream.ClientStreams,
+			IsServerStream: st.desc.stream.ServerStreams,
+		}
+		err = s.stream_int(st.desc.impl, st, &info, st.desc.stream.Handler)
+	} else {
+		err = st.desc.stream.Handler(st.desc.impl, st)
+	}
+	if err == nil && st.ctx.Err() != nil {
+		err = context.Cause(st.ctx)
+	}
+
+	f := st.terminalFrame(err)
+	s.tx.Handle(context.WithoutCancel(st.ctx), f)
+}
+
+func (s *Server) finish(st *serverStream) {
+	s.mu.Lock()
+	delete(s.calls, st.key)
+	s.mu.Unlock()
+	st.cancel(status.Error(codes.Canceled, "call finished"))
+}
+
+// GracefulStop refuses new calls and waits for in-flight handlers.
 func (s *Server) GracefulStop() {
-	s.drain.Store(true)
+	s.mu.Lock()
+	s.drain = true
+	s.mu.Unlock()
+
 	s.wg.Wait()
-	s.closed.Store(true)
+
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
 }
 
+// Stop cancels every in-flight handler and refuses new calls
+// (PROTOCOL.md §9.4). Idempotent.
 func (s *Server) Stop() {
+	s.mu.Lock()
+	s.drain = true
+	s.closed = true
+	targets := make([]*serverStream, 0, len(s.calls))
+	for _, st := range s.calls {
+		targets = append(targets, st)
+	}
+	s.mu.Unlock()
 
+	cause := status.Error(codes.Unavailable, "server stopped")
+	for _, st := range targets {
+		st.cancel(cause)
+	}
+	s.wg.Wait()
 }
 
-type serviceDesc struct {
-	index    uint32
-	fullname string
+// DisconnectPeer fails every live call from peer. Adapters call it when a
+// peer's transport dies (PROTOCOL.md §4.5). Idempotent.
+func (s *Server) DisconnectPeer(peer any, err error) {
+	s.mu.Lock()
+	var targets []*serverStream
+	for k, st := range s.calls {
+		if k.peer == peer {
+			targets = append(targets, st)
+		}
+	}
+	s.mu.Unlock()
 
-	service *grpc.ServiceDesc
-	method  *grpc.MethodDesc
-	stream  *grpc.StreamDesc
-
-	impl any
-}
-
-func (d *serviceDesc) IsUnary() bool {
-	return d.method != nil
+	cause := status.Error(codes.Unavailable, "transport closed")
+	if err != nil {
+		cause = status.Errorf(codes.Unavailable, "transport closed: %v", err)
+	}
+	for _, st := range targets {
+		st.cancel(cause)
+	}
 }
 
 type ServerOption interface {
@@ -348,7 +447,6 @@ func StreamInterceptor(i grpc.StreamServerInterceptor) ServerOption {
 		}
 		o.stream_int = i
 	})
-
 }
 
 func ChainStreamInterceptors(is ...grpc.StreamServerInterceptor) ServerOption {

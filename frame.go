@@ -2,6 +2,7 @@ package drpc
 
 import (
 	"context"
+	"errors"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
@@ -9,6 +10,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// FrameHandler is the core-facing seam: Conn and Server emit and consume
+// individual frames. See PROTOCOL.md §3.
 type FrameHandler interface {
 	Handle(ctx context.Context, f *Frame) error
 }
@@ -19,11 +22,38 @@ func (f FrameHandlerFunc) Handle(ctx context.Context, frame *Frame) error {
 	return f(ctx, frame)
 }
 
-func SkipNextFrame(hp *FrameHandler, h FrameHandler) FrameHandler {
+// EnvelopHandler is the adapter-facing seam: the wire unit is always one
+// Envelop holding 1..n frames. See PROTOCOL.md §3, §4.1.
+type EnvelopHandler interface {
+	Handle(ctx context.Context, e *Envelop) error
+}
+
+type EnvelopHandlerFunc func(ctx context.Context, e *Envelop) error
+
+func (f EnvelopHandlerFunc) Handle(ctx context.Context, e *Envelop) error {
+	return f(ctx, e)
+}
+
+// Wrap1 adapts an EnvelopHandler to a FrameHandler by wrapping each frame in
+// a single-frame envelop (the no-batching default).
+func Wrap1(h EnvelopHandler) FrameHandler {
 	return FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
-		*hp = h
-		return nil
+		e := &Envelop{}
+		e.SetFrames([]*Frame{f})
+		return h.Handle(ctx, e)
 	})
+}
+
+// Unpack delivers each frame of e to h in order (PROTOCOL.md §4.1).
+// Adapters use this on the receive path.
+func Unpack(ctx context.Context, e *Envelop, h FrameHandler) error {
+	var errs []error
+	for _, f := range e.GetFrames() {
+		if err := h.Handle(ctx, f); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (x *Frame) Status() *status.Status {
@@ -57,4 +87,15 @@ func (x *Frame) setError(err error) {
 		x.SetCode(uint32(codes.Unknown))
 		x.SetDesc(err.Error())
 	}
+}
+
+// resetFor builds a RESET answering f. The epoch echoes the offending frame —
+// the one exception to the sender-epoch rule — so the receiver can match it
+// against its own epoch. See PROTOCOL.md §9.3.
+func resetFor(f *Frame) *Frame {
+	r := &Frame{}
+	r.SetFlags(FlagReset)
+	r.SetEpoch(f.GetEpoch())
+	r.SetSid(f.GetSid())
+	return r
 }

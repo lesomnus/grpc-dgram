@@ -34,7 +34,7 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 		l = x.NopLogger{}
 	}
 
-	ca := make(chan *drpc.Frame, 10)
+	ca := make(chan *drpc.Frame, 256)
 	server := drpc.NewServer(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
 		l.Logf("server->client %d:%d", f.GetSid(), f.GetSeq())
 		if PrintBody {
@@ -44,7 +44,7 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 		return nil
 	}), o.ServerOpts...)
 
-	cb := make(chan *drpc.Frame, 10)
+	cb := make(chan *drpc.Frame, 256)
 	conn := drpc.NewConn(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
 		l.Logf("client->server %d:%d", f.GetSid(), f.GetSeq())
 		if PrintBody {
@@ -70,7 +70,7 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 			case <-ctx.Done():
 				return
 			case f := <-ca:
-				c.rx = append(c.rx, proto.CloneOf(f))
+				c.recordRx(f)
 				if err := conn.Handle(ctx, f); err != nil {
 					if err != ctx.Err() {
 						panic(err)
@@ -85,7 +85,7 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 			case <-ctx.Done():
 				return
 			case f := <-cb:
-				c.tx = append(c.tx, proto.CloneOf(f))
+				c.recordTx(f)
 				if err := server.Handle(ctx, f); err != nil {
 					if err != ctx.Err() {
 						panic(err)
@@ -116,8 +116,51 @@ type Client struct {
 	server  *drpc.Server
 	service *echo.EchoServer
 
+	mu sync.Mutex
 	tx []*drpc.Frame
 	rx []*drpc.Frame
+}
+
+func (c *Client) recordTx(f *drpc.Frame) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tx = append(c.tx, proto.CloneOf(f))
+}
+
+func (c *Client) recordRx(f *drpc.Frame) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rx = append(c.rx, proto.CloneOf(f))
+}
+
+// firstTxPayload returns the first recorded client->server frame that carries
+// a payload (e.g. skips the eager OPEN of client-streaming calls).
+func (c *Client) firstTxPayload(t *testing.T) *drpc.Frame {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, f := range c.tx {
+		if f.HasPayload() {
+			return f
+		}
+	}
+	t.Fatal("no client->server frame with payload")
+	return nil
+}
+
+// firstRxPayload returns the first recorded server->client frame that carries
+// a payload (e.g. skips creation-ack and header frames).
+func (c *Client) firstRxPayload(t *testing.T) *drpc.Frame {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, f := range c.rx {
+		if f.HasPayload() {
+			return f
+		}
+	}
+	t.Fatal("no server->client frame with payload")
+	return nil
 }
 
 func TestE2E(t *testing.T) {
@@ -358,10 +401,13 @@ func TestE2E(t *testing.T) {
 			stream, err := client.Buff(ctx)
 			x.NoError(t, err)
 
-			err = stream.Send(&echo.EchoRequest{})
-			x.NoError(t, err)
+			// The eager OPEN is rejected as soon as it arrives; a Send racing
+			// the rejection may or may not observe it yet.
+			if err := stream.Send(&echo.EchoRequest{}); err != nil {
+				x.ErrorIs(t, err, io.EOF)
+			}
 
-			// Wait for the client to receive the error from the server.
+			// Wait for the client to receive the rejection.
 			time.Sleep(300 * time.Millisecond)
 
 			err = stream.Send(&echo.EchoRequest{})
@@ -382,8 +428,9 @@ func TestE2E(t *testing.T) {
 			stream, err := client.Live(ctx)
 			x.NoError(t, err)
 
-			err = stream.Send(&echo.EchoRequest{})
-			x.NoError(t, err)
+			if err := stream.Send(&echo.EchoRequest{}); err != nil {
+				x.ErrorIs(t, err, io.EOF)
+			}
 
 			_, err = stream.Recv()
 			x.Error(t, err)
@@ -547,8 +594,9 @@ func TestE2E(t *testing.T) {
 			stream, err := client.Many(ctx, &echo.EchoRequest{})
 			x.NoError(t, err)
 
+			// Repeat is 0: the stream ends without a message.
 			_, err = stream.Recv()
-			x.NoError(t, err)
+			x.ErrorIs(t, err, io.EOF)
 			x.Equal(t, md, client.service.MD)
 
 			header, err := stream.Header()
@@ -597,7 +645,7 @@ func TestE2E(t *testing.T) {
 			x.NoError(t, err)
 
 			_, err = stream.Recv()
-			x.NoError(t, err)
+			x.ErrorIs(t, err, io.EOF)
 			x.Equal(t, md, client.service.MD)
 
 			header, err := stream.Header()
@@ -626,16 +674,14 @@ func TestE2E(t *testing.T) {
 				CircularShift: 1,
 			}.Build())
 			x.NoError(t, err)
-			x.NotEmpty(t, client.tx)
-			x.NotEmpty(t, client.rx)
 
 			req := &echo.EchoRequest{}
-			err = protojson.Unmarshal(client.tx[0].GetPayload(), req)
+			err = protojson.Unmarshal(client.firstTxPayload(t).GetPayload(), req)
 			x.NoError(t, err)
 			x.Equal(t, "abc", req.GetMessage())
 
 			res := &echo.EchoResponse{}
-			err = protojson.Unmarshal(client.rx[0].GetPayload(), res)
+			err = protojson.Unmarshal(client.firstRxPayload(t).GetPayload(), res)
 			x.NoError(t, err)
 			x.Equal(t, "bca", res.GetMessage())
 		})
@@ -654,16 +700,14 @@ func TestE2E(t *testing.T) {
 
 			_, err = stream.Recv()
 			x.NoError(t, err)
-			x.NotEmpty(t, client.tx)
-			x.NotEmpty(t, client.rx)
 
 			req := &echo.EchoRequest{}
-			err = protojson.Unmarshal(client.tx[0].GetPayload(), req)
+			err = protojson.Unmarshal(client.firstTxPayload(t).GetPayload(), req)
 			x.NoError(t, err)
 			x.Equal(t, "abc", req.GetMessage())
 
 			res := &echo.EchoResponse{}
-			err = protojson.Unmarshal(client.rx[0].GetPayload(), res)
+			err = protojson.Unmarshal(client.firstRxPayload(t).GetPayload(), res)
 			x.NoError(t, err)
 			x.Equal(t, "bca", res.GetMessage())
 		})
@@ -688,12 +732,12 @@ func TestE2E(t *testing.T) {
 			x.NoError(t, err)
 
 			req := &echo.EchoRequest{}
-			err = protojson.Unmarshal(client.tx[0].GetPayload(), req)
+			err = protojson.Unmarshal(client.firstTxPayload(t).GetPayload(), req)
 			x.NoError(t, err)
 			x.Equal(t, "abc", req.GetMessage())
 
 			res := &echo.EchoBatchResponse{}
-			err = protojson.Unmarshal(client.rx[0].GetPayload(), res)
+			err = protojson.Unmarshal(client.firstRxPayload(t).GetPayload(), res)
 			x.NoError(t, err)
 
 			items := res.GetItems()
@@ -724,12 +768,12 @@ func TestE2E(t *testing.T) {
 			x.NoError(t, err)
 
 			req := &echo.EchoRequest{}
-			err = protojson.Unmarshal(client.tx[0].GetPayload(), req)
+			err = protojson.Unmarshal(client.firstTxPayload(t).GetPayload(), req)
 			x.NoError(t, err)
 			x.Equal(t, "abc", req.GetMessage())
 
 			res := &echo.EchoResponse{}
-			err = protojson.Unmarshal(client.rx[0].GetPayload(), res)
+			err = protojson.Unmarshal(client.firstRxPayload(t).GetPayload(), res)
 			x.NoError(t, err)
 			x.Equal(t, "bca", res.GetMessage())
 		})
@@ -752,7 +796,7 @@ func TestE2E(t *testing.T) {
 			defer stop()
 
 			_, err := client.Once(ctx, echo.Void())
-			x.ErrorIs(t, err, ctx.Err())
+			x.Equal(t, codes.Canceled, status.Code(err))
 		})
 		t.Run("Server Streaming", func(t *testing.T) {
 			client, ctx, stop := pipe(t)
@@ -762,7 +806,7 @@ func TestE2E(t *testing.T) {
 			x.NoError(t, err)
 
 			_, err = stream.Recv()
-			x.ErrorIs(t, err, ctx.Err())
+			x.Equal(t, codes.Canceled, status.Code(err))
 		})
 		t.Run("Client Streaming", func(t *testing.T) {
 			client, ctx, stop := pipe(t)
@@ -775,7 +819,7 @@ func TestE2E(t *testing.T) {
 			x.NoError(t, err)
 
 			_, err = stream.CloseAndRecv()
-			x.ErrorIs(t, err, ctx.Err())
+			x.Equal(t, codes.Canceled, status.Code(err))
 		})
 		t.Run("Bidi Streaming", func(t *testing.T) {
 			client, ctx, stop := pipe(t)
@@ -788,7 +832,96 @@ func TestE2E(t *testing.T) {
 			x.NoError(t, err)
 
 			_, err = stream.Recv()
-			x.ErrorIs(t, err, ctx.Err())
+			x.Equal(t, codes.Canceled, status.Code(err))
 		})
+	})
+	t.Run("concurrent", func(t *testing.T) {
+		ctx := t.Context()
+
+		client, stop := pipe(t)
+		defer stop()
+
+		var wg sync.WaitGroup
+		errs := make(chan error, 32)
+		for i := range 8 {
+			wg.Go(func() {
+				msg := fmt.Sprintf("unary-%d", i)
+				res, err := client.Once(ctx, echo.EchoRequest_builder{
+					Message:       msg,
+					CircularShift: 1,
+				}.Build())
+				if err != nil {
+					errs <- fmt.Errorf("unary-%d: %w", i, err)
+					return
+				}
+				if want := echo.CircularShift(msg, 1); res.GetMessage() != want {
+					errs <- fmt.Errorf("unary-%d: got %q, want %q", i, res.GetMessage(), want)
+				}
+			})
+		}
+		for i := range 4 {
+			wg.Go(func() {
+				stream, err := client.Many(ctx, echo.EchoRequest_builder{
+					Message:       fmt.Sprintf("ss-%d", i),
+					CircularShift: 1,
+					Repeat:        3,
+				}.Build())
+				if err != nil {
+					errs <- fmt.Errorf("ss-%d: %w", i, err)
+					return
+				}
+				n := 0
+				for {
+					_, err := stream.Recv()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						errs <- fmt.Errorf("ss-%d: %w", i, err)
+						return
+					}
+					n++
+				}
+				if n != 3 {
+					errs <- fmt.Errorf("ss-%d: got %d messages, want 3", i, n)
+				}
+			})
+		}
+		for i := range 4 {
+			wg.Go(func() {
+				stream, err := client.Live(ctx)
+				if err != nil {
+					errs <- fmt.Errorf("bidi-%d: %w", i, err)
+					return
+				}
+				for j := range 3 {
+					err := stream.Send(echo.EchoRequest_builder{
+						Message:       fmt.Sprintf("bidi-%d-%d", i, j),
+						CircularShift: 1,
+						Repeat:        1,
+					}.Build())
+					if err != nil {
+						errs <- fmt.Errorf("bidi-%d send: %w", i, err)
+						return
+					}
+					if _, err := stream.Recv(); err != nil {
+						errs <- fmt.Errorf("bidi-%d recv: %w", i, err)
+						return
+					}
+				}
+				if err := stream.CloseSend(); err != nil {
+					errs <- fmt.Errorf("bidi-%d close: %w", i, err)
+					return
+				}
+				if _, err := stream.Recv(); err != io.EOF {
+					errs <- fmt.Errorf("bidi-%d: want EOF, got %v", i, err)
+				}
+			})
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			x.NoError(t, err)
+		}
 	})
 }

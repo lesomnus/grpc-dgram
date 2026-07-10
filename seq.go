@@ -1,23 +1,68 @@
 package drpc
 
 const (
-	seqMax rx_seq = 0x7FFF_FFFF
+	// wFwd is the max forward seq jump a receiver accepts (PROTOCOL.md §6.3).
+	wFwd uint32 = 4096
+	// kLoud consecutive, mutually consistent beyond-window arrivals are
+	// evidence of genuine sender progress past a >wFwd loss burst; the call
+	// fails loudly with DATA_LOSS (PROTOCOL.md §6.3).
+	kLoud = 3
 )
 
-type tx_seq uint32
+// txSeq numbers outgoing frames of one stream direction, starting at 1.
+// Callers serialize access (the stream's tx mutex).
+type txSeq struct{ v uint32 }
 
-func (v *tx_seq) next() uint32 {
-	*v++
-	return uint32(*v)
+func (s *txSeq) next() uint32 { s.v++; return s.v }
+
+type rxVerdict int
+
+const (
+	// rxAccept: in-window forward step; deliver.
+	rxAccept rxVerdict = iota
+	// rxDrop: duplicate, older, or lone beyond-window frame; drop silently.
+	rxDrop
+	// rxDataLoss: kLoud consistent beyond-window arrivals; fail the call.
+	rxDataLoss
+)
+
+// rxWindow validates per-stream, per-direction sequence numbers.
+// L initializes to 0: the server direction starts with the OPEN (seq 1);
+// the client side may legitimately accept any first seq in [1, wFwd]
+// (PROTOCOL.md §6.3). Callers serialize access per stream.
+type rxWindow struct {
+	l          uint32 // highest accepted seq
+	beyondN    int    // length of the current consistent beyond-window run
+	beyondLast uint32 // last beyond-window seq seen
 }
 
-type rx_seq uint32
-
-func (v *rx_seq) checkAndSet(remote rx_seq) bool {
-	local := *v
-	if (remote != local) && ((remote - local) < seqMax) {
-		*v = remote
-		return true
+func (w *rxWindow) check(seq uint32) rxVerdict {
+	if seq == 0 {
+		// Stateless frames (RESET, PING) never reach seq validation;
+		// a sequenced frame with seq 0 is malformed.
+		return rxDrop
 	}
-	return false
+	switch d := seq - w.l; { // mod 2^32
+	case d == 0 || d >= 1<<31:
+		// Duplicate or older: dedup. Neutral for the beyond-run (§6.3).
+		return rxDrop
+	case d <= wFwd:
+		w.l = seq
+		w.beyondN = 0
+		return rxAccept
+	default:
+		// Beyond-window. Delta from the previous beyond-window frame must be
+		// in [0, wFwd] to count as consistent — delta 0 included, so
+		// byte-identical replays of a beyond-window T accumulate (§6.3).
+		if w.beyondN > 0 && seq-w.beyondLast <= wFwd {
+			w.beyondN++
+		} else {
+			w.beyondN = 1
+		}
+		w.beyondLast = seq
+		if w.beyondN >= kLoud {
+			return rxDataLoss
+		}
+		return rxDrop
+	}
 }

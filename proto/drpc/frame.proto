@@ -3,38 +3,60 @@ edition = "2023";
 package drpc;
 
 import "drpc/metadata.proto";
-import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
 
 option features.field_presence = IMPLICIT;
 option go_package = "github.com/lesomnus/grpc-dgram;drpc";
 
+// Frame is the unit of the drpc protocol. See PROTOCOL.md §5.
+//
+// Flags (bitmask on `flags`):
+//   1 = OPEN  — creates the call; client→server only; seq MUST be 1.
+//   2 = CLOSE — sender's direction finished; with `code` it is terminal.
+//   4 = RESET — stateless "no such call"; `epoch` echoes the offending frame.
+//   8 = PING  — sid 0: peer keepalive; sid≠0: stream probe.
 message Frame {
-  fixed32 sid = 1;
-  fixed32 seq = 2;
-  string codec = 3;
+  // Sender's incarnation nonce, chosen at random per Conn/Server instance.
+  // Exception: RESET frames echo the epoch of the frame they answer.
+  fixed32 epoch = 1;
 
-  // Method is mapped to numeric index at the server.
-  // Server always respond only with `method_index` so the client can learn which
-  // service is mapped to what number during communication.
-  string method = 4;
-  uint32 method_index = 5;
+  // Stream id, client-allocated, starting at 1, never reused within an
+  // epoch. 0 is reserved for peer-scope control frames (PING).
+  fixed32 sid = 2;
 
-  // enum FLAG {
-  //   FLAG_UNSPECIFIED = 0;
-  //   FLAG_OPEN = 1;
-  //   FLAG_CLOSE = 2;
-  // }
-  // FLAG flags = 6;
+  // Per-stream, per-direction sequence, starting at 1.
+  // Stateless frames (RESET, PING) carry 0.
+  fixed32 seq = 3;
 
-  google.protobuf.Timestamp deadline = 7;
+  // Flag bitmask; see message comment.
+  uint32 flags = 4;
 
-  bytes payload = 8;
+  // Full method name (e.g. "/echo.EchoService/Once"); OPEN frames only.
+  string method = 5;
 
-  // Status code and error description.
+  // 1-based method index in server registration order; 0 = unset.
+  // Servers attach it to every frame they send (the learning channel).
+  uint32 method_index = 6;
+
+  // Codec name; OPEN frames only; "" means proto.
+  string codec = 7;
+
+  // Remaining call budget at send time; OPEN frames only.
+  google.protobuf.Duration timeout = 8;
+
+  // One marshaled message. Presence is meaningful: a flag-less frame WITH
+  // payload is a data frame (even when the message marshals to 0 bytes);
+  // WITHOUT payload it is a header frame.
+  bytes payload = 9 [features.field_presence = EXPLICIT];
+
+  // gRPC status code; meaningful only on CLOSE frames, where presence
+  // distinguishes terminal CLOSE (code set) from half-close (unset).
   // See https://grpc.io/docs/guides/status-codes/.
-  uint32 code = 9 [features.field_presence = EXPLICIT];
-  string desc = 10;
+  uint32 code = 10 [features.field_presence = EXPLICIT];
 
-  Metadata header = 11;
-  Metadata trailer = 12;
+  // Status description.
+  string desc = 11;
+
+  Metadata header = 12;
+  Metadata trailer = 13;
 }
