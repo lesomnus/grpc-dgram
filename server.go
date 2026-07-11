@@ -380,6 +380,13 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		release()
 		return nil
 	}
+	if ps.liveCalls >= ps.maxLive {
+		// Per-peer live-call cap (PROTOCOL.md §15): refuse rather than let a
+		// single peer's valid-method OPEN flood spawn unbounded handlers.
+		s.mu.Unlock()
+		release()
+		return s.rejectOpen(ctx, f, desc.index, codes.ResourceExhausted, "too many concurrent calls")
+	}
 	s.calls[key] = st
 	if ps.hwm < key.sid {
 		ps.hwm = key.sid

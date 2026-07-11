@@ -49,6 +49,7 @@ type peerState struct {
 
 	maxTombs     int // §15 caps, copied from the Server at creation
 	maxTombBytes int
+	maxLive      int
 
 	lastRx   atomic.Int64 // validated frames only (§9.1)
 	lastTx   atomic.Int64
@@ -170,6 +171,7 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time) *peerState {
 		created:      now,
 		maxTombs:     s.limits.MaxTombstones,
 		maxTombBytes: s.limits.MaxTombstoneBytes,
+		maxLive:      s.limits.MaxLiveCalls,
 	}
 	ps.lastRx.Store(now.UnixNano())
 	ps.lastTx.Store(now.UnixNano())

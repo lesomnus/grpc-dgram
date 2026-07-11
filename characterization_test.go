@@ -84,14 +84,19 @@ type injectServer struct {
 	out chan *drpc.Frame
 }
 
+// newInjectServer builds a reliable-mode server (no timers, RESET immediate)
+// so injected-frame outcomes are deterministic.
 func newInjectServer(t *testing.T, opts ...drpc.ServerOption) *injectServer {
+	return newInjectServerMode(t, true, opts...)
+}
+
+func newInjectServerMode(t *testing.T, reliable bool, opts ...drpc.ServerOption) *injectServer {
 	is := &injectServer{out: make(chan *drpc.Frame, 64)}
 	tx := drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
 		is.out <- proto.CloneOf(f)
 		return nil
 	})
-	// Reliable mode keeps it deterministic: no timers, RESET is immediate.
-	is.srv = drpc.NewServer(tx, append([]drpc.ServerOption{drpc.WithReliable(true)}, opts...)...)
+	is.srv = drpc.NewServer(tx, append([]drpc.ServerOption{drpc.WithReliable(reliable)}, opts...)...)
 	echo.RegisterEchoServiceServer(is.srv, &echo.EchoServer{})
 	t.Cleanup(is.srv.Stop)
 	return is
@@ -191,8 +196,8 @@ func TestChar_InjectionMatrix(t *testing.T) {
 		// server does not RESET a live sid), so no RESET is emitted.
 		x.True(t, is.recv(t) == nil, "foreign-epoch RESET must be ignored")
 	})
-	t.Run("huge seq on a live stream is dropped, no wedge", func(t *testing.T) {
-		is := newInjectServer(t)
+	t.Run("huge seq on a live stream is dropped, no wedge (unreliable)", func(t *testing.T) {
+		is := newInjectServerMode(t, false) // default timing: no probe within the recv window
 		open := &drpc.Frame{}
 		open.SetEpoch(1)
 		open.SetSid(9)
@@ -233,55 +238,6 @@ func TestChar_DuplicateOpenOnLiveCallDoesNotFork(t *testing.T) {
 	// Exactly one execution; at least one terminal emitted.
 	x.Equal(t, 1, int(execs.Load()))
 	x.True(t, is.recv(t) != nil, "a terminal must be emitted")
-}
-
-// ---------------------------------------------------------------------------
-// Reliable mode: a gap fails the call loudly with INTERNAL (§10.6, decision Q6).
-// ---------------------------------------------------------------------------
-
-func TestChar_ReliableModeGapFailsLoud(t *testing.T) {
-	bubble(t, func(t *testing.T) {
-		// Reliable mode, but we inject loss anyway: a dropped server data frame
-		// leaves a seq gap, which reliable mode treats as a broken transport.
-		dropFirstData := dropFirst(func(f *drpc.Frame) bool {
-			return f.GetFlags() == 0 && f.HasPayload()
-		})
-		client, stop := PipeOption{
-			ServerOpts: []drpc.ServerOption{drpc.WithReliable(true)},
-			ConnOpts:   []drpc.ConnOption{drpc.WithReliable(true)},
-			S2C:        dropFirstData,
-		}.Use(t)
-		defer stop()
-
-		stream, err := client.Many(t.Context(), echo.EchoRequest_builder{
-			Message:       "abc",
-			CircularShift: 1,
-			Repeat:        3,
-		}.Build())
-		x.NoError(t, err)
-
-		// The first data frame is lost; the second (seq 2) is a forward jump the
-		// forward window still accepts, so the app sees a gap, not INTERNAL —
-		// document the ACTUAL behavior: the forward window tolerates the jump,
-		// so reliable-mode "fail loud on gap" applies to a MISSING dup/reorder,
-		// not a plain forward loss. Assert the observed outcome.
-		var got int
-		var lastErr error
-		for {
-			_, err := stream.Recv()
-			if err != nil {
-				lastErr = err
-				break
-			}
-			got++
-		}
-		_ = got
-		// Either clean EOF (forward window swallowed the gap) or INTERNAL — both
-		// are non-hanging terminal outcomes. Pin that it terminates.
-		if lastErr != io.EOF && status.Code(lastErr) != codes.Internal {
-			t.Fatalf("reliable-mode loss must terminate, got %v", lastErr)
-		}
-	})
 }
 
 // ---------------------------------------------------------------------------
@@ -387,4 +343,77 @@ func TestChar_StatusDetailsDropped(t *testing.T) {
 		x.Equal(t, "nope", got.Message())                // message preserved
 		x.Equal(t, 0, len(got.Details()))                // details DROPPED (divergence)
 	})
+}
+
+// ---------------------------------------------------------------------------
+// L5 fix: in reliable mode a seq gap or duplicate fails the call with INTERNAL
+// (§10.6, decision Q6) — a broken "reliable" transport is surfaced, not hidden.
+// ---------------------------------------------------------------------------
+
+func TestChar_ReliableModeGapIsInternal(t *testing.T) {
+	// Reliable mode; drop the FIRST server data frame of a multi-message
+	// stream so the next arrives with a seq gap.
+	dropFirstData := dropFirst(func(f *drpc.Frame) bool {
+		return f.GetFlags() == 0 && f.HasPayload()
+	})
+	client, stop := PipeOption{
+		ServerOpts: []drpc.ServerOption{drpc.WithReliable(true)},
+		ConnOpts:   []drpc.ConnOption{drpc.WithReliable(true)},
+		S2C:        dropFirstData,
+	}.Use(t)
+	defer stop()
+
+	stream, err := client.Many(t.Context(), echo.EchoRequest_builder{
+		Message:       "abc",
+		CircularShift: 1,
+		Repeat:        3,
+	}.Build())
+	x.NoError(t, err)
+
+	// The gap is detected and the call fails loudly with INTERNAL.
+	var lastErr error
+	for {
+		_, err := stream.Recv()
+		if err != nil {
+			lastErr = err
+			break
+		}
+	}
+	x.Equal(t, codes.Internal, status.Code(lastErr))
+}
+
+// ---------------------------------------------------------------------------
+// L4 fix: a per-peer live-call cap bounds the handler goroutines a single peer
+// can spawn (§15). A flood of valid OPENs past the cap is refused with
+// RESOURCE_EXHAUSTED instead of growing without bound.
+// ---------------------------------------------------------------------------
+
+func TestChar_LiveCallCap(t *testing.T) {
+	const cap = 3
+	is := newInjectServer(t, drpc.WithLimits(drpc.Limits{MaxLiveCalls: cap}))
+
+	// Open `cap` long-lived bidi calls (each handler blocks in Recv).
+	for sid := uint32(1); sid <= cap; sid++ {
+		open := &drpc.Frame{}
+		open.SetEpoch(1)
+		open.SetSid(sid)
+		open.SetSeq(1)
+		open.SetFlags(drpc.FlagOpen)
+		open.SetMethod(echo.EchoService_Live_FullMethodName)
+		is.handle(open)
+		h := is.recv(t)
+		x.True(t, h != nil && h.GetFlags() == 0, "creation ack expected")
+	}
+
+	// One more distinct sid is over the cap: refused with RESOURCE_EXHAUSTED.
+	over := &drpc.Frame{}
+	over.SetEpoch(1)
+	over.SetSid(cap + 1)
+	over.SetSeq(1)
+	over.SetFlags(drpc.FlagOpen)
+	over.SetMethod(echo.EchoService_Live_FullMethodName)
+	is.handle(over)
+	r := is.recv(t)
+	x.True(t, r != nil, "expected a terminal")
+	x.Equal(t, codes.ResourceExhausted, codes.Code(r.GetCode()))
 }

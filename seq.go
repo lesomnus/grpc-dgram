@@ -27,6 +27,9 @@ const (
 	rxBeyond
 	// rxDataLoss: kLoud consistent beyond-window arrivals; fail the call.
 	rxDataLoss
+	// rxProtocolError: reliable mode saw a gap or duplicate — the transport
+	// is broken; fail the call with INTERNAL (PROTOCOL.md §10.6, Q6).
+	rxProtocolError
 )
 
 // rxWindow validates per-stream, per-direction sequence numbers.
@@ -37,6 +40,7 @@ type rxWindow struct {
 	l          uint32 // highest accepted seq
 	beyondN    int    // length of the current consistent beyond-window run
 	beyondLast uint32 // last beyond-window seq seen
+	strict     bool   // reliable mode: require exactly l+1, else fail loud
 }
 
 func (w *rxWindow) check(seq uint32) rxVerdict {
@@ -44,6 +48,16 @@ func (w *rxWindow) check(seq uint32) rxVerdict {
 		// Stateless frames (RESET, PING) never reach seq validation;
 		// a sequenced frame with seq 0 is malformed.
 		return rxBeyond
+	}
+	if w.strict {
+		// Reliable, ordered transport: exactly one forward step is legal.
+		// Anything else means the transport lost, duplicated, or reordered a
+		// frame — a contract violation, not expected noise (PROTOCOL.md §10.6).
+		if seq == w.l+1 {
+			w.l = seq
+			return rxAccept
+		}
+		return rxProtocolError
 	}
 	switch d := seq - w.l; { // mod 2^32
 	case d == 0 || d >= 1<<31:

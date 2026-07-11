@@ -166,6 +166,7 @@ func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, cl
 			s.methodIndex = li.index
 		}
 	}
+	s.rxWin.strict = c.mode.reliable
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
 	n := nowNano()
@@ -204,6 +205,12 @@ func (s *clientStream) handleRx(f *Frame) {
 		// and abort so the server stops.
 		err := status.Error(codes.DataLoss, "seq window overrun: >W_fwd consecutive frames lost")
 		s.sendAbort(codes.DataLoss)
+		s.finishLocal(err)
+		return
+	case rxProtocolError:
+		// Reliable-mode gap/duplicate: the transport is broken (§10.6).
+		err := status.Error(codes.Internal, "reliable transport lost or reordered a frame")
+		s.sendAbort(codes.Internal)
 		s.finishLocal(err)
 		return
 	}
@@ -670,6 +677,7 @@ func newServerStream(ctx context.Context, srv *Server, key callKey, desc *servic
 		rxEOF: make(chan struct{}),
 	}
 	s.rxWin.l = 1 // the accepted OPEN
+	s.rxWin.strict = srv.mode.reliable
 	n := nowNano()
 	s.lastRx.Store(n)
 	s.lastTx.Store(n)
@@ -708,6 +716,9 @@ func (s *serverStream) handleRx(f *Frame) {
 		return
 	case rxDataLoss:
 		s.cancel(status.Error(codes.DataLoss, "seq window overrun: >W_fwd consecutive frames lost"))
+		return
+	case rxProtocolError:
+		s.cancel(status.Error(codes.Internal, "reliable transport lost or reordered a frame"))
 		return
 	}
 	s.noteValidatedRx()

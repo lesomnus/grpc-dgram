@@ -29,6 +29,7 @@ const (
 	defaultMaxTombBytes   = 1 << 20
 	defaultMaxDeadPeers   = 4
 	defaultMaxResets      = 1024
+	defaultMaxLiveCalls   = 4096
 	defaultRxDropNewest   = DropNewest
 	defaultMaxHandlerZero = 0
 )
@@ -54,6 +55,10 @@ type Limits struct {
 	MaxDeadPeers int
 	// MaxPendingResets caps the RESET rate-limit / delayed-RESET maps.
 	MaxPendingResets int
+	// MaxLiveCalls caps concurrently live calls per peer incarnation; an
+	// OPEN past it is refused with RESOURCE_EXHAUSTED, bounding the handler
+	// goroutines a single peer can spawn.
+	MaxLiveCalls int
 }
 
 func (l Limits) withDefaults() Limits {
@@ -68,6 +73,9 @@ func (l Limits) withDefaults() Limits {
 	}
 	if l.MaxPendingResets <= 0 {
 		l.MaxPendingResets = defaultMaxResets
+	}
+	if l.MaxLiveCalls <= 0 {
+		l.MaxLiveCalls = defaultMaxLiveCalls
 	}
 	return l
 }
