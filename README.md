@@ -124,15 +124,16 @@ Over a reliable, ordered transport, timers and retransmission are off,
 delivery is the exact sequence, and any gap or duplicate is surfaced as
 `INTERNAL` (a broken "reliable" transport). This is the path to **plain
 gRPC-over-WebSocket / reliable-datachannel** semantics, and it is
-auto-detected: `transport/gorilla` always advertises reliable, and `transport/pion`
-derives it from the data-channel configuration (ordered, no
-retransmit/lifetime cap) — a client `pion.New` always, a server
-`pion.Gateway` from its first channel when one is bound before
-`drpc.NewServer` (a server built earlier defaults to unreliable, which is
-correct on any channel, or takes `pion.WithReliable(true)`). `WithReliable`
-remains as the explicit override for custom transports. With no protocol
-timers running, the adapter's death detection (keepalive, `OnClose`, send
-stall) is what fails live calls — the shipped adapters own that duty.
+auto-detected with zero options: `transport/gorilla` always advertises
+reliable, and `transport/pion` derives it from each data channel's
+configuration (ordered, no retransmit/lifetime cap). On the server the mode
+is **per peer**: a gateway annotates each channel's reliability
+(`drpc.NewReliableContext`), so one `drpc.Server` serves a reliable control
+channel and unreliable telemetry channels side by side — each in its own
+mode. `WithReliable` remains as the explicit override for custom
+transports. With no protocol timers running on a reliable channel, the
+transport's death detection (keepalive, `OnClose`, send stall) is what
+fails live calls — the shipped transports own that duty.
 
 ### Tuning (sensor streams)
 

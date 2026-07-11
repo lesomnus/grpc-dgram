@@ -354,7 +354,8 @@ func (g *Gateway) ServePeer(ctx context.Context, srv *drpc.Server, c *websocket.
 	g.peers[key] = s
 	g.mu.Unlock()
 
-	err := serve(ctx, c, g.o, drpc.NewPeerContext(ctx, key), srv)
+	rxCtx := drpc.NewReliableContext(drpc.NewPeerContext(ctx, key), true)
+	err := serve(ctx, c, g.o, rxCtx, srv)
 
 	g.mu.Lock()
 	delete(g.peers, key)

@@ -55,7 +55,7 @@ dc, err := pc.CreateDataChannel("sensor", &webrtc.DataChannelInit{
 ## Server (the side that receives channels)
 
 ```go
-gw := pion.NewGateway(pion.WithReliable(true)) // see "gateway mode" below
+gw := pion.NewGateway()
 srv := drpc.NewServer(gw)
 pb.RegisterEchoServiceServer(srv, &myHandler{})
 
@@ -70,18 +70,15 @@ read loop until that callback returns and drops messages that arrive with no
 handler registered. `ServePeer` blocks until the channel dies (then calls
 `srv.DisconnectPeer`), so it must run on its own goroutine.
 
-### Gateway mode
+### Mixed channels
 
-`drpc.NewServer(gw)` reads the mode **once, at construction** — usually
-before any channel exists — so the gateway latches it at whichever of
-`WithReliable` / first `Bind` / `Reliable()` happens first:
-
-- Pass `pion.WithReliable(true)` when you build the server before channels
-  arrive and want the timers-off path. Unreliable channels are then refused.
-- With no option, a server built first latches **unreliable** — which still
-  serves reliable channels correctly (the timers are merely redundant).
-- Binding the first channel *before* `drpc.NewServer` latches the mode from
-  that channel's config.
+Channels of differing reliability mix freely under one `Gateway` and one
+`drpc.Server` — a reliable control channel plus unreliable telemetry
+channels on the same `PeerConnection` is the natural wiring. `ServePeer`
+annotates each peer with its channel's reliability
+(`drpc.NewReliableContext`), and the server runs every peer in its own
+mode: strict sequencing with no timers on the reliable channel, the full
+timer machinery on the unreliable ones. No mode options anywhere.
 
 ## Options
 
@@ -90,7 +87,6 @@ before any channel exists — so the gateway latches it at whichever of
 | `WithMaxMessageSize(n)` | 1200 B unreliable / 16 KiB reliable | largest marshaled `Envelop` this endpoint will send; 0 removes the limit |
 | `WithMaxBufferedAmount(n)` | 1 MiB | outbound high-water mark: sends block while `dc.BufferedAmount()` is at or above it (pion queues without limit); 0 never blocks |
 | `WithSendStallTimeout(d)` | 30 s | how long one send may wait at the mark before the channel is declared dead; 0 waits on ctx alone |
-| `WithReliable(v)` | — | gateway only: declares the mode up front (see above) |
 
 ## Caveats
 

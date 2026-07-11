@@ -19,3 +19,23 @@ func PeerFromContext(ctx context.Context) (any, bool) {
 	v := ctx.Value(peerCtxKey{})
 	return v, v != nil
 }
+
+type reliableCtxKey struct{}
+
+// NewReliableContext annotates ctx with the reliability of the channel the
+// frame arrived on. A gateway serving channels of differing reliability
+// (e.g. WebRTC data channels) calls this per channel, before Handle, and the
+// server then runs each peer in its channel's mode — strict sequencing with
+// no timers on a reliable channel, the full timer machinery on an unreliable
+// one — regardless of the server-wide default (PROTOCOL.md §4.3). The
+// annotation MUST be constant for a given peer: reliability is a property of
+// the channel, and one peer is one channel. Frames without the annotation
+// run in the server's own mode.
+func NewReliableContext(ctx context.Context, reliable bool) context.Context {
+	return context.WithValue(ctx, reliableCtxKey{}, reliable)
+}
+
+func reliableFromContext(ctx context.Context) (bool, bool) {
+	v, ok := ctx.Value(reliableCtxKey{}).(bool)
+	return v, ok
+}

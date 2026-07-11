@@ -33,7 +33,6 @@ type options struct {
 	maxMessageSize    *int
 	maxBufferedAmount *uint64
 	sendStallTimeout  *time.Duration
-	reliable          *bool
 }
 
 type Option func(*options)
@@ -59,15 +58,6 @@ func WithMaxBufferedAmount(n uint64) Option {
 // DefaultSendStallTimeout.
 func WithSendStallTimeout(d time.Duration) Option {
 	return func(o *options) { o.sendStallTimeout = &d }
-}
-
-// WithReliable declares the mode of every channel a Gateway will serve, for
-// deployments where the server is built before the first channel arrives
-// (see Gateway.Reliable). With true, ServePeer refuses unreliable channels —
-// a lossy channel cannot run with timers off. New ignores this option: a
-// Transport always derives the mode from its own channel.
-func WithReliable(v bool) Option {
-	return func(o *options) { o.reliable = &v }
 }
 
 func buildOptions(opts []Option) options {
@@ -158,12 +148,18 @@ type peerKey uint64
 
 // Gateway is the server-side endpoint: one drpc.Server serving many peers,
 // one DataChannel each. It is the tx handler for drpc.NewServer.
+//
+// Channels of differing reliability mix freely — a reliable control channel
+// and unreliable telemetry channels on one PeerConnection is the natural
+// wiring. Each channel's mode is derived from its own configuration and
+// annotated per peer (drpc.NewReliableContext), so the server runs every
+// peer in its channel's mode; the Gateway itself deliberately does not
+// implement drpc.TransportInfo — there is no single answer to advertise.
 type Gateway struct {
 	o    options
 	next atomic.Uint64
 
 	mu    sync.Mutex
-	mode  *bool // latched channel mode; nil until first decided
 	chans map[*webrtc.DataChannel]*gwChannel
 	peers map[peerKey]*channel
 }
@@ -171,7 +167,6 @@ type Gateway struct {
 type gwChannel struct {
 	ch     *channel
 	key    peerKey
-	ok     bool // channel config matches the gateway mode
 	served atomic.Bool
 }
 
@@ -179,36 +174,9 @@ func NewGateway(opts ...Option) *Gateway {
 	o := buildOptions(opts)
 	return &Gateway{
 		o:     o,
-		mode:  o.reliable,
 		chans: map[*webrtc.DataChannel]*gwChannel{},
 		peers: map[peerKey]*channel{},
 	}
-}
-
-// Reliable reports the mode of the channels this gateway serves.
-// drpc.NewServer reads it once at construction — usually before any channel
-// exists — so the gateway cannot derive the mode from traffic it has not
-// seen: the mode is WithReliable if given, else the configuration of the
-// first channel passed to Bind or ServePeer, else unreliable; it latches at
-// whichever of Reliable, Bind, or ServePeer runs first. The unreliable
-// machinery is correct on any channel (timers on a reliable channel are
-// merely redundant), so an unreliable-latched gateway serves reliable
-// channels too; the reverse is refused — timers off over a lossy channel
-// would hang — so ServePeer rejects an unreliable channel once the gateway
-// latched reliable. A server built before its first channel therefore runs
-// unreliable and serves everything, unless WithReliable(true) says
-// otherwise.
-func (g *Gateway) Reliable() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.latchLocked(false)
-}
-
-func (g *Gateway) latchLocked(v bool) bool {
-	if g.mode == nil {
-		g.mode = &v
-	}
-	return *g.mode
 }
 
 // Bind registers the gateway's handlers on dc and starts buffering its
@@ -232,15 +200,9 @@ func (g *Gateway) bind(dc *webrtc.DataChannel) *gwChannel {
 	if b, ok := g.chans[dc]; ok {
 		return b
 	}
-	r := channelReliable(dc)
-	m := g.latchLocked(r)
 	b := &gwChannel{
-		ch:  newChannel(dc, m, g.o),
+		ch:  newChannel(dc, channelReliable(dc), g.o),
 		key: peerKey(g.next.Add(1)),
-		// Only one combination is unservable: a lossy channel under a server
-		// whose timers are off. A reliable channel under an unreliable-latched
-		// gateway merely runs redundant timers (see Reliable).
-		ok: r || !m,
 	}
 	g.chans[dc] = b
 	g.peers[b.key] = b.ch
@@ -258,25 +220,23 @@ func (g *Gateway) drop(dc *webrtc.DataChannel, b *gwChannel) {
 	g.mu.Unlock()
 }
 
-// ServePeer delivers dc's frames to srv under a fresh peer key until ctx is
-// done or the channel dies. On channel death it performs the §4.5 teardown
-// duty — srv.DisconnectPeer with the cause — deregisters the peer, and
-// returns that cause; it returns nil on a clean close or on ctx cancellation.
-// It refuses a channel whose configuration contradicts the gateway mode (see
-// Reliable) and serves each channel at most once.
+// ServePeer delivers dc's frames to srv under a fresh peer key — annotated
+// with the channel's own reliability, so the server runs this peer in the
+// channel's mode (PROTOCOL.md §4.3) — until ctx is done or the channel
+// dies. On channel death it performs the §4.5 teardown duty —
+// srv.DisconnectPeer with the cause — deregisters the peer, and returns
+// that cause; it returns nil on a clean close or on ctx cancellation. Each
+// channel is served at most once.
 func (g *Gateway) ServePeer(ctx context.Context, srv *drpc.Server, dc *webrtc.DataChannel) error {
 	b := g.bind(dc)
-	if !b.ok {
-		g.drop(dc, b)
-		return fmt.Errorf("pion: %s channel on a gateway locked %s",
-			modeName(channelReliable(dc)), modeName(g.Reliable()))
-	}
 	if !b.served.CompareAndSwap(false, true) {
 		return errors.New("pion: channel already served")
 	}
 	defer g.drop(dc, b)
 
-	died, err := b.ch.serve(drpc.NewPeerContext(ctx, b.key), srv)
+	ctx = drpc.NewPeerContext(ctx, b.key)
+	ctx = drpc.NewReliableContext(ctx, b.ch.reliable)
+	died, err := b.ch.serve(ctx, srv)
 	if died {
 		srv.DisconnectPeer(b.key, err)
 	}
@@ -308,11 +268,4 @@ func (g *Gateway) Send(ctx context.Context, e *drpc.Envelop) error {
 		return fmt.Errorf("pion: peer %d is gone", k)
 	}
 	return ch.send(ctx, e)
-}
-
-func modeName(reliable bool) string {
-	if reliable {
-		return "reliable"
-	}
-	return "unreliable"
 }

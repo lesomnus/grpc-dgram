@@ -58,6 +58,11 @@ type Server struct {
 	serving  atomic.Bool
 	services map[string]*serviceDesc
 
+	// sawUnreliable latches once any unreliable-mode state exists; until
+	// then the sweeper has nothing it could ever do (reliable peers run no
+	// timers) and is never started.
+	sawUnreliable atomic.Bool
+
 	unary_int  grpc.UnaryServerInterceptor
 	stream_int grpc.StreamServerInterceptor
 }
@@ -130,6 +135,16 @@ func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
 		d.stream = &desc.Streams[i]
 		d.impl = impl
 	}
+}
+
+// rxReliable resolves the mode governing a received frame: the adapter's
+// per-channel annotation when present (NewReliableContext, PROTOCOL.md
+// §4.3), else the server's own mode.
+func (s *Server) rxReliable(ctx context.Context) bool {
+	if r, ok := reliableFromContext(ctx); ok {
+		return r
+	}
+	return s.mode.reliable
 }
 
 // Handle delivers one client frame to this Server. Adapters call it for each
@@ -216,7 +231,7 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 		// below hwm_aged is necessarily a stale straggler.
 		if ps := s.peers[ek]; ps != nil {
 			// sids never wrap (§6.2): plain comparison.
-			aged := ps.hwmAgedLocked(now, s.mode.timing.Tombstone, s.mode.reliable)
+			aged := ps.hwmAgedLocked(now, s.mode.timing.Tombstone, ps.reliable)
 			if key.sid <= aged {
 				s.mu.Unlock()
 				return s.sendReset(ctx, key, f)
@@ -227,8 +242,9 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 	}
 
 	// Unknown, non-OPEN, non-PING: delayed RESET — the OPEN may merely be
-	// late (PROTOCOL.md §9.3). Reliable mode has no reordering: immediate.
-	if s.mode.reliable {
+	// late (PROTOCOL.md §9.3). A reliable channel has no reordering:
+	// immediate.
+	if s.rxReliable(ctx) {
 		s.mu.Unlock()
 		return s.sendReset(ctx, key, f)
 	}
@@ -237,6 +253,7 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 			due:  now.Add(s.mode.timing.Hold),
 			echo: f.GetEpoch(),
 		}
+		s.sawUnreliable.Store(true)
 	}
 	s.mu.Unlock()
 	s.kickSweep()
@@ -244,9 +261,9 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 }
 
 // sendReset answers a frame with an immediate RESET, rate-limited per call
-// key (PROTOCOL.md §9.3, §15).
+// key on unreliable channels (PROTOCOL.md §9.3, §15).
 func (s *Server) sendReset(ctx context.Context, key callKey, f *Frame) error {
-	if !s.mode.reliable {
+	if !s.rxReliable(ctx) {
 		n := nowNano()
 		s.mu.Lock()
 		if last, ok := s.resetAt[key]; ok {
@@ -260,6 +277,7 @@ func (s *Server) sendReset(ctx context.Context, key callKey, f *Frame) error {
 			return nil
 		}
 		s.resetAt[key] = n
+		s.sawUnreliable.Store(true)
 		s.mu.Unlock()
 		s.kickSweep()
 	}
@@ -289,6 +307,10 @@ func (s *Server) resetByPeerSid(peer any, sid uint32) {
 }
 
 func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
+	// The frame's channel mode governs the whole call (PROTOCOL.md §4.3):
+	// captured here, inherited by the stream and the peer container.
+	rel := s.rxReliable(ctx)
+
 	// Methods are addressed by full name, always (PROTOCOL.md §13).
 	desc := s.services[f.GetMethod()]
 	if desc == nil {
@@ -325,7 +347,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	if c, ok := s.methodRx[desc.fullname]; ok {
 		rxCfg = c
 	}
-	st := newServerStream(sctx, s, key, desc, codec, rxCfg.withDefaults())
+	st := newServerStream(sctx, s, key, desc, codec, rxCfg.withDefaults(), rel)
 	st.cancelTimeout = cancelTimeout
 
 	var transport *serverTransportUnary
@@ -356,9 +378,9 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		return nil
 	}
 	now := time.Now()
-	ps := s.ensurePeerLocked(epochKey{peer: key.peer, epoch: key.epoch}, now)
+	ps := s.ensurePeerLocked(epochKey{peer: key.peer, epoch: key.epoch}, now, rel)
 	if _, tombed := ps.tombs[key.sid]; tombed ||
-		key.sid <= ps.hwmAgedLocked(now, s.mode.timing.Tombstone, s.mode.reliable) {
+		key.sid <= ps.hwmAgedLocked(now, s.mode.timing.Tombstone, ps.reliable) {
 		// Re-check under the registration lock: a concurrent duplicate OPEN
 		// may have run the whole call to completion since Handle's checks —
 		// admitting it here would re-execute a finished call and break
@@ -429,11 +451,11 @@ func (s *Server) rejectOpen(ctx context.Context, f *Frame, code codes.Code, msg 
 	t.SetCode(uint32(code))
 	t.SetDesc(fmt.Sprintf(msg, args...))
 
-	if !s.mode.reliable {
+	if !s.rxReliable(ctx) {
 		peer, _ := PeerFromContext(ctx)
 		now := time.Now()
 		s.mu.Lock()
-		ps := s.ensurePeerLocked(epochKey{peer: peer, epoch: f.GetEpoch()}, now)
+		ps := s.ensurePeerLocked(epochKey{peer: peer, epoch: f.GetEpoch()}, now, false)
 		ps.lastRx.Store(now.UnixNano())
 		if ps.hwm < f.GetSid() {
 			ps.hwm = f.GetSid()
@@ -527,7 +549,7 @@ func (s *Server) finish(st *serverStream, term *Frame) {
 	delete(s.calls, st.key)
 	if ps := st.ps; ps != nil {
 		ps.liveCalls--
-		if !s.mode.reliable {
+		if !st.reliable {
 			ttl := s.mode.timing.Tombstone
 			if dl, ok := st.ctx.Deadline(); ok {
 				// TTL floor: the propagated timeout remainder (§9.2).

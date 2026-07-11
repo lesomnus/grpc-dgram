@@ -36,6 +36,12 @@ type peerState struct {
 	epoch uint32
 	txCtx context.Context // Server root + peer, for timer-driven sends (§6.4)
 
+	// reliable is the mode of this peer's channel, captured at container
+	// creation from the frame annotation (PROTOCOL.md §4.3). A reliable
+	// container runs no timers: the sweep skips it entirely — no liveness,
+	// no PING, no checkpoints, no GC (it lives until teardown, §10.6).
+	reliable bool
+
 	hwm  uint32
 	cps  []hwmCP // watermark checkpoints, appended by the sweep (§9.4)
 	dead bool    // liveness expired; cleared state
@@ -135,8 +141,10 @@ type pendingReset struct {
 
 // ensurePeerLocked returns the container for ek, creating it and enforcing
 // the per-peer container cap (never evicting containers with live calls,
-// PROTOCOL.md §15). Server.mu held.
-func (s *Server) ensurePeerLocked(ek epochKey, now time.Time) *peerState {
+// PROTOCOL.md §15). Server.mu held. reliable applies on creation only: the
+// mode is a property of the peer's channel and cannot change (§4.3) — an
+// existing container keeps its first-captured value.
+func (s *Server) ensurePeerLocked(ek epochKey, now time.Time, reliable bool) *peerState {
 	ps := s.peers[ek]
 	if ps != nil {
 		return ps
@@ -167,6 +175,7 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time) *peerState {
 		peer:         ek.peer,
 		epoch:        ek.epoch,
 		txCtx:        txCtx,
+		reliable:     reliable,
 		tombs:        map[uint32]*srvTomb{},
 		created:      now,
 		maxTombs:     s.limits.MaxTombstones,
@@ -176,11 +185,16 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time) *peerState {
 	ps.lastRx.Store(now.UnixNano())
 	ps.lastTx.Store(now.UnixNano())
 	s.peers[ek] = ps
+	if !reliable {
+		s.sawUnreliable.Store(true)
+	}
 	return ps
 }
 
 func (s *Server) kickSweep() {
-	if s.mode.reliable {
+	if !s.sawUnreliable.Load() {
+		// Only unreliable-mode state needs timers; a server that has seen
+		// none runs no sweeper at all.
 		return
 	}
 	s.sw.kick(s.sweepLoop)
@@ -189,7 +203,17 @@ func (s *Server) kickSweep() {
 func (s *Server) hasWork() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.calls) > 0 || len(s.peers) > 0 || len(s.pendingResets) > 0 || len(s.resetAt) > 0
+	if len(s.pendingResets) > 0 || len(s.resetAt) > 0 {
+		return true
+	}
+	for _, ps := range s.peers {
+		// Reliable containers are not swept (no timers, no GC): only an
+		// unreliable one keeps the sweeper alive.
+		if !ps.reliable {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) sweepLoop() {
@@ -255,6 +279,13 @@ func (s *Server) sweep(now time.Time) {
 
 	// Containers: checkpoints, tombstone expiry, liveness, keepalive, GC.
 	for ek, ps := range s.peers {
+		if ps.reliable {
+			// A reliable peer runs no timers (PROTOCOL.md §10.6): no
+			// liveness, no PING, no tombstones to expire, no aging (its
+			// watermark is plain hwm), and no GC — state lives until
+			// teardown (DisconnectPeer/Stop).
+			continue
+		}
 		ps.cps = append(ps.cps, hwmCP{at: now, hwm: ps.hwm})
 		for len(ps.cps) > 1 && now.Sub(ps.cps[1].at) >= t.Tombstone {
 			// Keep exactly one checkpoint older than TTL: it defines hwm_aged.
@@ -312,8 +343,11 @@ func (s *Server) sweep(now time.Time) {
 		}
 	}
 
-	// Stream probes (§10.5).
+	// Stream probes (§10.5). Calls on reliable channels are not probed.
 	for _, st := range s.calls {
+		if st.reliable {
+			continue
+		}
 		if f := st.probeDue(now, t.probe(), s.epoch); f != nil {
 			if ps := s.peers[epochKey{peer: st.key.peer, epoch: st.key.epoch}]; ps != nil {
 				ps.lastTx.Store(n)

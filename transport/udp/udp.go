@@ -233,11 +233,12 @@ func (g *Gateway) Send(ctx context.Context, e *drpc.Envelop) error {
 func (g *Gateway) Serve(ctx context.Context, h drpc.FrameHandler) error {
 	stop := context.AfterFunc(ctx, func() { g.c.SetReadDeadline(unblockNow) })
 	defer stop()
+	rxCtx := drpc.NewReliableContext(ctx, false)
 	return serve(ctx, h, func(buf []byte) (int, context.Context, error) {
 		n, addr, err := g.c.ReadFromUDPAddrPort(buf)
 		if err != nil {
-			return n, ctx, err
+			return n, rxCtx, err
 		}
-		return n, drpc.NewPeerContext(ctx, addr), nil
+		return n, drpc.NewPeerContext(rxCtx, addr), nil
 	})
 }

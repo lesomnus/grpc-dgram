@@ -185,37 +185,107 @@ func serveUnreliable(t *testing.T) *ends {
 	return &ends{client: echo.NewEchoServiceClient(conn), tp: tp, gw: gw, srv: srv}
 }
 
-// The common answerer-server flow: the server is built before any channel
-// exists, so the gateway latches unreliable — which must still serve a
-// default-config (reliable) channel, merely with redundant timers. This is
-// the ordering shown in Bind's own OnDataChannel example.
-func TestAnswererServerServesReliableChannel(t *testing.T) {
+// The wiring this library exists for: ONE PeerConnection carrying a
+// reliable control channel and an unreliable telemetry channel, ONE
+// answerer-side Server serving both — each peer in its own channel's mode
+// (drpc.NewReliableContext, PROTOCOL.md §4.3), no mode options anywhere.
+// The reliable channel's idle stream surviving past T_live is the proof the
+// server did not run it under the unreliable liveness machinery.
+func TestMixedChannels(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 
+	// An aggressive T_live makes the idle-survival window cheap to cross.
+	fast := drpc.Timing{
+		Call:       2 * time.Second,
+		Liveness:   900 * time.Millisecond,
+		Retransmit: 100 * time.Millisecond,
+	}
 	gw := pion.NewGateway()
-	srv := drpc.NewServer(gw, drpc.WithTiming(timing)) // latches unreliable
+	srv := drpc.NewServer(gw, drpc.WithTiming(fast))
 	echo.RegisterEchoServiceServer(srv, &echo.EchoServer{})
 
-	var tp *pion.Transport
-	served := make(chan error, 1)
-	dial(t, nil, // default config: a reliable channel
-		func(dc *webrtc.DataChannel) {
-			tp = pion.New(dc)
-		},
-		func(dc *webrtc.DataChannel) {
-			gw.Bind(dc)
-			go func() { served <- gw.ServePeer(ctx, srv, dc) }()
-		},
-	)
+	se := webrtc.SettingEngine{}
+	se.SetIncludeLoopbackCandidate(true)
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
 
-	conn := drpc.NewConn(tp, drpc.WithTiming(timing))
+	offerer, err := api.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { offerer.Close() })
+	answerer, err := api.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { answerer.Close() })
+
+	answerer.OnDataChannel(func(dc *webrtc.DataChannel) {
+		gw.Bind(dc)
+		go gw.ServePeer(ctx, srv, dc)
+	})
+
+	// Two channels, one connection: reliable control, unreliable telemetry.
+	ctrlDC, err := offerer.CreateDataChannel("control", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordered := false
+	retx := uint16(0)
+	teleDC, err := offerer.CreateDataChannel("telemetry", &webrtc.DataChannelInit{
+		Ordered:        &ordered,
+		MaxRetransmits: &retx,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctrlTp, teleTp := pion.New(ctrlDC), pion.New(teleDC)
+
+	offer, err := offerer.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gathered := webrtc.GatheringCompletePromise(offerer)
+	if err := offerer.SetLocalDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	<-gathered
+	if err := answerer.SetRemoteDescription(*offerer.LocalDescription()); err != nil {
+		t.Fatal(err)
+	}
+	answer, err := answerer.CreateAnswer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gathered = webrtc.GatheringCompletePromise(answerer)
+	if err := answerer.SetLocalDescription(answer); err != nil {
+		t.Fatal(err)
+	}
+	<-gathered
+	if err := offerer.SetRemoteDescription(*answerer.LocalDescription()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctrl := drpc.NewConn(ctrlTp) // reliable: auto-detected, no options
+	tele := drpc.NewConn(teleTp, drpc.WithTiming(fast))
 	t.Cleanup(func() {
 		srv.Stop()
-		conn.Close(nil)
+		ctrl.Close(nil)
+		tele.Close(nil)
 		cancel()
 	})
 
-	res, err := conn2client(conn).Once(t.Context(), echo.EchoRequest_builder{
+	// A long-lived control stream and telemetry traffic, side by side.
+	stream, err := conn2client(ctrl).Live(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(echo.EchoRequest_builder{Message: "up", Repeat: 1}.Build()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	res, err := conn2client(tele).Once(t.Context(), echo.EchoRequest_builder{
 		Message:       "abc",
 		CircularShift: 1,
 	}.Build())
@@ -223,12 +293,22 @@ func TestAnswererServerServesReliableChannel(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := res.GetMessage(); got != "bca" {
-		t.Fatalf("got %q, want %q", got, "bca")
+		t.Fatalf("telemetry got %q, want %q", got, "bca")
 	}
-	select {
-	case err := <-served:
-		t.Fatalf("ServePeer refused the reliable channel: %v", err)
-	default:
+
+	// The control stream goes idle well past the server's T_live. A server
+	// running this peer in unreliable mode would expire it (a reliable-mode
+	// client sends no keepalive); per-peer mode must leave it untouched.
+	time.Sleep(3 * fast.Liveness)
+	if err := stream.Send(echo.EchoRequest_builder{Message: "still", Repeat: 1}.Build()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("idle control stream was killed: %v", err)
+	}
+	if got.GetMessage() != "still" {
+		t.Fatalf("got %q, want %q", got.GetMessage(), "still")
 	}
 }
 
@@ -289,9 +369,9 @@ func TestReliableEcho(t *testing.T) {
 		if !e.tp.Reliable() {
 			t.Error("transport did not derive reliable from the channel config")
 		}
-		if !e.gw.Reliable() {
-			t.Error("gateway did not derive reliable from the bound channel")
-		}
+		// Server side: the mode travels per peer via the ServePeer
+		// annotation; the idle-survival assertion in TestMixedChannels is
+		// the behavioral proof.
 	})
 	t.Run("unary", func(t *testing.T) {
 		res, err := e.client.Once(t.Context(), echo.EchoRequest_builder{
@@ -359,9 +439,6 @@ func TestUnreliableEcho(t *testing.T) {
 	t.Run("mode is auto-detected", func(t *testing.T) {
 		if e.tp.Reliable() {
 			t.Error("transport took a zero-retransmit channel for reliable")
-		}
-		if e.gw.Reliable() {
-			t.Error("gateway latched reliable with no reliable channel in sight")
 		}
 	})
 	t.Run("unary", func(t *testing.T) {

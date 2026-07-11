@@ -647,6 +647,11 @@ type serverStream struct {
 	key    callKey
 	ps     *peerState // container of this client incarnation; set at open
 
+	// reliable is the mode of the channel this call arrived on
+	// (PROTOCOL.md §4.3): it selects strict sequencing, and gates the
+	// probe/tombstone machinery of the peer-mixed server.
+	reliable bool
+
 	desc  *serviceDesc
 	codec encoding.CodecV2
 
@@ -687,19 +692,20 @@ type serverStream struct {
 	rxEOF     chan struct{}
 }
 
-func newServerStream(ctx context.Context, srv *Server, key callKey, desc *serviceDesc, codec encoding.CodecV2, rxCfg rxConfig) *serverStream {
+func newServerStream(ctx context.Context, srv *Server, key callKey, desc *serviceDesc, codec encoding.CodecV2, rxCfg rxConfig, reliable bool) *serverStream {
 	s := &serverStream{
-		server: srv,
-		key:    key,
-		desc:   desc,
-		codec:  codec,
+		server:   srv,
+		key:      key,
+		desc:     desc,
+		codec:    codec,
+		reliable: reliable,
 
 		rx:    make(chan *Frame, rxCfg.size),
 		rxCfg: rxCfg,
 		rxEOF: make(chan struct{}),
 	}
 	s.rxWin.l = 1 // the accepted OPEN
-	s.rxWin.strict = srv.mode.reliable
+	s.rxWin.strict = reliable
 	n := nowNano()
 	s.lastRx.Store(n)
 	s.lastTx.Store(n)
