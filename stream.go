@@ -41,6 +41,11 @@ func toStatusErr(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return status.Error(codes.DeadlineExceeded, context.DeadlineExceeded.Error())
 	}
+	if errors.Is(err, ErrMessageTooLarge) {
+		// The adapter refused the send: too large for the transport
+		// (PROTOCOL.md §4.4).
+		return status.Error(codes.ResourceExhausted, err.Error())
+	}
 	return status.Error(codes.Unknown, err.Error())
 }
 

@@ -10,6 +10,12 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// ErrMessageTooLarge is returned (or wrapped) by an adapter's Handle when a
+// marshaled envelop cannot fit the transport's message limit. The core never
+// fragments; it maps this error to the gRPC status ResourceExhausted on the
+// owning call. See PROTOCOL.md §4.4.
+var ErrMessageTooLarge = errors.New("drpc: message too large for the transport")
+
 // FrameHandler is the core-facing seam: Conn and Server emit and consume
 // individual frames. See PROTOCOL.md §3.
 type FrameHandler interface {

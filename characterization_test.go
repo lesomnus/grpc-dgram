@@ -8,6 +8,7 @@ package drpc_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync/atomic"
 	"testing"
@@ -478,6 +479,48 @@ func TestChar_ClientRejectsForeignEpochFrame(t *testing.T) {
 	got2 := &echo.EchoResponse{}
 	x.NoError(t, stream.RecvMsg(got2))
 	x.Equal(t, "real2", got2.GetMessage()) // spoof was dropped, not delivered
+}
+
+// ---------------------------------------------------------------------------
+// §4.4: message size is the adapter's concern. When the adapter's Handle
+// refuses a send with ErrMessageTooLarge, the core fails the owning call with
+// ResourceExhausted — synchronously, never fragmenting or retrying.
+// ---------------------------------------------------------------------------
+
+func TestChar_AdapterRefusesTooLargeSend(t *testing.T) {
+	// A reliable-mode conn keeps protocol timers out of the picture; the
+	// failure is synchronous and needs no peer at all.
+	newConn := func(limit int) *drpc.Conn {
+		return drpc.NewConn(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
+			if len(f.GetPayload()) > limit {
+				return fmt.Errorf("refused %d bytes: %w", len(f.GetPayload()), drpc.ErrMessageTooLarge)
+			}
+			return nil
+		}), drpc.WithReliable(true))
+	}
+
+	t.Run("unary: status surfaces via the invoke result", func(t *testing.T) {
+		conn := newConn(8)
+		defer conn.Close(nil)
+		client := echo.NewEchoServiceClient(conn)
+
+		_, err := client.Once(t.Context(), echo.EchoRequest_builder{
+			Message: "far larger than eight bytes",
+		}.Build())
+		x.Equal(t, codes.ResourceExhausted, status.Code(err))
+	})
+	t.Run("client-streaming: Send returns the status itself", func(t *testing.T) {
+		conn := newConn(8)
+		defer conn.Close(nil)
+		client := echo.NewEchoServiceClient(conn)
+
+		stream, err := client.Buff(t.Context())
+		x.NoError(t, err) // the eager OPEN is tiny and passes
+		err = stream.Send(echo.EchoRequest_builder{
+			Message: "far larger than eight bytes",
+		}.Build())
+		x.Equal(t, codes.ResourceExhausted, status.Code(err))
+	})
 }
 
 // ---------------------------------------------------------------------------
