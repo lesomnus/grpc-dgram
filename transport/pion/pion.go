@@ -9,7 +9,7 @@
 // setup and signaling stay with the application.
 //
 // DataChannels are connection-oriented, so the §4.5 teardown duty applies:
-// ServeConn and ServePeer hook OnClose and call Conn.Close /
+// the attached client pump and ServePeer hook OnClose and call Conn.Close /
 // Server.DisconnectPeer when the channel dies — in reliable mode the only
 // unblocking mechanism. A PeerConnection can be severed without a close ever
 // surfacing on the channel (the SCTP shutdown needs a live transport to
@@ -79,23 +79,51 @@ func buildOptions(opts []Option) options {
 
 // Transport is the client-side endpoint: one DataChannel talking to one
 // server, so no peer key is needed (PROTOCOL.md §6.4). It is the tx handler
-// for drpc.NewConn — implementing drpc.TransportInfo directly so mode
-// discovery is not masked by a wrapper.
+// for drpc.NewConn — implementing drpc.TransportInfo and drpc.ConnAttacher
+// directly so neither is masked by a wrapper. drpc.NewConn attaches it and
+// the drain pump starts by itself: no user goroutine, and conn.Close (or
+// Close here) tears everything down, DataChannel included.
 type Transport struct {
-	ch     *channel
-	served atomic.Bool
+	ch       *channel
+	attached atomic.Bool
+	closer   sync.Once
 }
 
 // New wraps an already-negotiated DataChannel. It registers the channel
-// handlers immediately and buffers inbound messages until ServeConn drains
-// them — pion drops messages that arrive with no handler registered. For a
-// remotely-announced channel, call New synchronously inside OnDataChannel:
-// pion holds the channel's read loop until that callback returns, so handlers
-// registered there observe every message, while a handler registered from a
-// spawned goroutine races the read loop.
+// handlers immediately and buffers inbound messages until the attached pump
+// drains them — pion drops messages that arrive with no handler registered.
+// For a remotely-announced channel, call New synchronously inside
+// OnDataChannel: pion holds the channel's read loop until that callback
+// returns, so handlers registered there observe every message, while a
+// handler registered from a spawned goroutine races the read loop. The
+// Transport owns the channel from here on: Close closes it, and closing the
+// attached Conn does too.
 func New(dc *webrtc.DataChannel, opts ...Option) *Transport {
 	o := buildOptions(opts)
 	return &Transport{ch: newChannel(dc, channelReliable(dc), o)}
+}
+
+// AttachConn is called by drpc.NewConn: it starts the drain pump, which runs
+// until the channel dies or Close is called, then performs the §4.5
+// teardown — conn.Close with the cause — the only mechanism that unblocks
+// live calls in reliable mode. Attach (i.e. drpc.NewConn) promptly after
+// New: past rxBufferSize buffered messages the channel's read loop blocks
+// waiting for the pump.
+func (t *Transport) AttachConn(conn *drpc.Conn) {
+	if !t.attached.CompareAndSwap(false, true) {
+		panic("pion: transport already attached to a Conn")
+	}
+	go func() {
+		_, err := t.ch.serve(context.Background(), conn)
+		conn.Close(err)
+	}()
+}
+
+// Close closes the DataChannel; its death path flushes what was already
+// received, stops the pump, and fails any live calls. Idempotent.
+func (t *Transport) Close() error {
+	t.closer.Do(func() { t.ch.dc.Close() })
+	return nil
 }
 
 // Reliable reports the mode derived from the channel configuration; see
@@ -115,23 +143,6 @@ func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
 // wrapping drpc.ErrMessageTooLarge (PROTOCOL.md §4.4).
 func (t *Transport) Send(ctx context.Context, e *drpc.Envelop) error {
 	return t.ch.send(ctx, e)
-}
-
-// ServeConn delivers received frames to conn until ctx is done or the channel
-// dies. On channel death it performs the §4.5 teardown duty — conn.Close with
-// the cause — and returns that cause; it returns nil on a clean close or on
-// ctx cancellation, where conn stays open and is the caller's to close. Call
-// it once, promptly after New: past rxBufferSize buffered messages the
-// channel's read loop blocks waiting for it.
-func (t *Transport) ServeConn(ctx context.Context, conn *drpc.Conn) error {
-	if !t.served.CompareAndSwap(false, true) {
-		return errors.New("pion: ServeConn already called")
-	}
-	died, err := t.ch.serve(ctx, conn)
-	if died {
-		conn.Close(err)
-	}
-	return err
 }
 
 // peerKey identifies one served channel within a Gateway. Keys are never

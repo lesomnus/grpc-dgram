@@ -16,8 +16,8 @@ import (
 	"time"
 
 	drpc "github.com/lesomnus/grpc-dgram"
-	"github.com/lesomnus/grpc-dgram/transport/udp"
 	"github.com/lesomnus/grpc-dgram/internal/echo"
+	"github.com/lesomnus/grpc-dgram/transport/udp"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -67,23 +67,10 @@ func (a serverAddr) dial(t *testing.T, opts ...udp.Option) echo.EchoServiceClien
 	if err != nil {
 		t.Fatal(err)
 	}
-	tp := udp.New(c, opts...)
-	conn := drpc.NewConn(tp, drpc.WithTiming(timing))
-
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if err := tp.Serve(ctx, conn); err != nil {
-			t.Errorf("transport serve: %v", err)
-		}
-	}()
-	t.Cleanup(func() {
-		conn.Close(nil)
-		cancel()
-		c.Close()
-		<-done
-	})
+	// drpc.NewConn discovers the transport via ConnAttacher: the receive
+	// pump starts by itself, and Close tears the socket down too.
+	conn := drpc.NewConn(udp.New(c, opts...), drpc.WithTiming(timing))
+	t.Cleanup(func() { conn.Close(nil) })
 	return echo.NewEchoServiceClient(conn)
 }
 
@@ -187,30 +174,22 @@ func TestServerAbsenceIsNotFatal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
-	tp := udp.New(c)
-	conn := drpc.NewConn(tp, drpc.WithTiming(timing))
+	conn := drpc.NewConn(udp.New(c), drpc.WithTiming(timing))
 	defer conn.Close(nil)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	served := make(chan error, 1)
-	go func() { served <- tp.Serve(ctx, conn) }()
 	client := echo.NewEchoServiceClient(conn)
 
 	// No server: the OPEN and its retransmissions draw ICMP refusals on both
 	// the write and the blocked read. The call must end by its deadline —
-	// not by a transport error — and Serve must still be running.
+	// not by a transport error — and the conn must stay usable (the revived
+	// call below is the proof the pump survived).
 	dctx, dcancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	_, err = client.Once(dctx, echo.EchoRequest_builder{Message: "abc"}.Build())
 	dcancel()
 	if got := status.Code(err); got != codes.DeadlineExceeded {
 		t.Fatalf("call against an absent server ended %v (%v), want DeadlineExceeded", got, err)
-	}
-	select {
-	case err := <-served:
-		t.Fatalf("Serve exited on ICMP unreachable: %v", err)
-	default:
 	}
 
 	// The server comes back on the same address; the same conn works.
@@ -241,11 +220,6 @@ func TestServerAbsenceIsNotFatal(t *testing.T) {
 	}
 	if got := res.GetMessage(); got != "bca" {
 		t.Fatalf("got %q, want %q", got, "bca")
-	}
-	cancel()
-	c.Close()
-	if err := <-served; err != nil {
-		t.Fatalf("Serve: %v", err)
 	}
 }
 

@@ -22,6 +22,20 @@ type FrameHandler interface {
 	Handle(ctx context.Context, f *Frame) error
 }
 
+// ConnAttacher is discovered on the tx by NewConn the way TransportInfo is:
+// the transport receives the Conn it serves and starts its own receive
+// machinery, so the client needs no user-managed goroutine — matching gRPC.
+// Conn.Close closes a tx that implements io.Closer, so one Close tears the
+// whole endpoint down; the transport's Close must be idempotent.
+//
+// Servers deliberately have no equivalent: service registration must precede
+// the first received frame (the registry freezes when serving starts), so a
+// server transport is started explicitly — Serve/ServePeer — after
+// RegisterService, the shape of grpc's Server.Serve(lis).
+type ConnAttacher interface {
+	AttachConn(c *Conn)
+}
+
 type FrameHandlerFunc func(ctx context.Context, f *Frame) error
 
 func (f FrameHandlerFunc) Handle(ctx context.Context, frame *Frame) error {

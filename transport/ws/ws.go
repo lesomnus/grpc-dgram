@@ -6,8 +6,8 @@
 //
 //   - Teardown (§4.5): when the socket dies, Conn.Close /
 //     Server.DisconnectPeer is the only mechanism that unblocks live calls.
-//     ServeConn and ServePeer call it on every exit path — this is the point
-//     of the adapter, not a nicety.
+//     The attached client pump and ServePeer call it on every exit path —
+//     this is the point of the adapter, not a nicety.
 //   - Liveness (§10.6): death is detected by read errors plus a ping/pong
 //     keepalive (WithKeepalive); a peer that makes no read progress within
 //     the keepalive timeout is dead.
@@ -216,20 +216,57 @@ func serve(ctx context.Context, c *websocket.Conn, o options, rxCtx context.Cont
 
 // Transport is the client-side endpoint: one WebSocket talking to one
 // server. It is the tx handler for drpc.NewConn — implementing
-// drpc.TransportInfo directly so mode discovery is not masked by a wrapper.
+// drpc.TransportInfo and drpc.ConnAttacher directly so neither is masked by
+// a wrapper. drpc.NewConn attaches it and the read loop + keepalive start by
+// themselves: no user goroutine, and conn.Close (or Close here) tears
+// everything down, WebSocket included.
 type Transport struct {
 	s sock
 	o options
+
+	ctx      context.Context
+	cancel   context.CancelFunc
+	attached atomic.Bool
+	closer   sync.Once
 }
 
 // New wraps an established client WebSocket (e.g. websocket.Dialer.Dial).
+// The Transport owns the socket from here on: Close closes it, and closing
+// the attached Conn does too.
 func New(c *websocket.Conn, opts ...Option) *Transport {
-	return &Transport{s: sock{c: c}, o: buildOptions(opts)}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Transport{s: sock{c: c}, o: buildOptions(opts), ctx: ctx, cancel: cancel}
+}
+
+// AttachConn is called by drpc.NewConn: it starts the read loop and the
+// keepalive, which run until the socket dies or Close is called, and on
+// every exit perform the §4.5 teardown — conn.Close with the cause — the
+// only mechanism that unblocks live calls in reliable mode. The single peer
+// needs no peer key (PROTOCOL.md §6.4).
+func (t *Transport) AttachConn(conn *drpc.Conn) {
+	if !t.attached.CompareAndSwap(false, true) {
+		panic("ws: transport already attached to a Conn")
+	}
+	go func() {
+		err := serve(t.ctx, t.s.c, t.o, t.ctx, conn)
+		conn.Close(err)
+		t.Close()
+	}()
+}
+
+// Close stops the read loop and keepalive and closes the WebSocket; the
+// pump's exit fails any live calls. Idempotent.
+func (t *Transport) Close() error {
+	t.closer.Do(func() {
+		t.cancel()
+		t.s.c.Close()
+	})
+	return nil
 }
 
 // Reliable reports true: WebSocket neither loses, duplicates, nor reorders.
 // The core discovers this and disables all protocol timers (PROTOCOL.md
-// §10.6), which is what makes ServeConn's teardown duty mandatory.
+// §10.6), which is what makes the attached pump's teardown duty mandatory.
 func (t *Transport) Reliable() bool { return true }
 
 // Handle sends one frame as a single-frame envelop.
@@ -246,18 +283,6 @@ func (t *Transport) Send(_ context.Context, e *drpc.Envelop) error {
 		return err
 	}
 	return t.s.write(data, t.o.keepaliveTimeout)
-}
-
-// ServeConn delivers received frames to conn and runs the keepalive until
-// ctx is done or the socket dies. The single peer needs no peer key
-// (PROTOCOL.md §6.4). On every exit it calls conn.Close: with protocol
-// timers off, this teardown is the only mechanism that unblocks live calls
-// (§4.5). Returns nil on ctx cancellation or a clean close, the transport
-// error otherwise.
-func (t *Transport) ServeConn(ctx context.Context, conn *drpc.Conn) error {
-	err := serve(ctx, t.s.c, t.o, ctx, conn)
-	conn.Close(err)
-	return err
 }
 
 // peerKey identifies one registered WebSocket. Deliberately opaque and

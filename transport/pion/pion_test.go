@@ -15,8 +15,8 @@ import (
 	"time"
 
 	drpc "github.com/lesomnus/grpc-dgram"
-	"github.com/lesomnus/grpc-dgram/transport/pion"
 	"github.com/lesomnus/grpc-dgram/internal/echo"
+	"github.com/lesomnus/grpc-dgram/transport/pion"
 	"github.com/pion/webrtc/v4"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -132,19 +132,15 @@ func serveReliable(t *testing.T) *ends {
 	case <-time.After(10 * time.Second):
 		t.Fatal("data channel never announced: ICE failed?")
 	}
+	// drpc.NewConn discovers the transport: mode via TransportInfo, receive
+	// pump via ConnAttacher — no goroutine here, one Close in cleanup.
 	conn := drpc.NewConn(tp)
-	cdone := make(chan struct{})
-	go func() {
-		defer close(cdone)
-		tp.ServeConn(ctx, conn)
-	}()
 
 	t.Cleanup(func() {
 		srv.Stop()
 		conn.Close(nil)
 		cancel()
 		<-sdone
-		<-cdone
 	})
 	return &ends{
 		client:   echo.NewEchoServiceClient(conn),
@@ -180,17 +176,11 @@ func serveUnreliable(t *testing.T) *ends {
 	)
 
 	conn := drpc.NewConn(tp, drpc.WithTiming(timing))
-	cdone := make(chan struct{})
-	go func() {
-		defer close(cdone)
-		tp.ServeConn(ctx, conn)
-	}()
 
 	t.Cleanup(func() {
 		srv.Stop()
 		conn.Close(nil)
 		cancel()
-		<-cdone
 	})
 	return &ends{client: echo.NewEchoServiceClient(conn), tp: tp, gw: gw, srv: srv}
 }
@@ -219,16 +209,10 @@ func TestAnswererServerServesReliableChannel(t *testing.T) {
 	)
 
 	conn := drpc.NewConn(tp, drpc.WithTiming(timing))
-	cdone := make(chan struct{})
-	go func() {
-		defer close(cdone)
-		tp.ServeConn(ctx, conn)
-	}()
 	t.Cleanup(func() {
 		srv.Stop()
 		conn.Close(nil)
 		cancel()
-		<-cdone
 	})
 
 	res, err := conn2client(conn).Once(t.Context(), echo.EchoRequest_builder{

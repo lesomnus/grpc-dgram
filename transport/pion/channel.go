@@ -39,7 +39,7 @@ const DefaultMaxBufferedAmount = 1 << 20
 const DefaultSendStallTimeout = 30 * time.Second
 
 // rxBufferSize bounds messages held between pion's read loop and the serve
-// loop. It absorbs traffic arriving before ServeConn/ServePeer starts; once
+// loop. It absorbs traffic arriving before the pump attaches; once
 // full, OnMessage blocks the channel's read loop, which on a reliable channel
 // is exactly SCTP flow control (PROTOCOL.md §4.2).
 const rxBufferSize = 32

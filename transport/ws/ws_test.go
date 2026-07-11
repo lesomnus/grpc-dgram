@@ -25,8 +25,8 @@ import (
 
 	"github.com/gorilla/websocket"
 	drpc "github.com/lesomnus/grpc-dgram"
-	"github.com/lesomnus/grpc-dgram/transport/ws"
 	"github.com/lesomnus/grpc-dgram/internal/echo"
+	"github.com/lesomnus/grpc-dgram/transport/ws"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -82,21 +82,11 @@ func (s *testServer) dial(t *testing.T, opts ...ws.Option) *testClient {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tp := ws.New(c, opts...)
-	conn := drpc.NewConn(tp) // reliable mode is discovered, not passed
-
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// The error is not asserted: tests kill sockets on purpose.
-		tp.ServeConn(ctx, conn)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		c.Close()
-		<-done
-	})
+	// drpc.NewConn discovers the transport: reliable mode via TransportInfo
+	// and the receive pump via ConnAttacher — no goroutine here, and Close
+	// tears the socket down too.
+	conn := drpc.NewConn(ws.New(c, opts...))
+	t.Cleanup(func() { conn.Close(nil) })
 	return &testClient{
 		EchoServiceClient: echo.NewEchoServiceClient(conn),
 		ws:                c,

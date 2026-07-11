@@ -84,6 +84,11 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 		}
 	}
 
+	// Last, with the Conn fully usable: the transport may start delivering
+	// frames from inside AttachConn.
+	if a, ok := tx.(ConnAttacher); ok {
+		a.AttachConn(v)
+	}
 	return v
 }
 
@@ -145,7 +150,10 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 }
 
 // Close fails every live call with UNAVAILABLE. Adapters call it when the
-// transport dies (PROTOCOL.md §4.5). Idempotent.
+// transport dies (PROTOCOL.md §4.5). It also closes a tx that implements
+// io.Closer, so closing the Conn tears the whole endpoint down — transport
+// goroutine and socket included. Idempotent (an io.Closer tx must be too:
+// its death path calls back into Close).
 func (c *Conn) Close(err error) {
 	st := status.Error(codes.Unavailable, "transport closed")
 	if err != nil {
@@ -153,6 +161,9 @@ func (c *Conn) Close(err error) {
 	}
 	c.failAll(st)
 	c.sw.stop()
+	if cl, ok := c.tx.(io.Closer); ok {
+		cl.Close()
+	}
 }
 
 func (c *Conn) lookup(sid uint32) *clientStream {

@@ -32,21 +32,19 @@ pc.Close()
 
 ## Client
 
-A connected socket talks to one server.
+A connected socket talks to one server. `drpc.NewConn` attaches the
+transport (`drpc.ConnAttacher`): the receive pump starts by itself — no
+goroutine to manage — and the transport owns the socket from then on.
 
 ```go
 c, err := net.Dial("udp", "10.0.0.7:7777")
 if err != nil { ... }
 
-tp := udp.New(c)
-conn := drpc.NewConn(tp) // unreliable mode auto-detected via TransportInfo
-go tp.Serve(ctx, conn)
-
+conn := drpc.NewConn(udp.New(c)) // unreliable mode auto-detected via TransportInfo
 client := pb.NewSensorServiceClient(conn)
 
-// shutdown:
+// shutdown — one call closes the conn, the transport, and the socket:
 conn.Close(nil)
-c.Close()
 ```
 
 ## Options
@@ -69,7 +67,8 @@ c.Close()
   terminate within their deadlines if the peer never comes back.
 - **No transport-death signal.** UDP is connectionless, so there is nothing
   to hook teardown on: vanished peers are handled by the core's timers
-  (`T_call`, `T_live`), and shutting down is your move — close the socket,
-  then `Conn.Close` / `Server.Stop`.
+  (`T_call`, `T_live`), and shutting down is your move — on the client one
+  `conn.Close(nil)` does it all; on the server, close the socket, then
+  `Server.Stop`.
 - **The wire is plaintext and spoofable.** Deploy over an encrypted channel
   (DTLS, WireGuard, ...) or on a trusted network — see `PROTOCOL.md` §15.

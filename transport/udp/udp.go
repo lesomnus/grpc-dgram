@@ -6,8 +6,10 @@
 //
 // UDP is connectionless: there is no transport-death signal to hook the §4.5
 // teardown duty on. Vanished peers are handled by the core's own liveness
-// machinery; tearing the endpoint down is the application's move (close the
-// socket, then Conn.Close / Server.Stop). Consequently an ICMP unreachable —
+// machinery; tearing the endpoint down is the application's move — on the
+// client one conn.Close(nil) suffices (it closes the Transport and the
+// socket); on the server, close the socket, then Server.Stop.
+// Consequently an ICMP unreachable —
 // surfaced by the OS as ECONNREFUSED on a connected socket's reads and
 // writes — is treated as datagram loss, not as an error: a momentarily
 // absent peer (a restarting server) is exactly what the protocol rides out.
@@ -22,6 +24,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -109,16 +113,49 @@ func serve(ctx context.Context, h drpc.FrameHandler, read func([]byte) (int, con
 
 // Transport is the client-side endpoint: a connected datagram socket talking
 // to one server. It is the tx handler for drpc.NewConn — implementing
-// drpc.TransportInfo directly so mode discovery is not masked by a wrapper.
+// drpc.TransportInfo and drpc.ConnAttacher directly so neither is masked by
+// a wrapper. drpc.NewConn attaches it and the receive pump starts by itself:
+// no user goroutine, and conn.Close (or Close here) tears everything down,
+// socket included.
 type Transport struct {
 	c   net.Conn
 	max int
+
+	attached atomic.Bool
+	closer   sync.Once
 }
 
-// New wraps a connected datagram socket (e.g. net.Dial("udp", addr)).
+// New wraps a connected datagram socket (e.g. net.Dial("udp", addr)). The
+// Transport owns the socket from here on: Close closes it, and closing the
+// attached Conn does too.
 func New(c net.Conn, opts ...Option) *Transport {
 	o := buildOptions(opts)
 	return &Transport{c: c, max: o.maxMessageSize}
+}
+
+// AttachConn is called by drpc.NewConn: it starts the receive pump, which
+// runs until the socket closes and performs the §4.5 teardown — conn.Close
+// with the cause — on its way out. The single peer needs no peer key
+// (PROTOCOL.md §6.4).
+func (t *Transport) AttachConn(conn *drpc.Conn) {
+	if !t.attached.CompareAndSwap(false, true) {
+		panic("udp: transport already attached to a Conn")
+	}
+	go func() {
+		err := serve(context.Background(), conn, func(buf []byte) (int, context.Context, error) {
+			n, err := t.c.Read(buf)
+			return n, context.Background(), err
+		})
+		conn.Close(err)
+		t.Close()
+	}()
+}
+
+// Close closes the socket, which stops the receive pump and, through its
+// exit path, fails any live calls. Idempotent.
+func (t *Transport) Close() error {
+	t.closer.Do(func() { t.c.Close() })
+	return nil
 }
 
 // Reliable reports false: UDP loses, duplicates, and reorders.
@@ -144,18 +181,6 @@ func (t *Transport) Send(_ context.Context, e *drpc.Envelop) error {
 		return err
 	}
 	return nil
-}
-
-// Serve delivers received frames to h — normally the *drpc.Conn — until ctx
-// is done or the socket is closed. The single peer needs no peer key
-// (PROTOCOL.md §6.4).
-func (t *Transport) Serve(ctx context.Context, h drpc.FrameHandler) error {
-	stop := context.AfterFunc(ctx, func() { t.c.SetReadDeadline(unblockNow) })
-	defer stop()
-	return serve(ctx, h, func(buf []byte) (int, context.Context, error) {
-		n, err := t.c.Read(buf)
-		return n, ctx, err
-	})
 }
 
 // Gateway is the server-side endpoint: one unconnected UDP socket serving

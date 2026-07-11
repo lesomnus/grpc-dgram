@@ -76,11 +76,12 @@ srv := drpc.NewServer(gw)
 pb.RegisterSensorServiceServer(srv, &myHandler{})
 go gw.Serve(ctx, srv)
 
-// Client: a drpc.Conn is a grpc.ClientConnInterface.
+// Client: a drpc.Conn is a grpc.ClientConnInterface. The transport attaches
+// itself (drpc.ConnAttacher) — no goroutine to manage, and one Close tears
+// down the conn, the transport, and the socket.
 c, _ := net.Dial("udp", serverAddr)
-tp := udp.New(c)
-conn := drpc.NewConn(tp)
-go tp.Serve(ctx, conn)
+conn := drpc.NewConn(udp.New(c))
+defer conn.Close(nil)
 client := pb.NewSensorServiceClient(conn)
 
 stream, _ := client.Readings(ctx, &pb.Subscribe{...})
@@ -96,18 +97,26 @@ Three adapters ship. `transport/udp` is part of the core module (stdlib only);
 `transport/ws` (gorilla/websocket) and `transport/pion` (pion/webrtc) live in
 their own Go modules so importing the core never pulls their dependencies.
 
-| | transport | mode | wiring |
-|---|---|---|---|
-| [`transport/udp`](./transport/udp) | UDP socket | unreliable | `udp.New(conn)` / `udp.NewGateway(pc)` + `Serve` |
-| [`transport/ws`](./transport/ws) | WebSocket | reliable | `ws.New(wsc)` + `ServeConn` / `ws.NewGateway()` + `ServePeer` |
-| [`transport/pion`](./transport/pion) | WebRTC DataChannel | **derived from the channel config** | `pion.New(dc)` + `ServeConn` / `pion.NewGateway()` + `Bind`+`ServePeer` |
+| | transport | mode | client | server |
+|---|---|---|---|---|
+| [`transport/udp`](./transport/udp) | UDP socket | unreliable | `udp.New(conn)` | `udp.NewGateway(pc)` + `Serve` |
+| [`transport/ws`](./transport/ws) | WebSocket | reliable | `ws.New(wsc)` | `ws.NewGateway()` + `ServePeer` |
+| [`transport/pion`](./transport/pion) | WebRTC DataChannel | **derived from the channel config** | `pion.New(dc)` | `pion.NewGateway()` + `Bind`+`ServePeer` |
+
+Clients are gRPC-shaped: `drpc.NewConn(tp)` attaches the transport and its
+receive machinery starts by itself; `conn.Close(nil)` (or the transport's
+`Close`) tears everything down. Servers are gRPC-shaped too, in the other
+direction: registration must precede the first received frame, so the
+server transport starts explicitly after `RegisterService` — the
+`Serve`/`ServePeer` calls above, the same shape as `grpc.Server.Serve(lis)`.
 
 To wire a custom transport instead: the wire unit is one marshaled `Envelop`
 (1..n `Frame`s) per transport message; implement `FrameHandler` (send) +
-`TransportInfo`, feed received frames to `Conn.Handle`/`Server.Handle`, and
+`TransportInfo` (+ `ConnAttacher` and `io.Closer` for the self-managing
+client shape), feed received frames to `Conn.Handle`/`Server.Handle`, and
 honor the teardown duty on connection-oriented channels. See
-[`PROTOCOL.md`](./PROTOCOL.md) §3–§4 for the contract and any shipped adapter
-as a reference.
+[`PROTOCOL.md`](./PROTOCOL.md) §3–§4 for the contract and any shipped
+transport as a reference.
 
 ### Reliable transports
 

@@ -26,12 +26,16 @@ import "github.com/lesomnus/grpc-dgram/transport/pion"
 dc, err := pc.CreateDataChannel("rpc", nil) // nil config = reliable
 if err != nil { ... }
 
-tp := pion.New(dc)
-conn := drpc.NewConn(tp) // mode auto-detected via TransportInfo
-go tp.ServeConn(ctx, conn) // drain pump; calls conn.Close on channel death
-
+conn := drpc.NewConn(pion.New(dc)) // mode auto-detected via TransportInfo
 client := pb.NewEchoServiceClient(conn)
+
+// shutdown — one call closes the conn, the transport, and the channel:
+conn.Close(nil)
 ```
+
+`drpc.NewConn` attaches the transport (`drpc.ConnAttacher`): the drain pump
+starts by itself — no goroutine to manage — and the transport owns the
+DataChannel from then on.
 
 If your client side *receives* the channel instead of creating it, call
 `pion.New` synchronously inside `OnDataChannel`, for the same reason `Bind`
@@ -109,9 +113,10 @@ before any channel exists — so the gateway latches it at whichever of
   fragmented partially-reliable message is lost whenever any fragment is lost.
 - A message over the size limit fails the owning call with
   `ResourceExhausted`; the channel stays up.
-- Call `ServeConn` promptly after `New` (and serve every bound channel):
-  inbound messages buffer from construction, and once the bound (32 messages)
-  fills, pion's read loop for that channel blocks until you drain it.
+- Attach promptly after `New` — i.e. call `drpc.NewConn` right away (and
+  `ServePeer` every bound channel): inbound messages buffer from
+  construction, and once the bound (32 messages) fills, pion's read loop for
+  that channel blocks until the pump drains it.
 - DataChannels are DTLS-encrypted by WebRTC itself — no extra transport
   security needed, but there is still no *authentication* of frames beyond
   the channel (see `PROTOCOL.md` §15).

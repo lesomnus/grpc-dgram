@@ -34,15 +34,19 @@ http.HandleFunc("/rpc", func(w http.ResponseWriter, r *http.Request) {
 
 ## Client
 
+`drpc.NewConn` attaches the transport (`drpc.ConnAttacher`): the read loop
+and keepalive start by themselves — no goroutine to manage — and the
+transport owns the WebSocket from then on.
+
 ```go
 c, _, err := websocket.DefaultDialer.DialContext(ctx, "wss://host/rpc", nil)
 if err != nil { ... }
 
-tp := ws.New(c)
-conn := drpc.NewConn(tp) // reliable mode auto-detected via TransportInfo
-go tp.ServeConn(ctx, conn) // read pump + keepalive; calls conn.Close on death
-
+conn := drpc.NewConn(ws.New(c)) // reliable mode auto-detected via TransportInfo
 client := pb.NewEchoServiceClient(conn)
+
+// shutdown — one call closes the conn, the transport, and the socket:
+conn.Close(nil)
 ```
 
 ## Options
@@ -56,9 +60,8 @@ client := pb.NewEchoServiceClient(conn)
 
 - **Teardown is the whole point.** With protocol timers off, the *only*
   mechanism that unblocks live calls is the adapter detecting transport death
-  and calling `Conn.Close` / `DisconnectPeer` — `ServeConn`/`ServePeer` do
-  this on every exit path. Always run them; a `Transport` you never serve
-  can send but will neither receive nor fail anything.
+  and calling `Conn.Close` / `DisconnectPeer` — the attached client pump and
+  `ServePeer` do this on every exit path.
 - **Keepalive doubles as the write bound.** Data writes carry a deadline
   equal to the keepalive timeout: a peer that stops draining would otherwise
   block a send forever with no timer to save it. A stalled write is treated
