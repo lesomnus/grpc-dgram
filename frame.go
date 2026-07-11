@@ -3,6 +3,7 @@ package drpc
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
@@ -15,6 +16,17 @@ import (
 // fragments; it maps this error to the gRPC status ResourceExhausted on the
 // owning call. See PROTOCOL.md §4.4.
 var ErrMessageTooLarge = errors.New("drpc: message too large for the transport")
+
+// nonzeroEpoch draws an incarnation nonce (PROTOCOL.md §6.1). Zero is
+// excluded: it marks an absent peer_epoch echo, so an incarnation named 0
+// could be addressed by frames that echo nothing.
+func nonzeroEpoch() uint32 {
+	for {
+		if v := rand.Uint32(); v != 0 {
+			return v
+		}
+	}
+}
 
 // FrameHandler is the core-facing seam: Conn and Server emit and consume
 // individual frames. See PROTOCOL.md §3.
@@ -117,11 +129,14 @@ func (x *Frame) setError(err error) {
 
 // resetFor builds a RESET answering f. The epoch echoes the offending frame —
 // the one exception to the sender-epoch rule — so the receiver can match it
-// against its own epoch. See PROTOCOL.md §9.3.
+// against its own epoch. The peer_epoch is echoed too: on a client→server
+// RESET it names the client incarnation of the offending call, so the server
+// resets exactly that call (PROTOCOL.md §9.3).
 func resetFor(f *Frame) *Frame {
 	r := &Frame{}
 	r.SetFlags(FlagReset)
 	r.SetEpoch(f.GetEpoch())
 	r.SetSid(f.GetSid())
+	r.SetPeerEpoch(f.GetPeerEpoch())
 	return r
 }

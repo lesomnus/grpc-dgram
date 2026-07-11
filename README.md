@@ -122,8 +122,11 @@ transport as a reference.
 
 Over a reliable, ordered transport, timers and retransmission are off,
 delivery is the exact sequence, and any gap or duplicate is surfaced as
-`INTERNAL` (a broken "reliable" transport). This is the path to **plain
-gRPC-over-WebSocket / reliable-datachannel** semantics, and it is
+`INTERNAL` (a broken "reliable" transport). A consumer that falls behind
+stalls the wire instead of losing messages — the receive path blocks on a
+full buffer and the stall propagates into the transport's own flow control
+(TCP/SCTP backpressure), exactly like gRPC-over-TCP. This is the path to
+**plain gRPC-over-WebSocket / reliable-datachannel** semantics, and it is
 auto-detected with zero options: `transport/gorilla` always advertises
 reliable, and `transport/pion` derives it from each data channel's
 configuration (ordered, no retransmit/lifetime cap). On the server the mode
@@ -205,10 +208,10 @@ bugs — a lost reading is superseded by the next.
   every message?* Use `WithReliable(true)` over a reliable adapter, or make the
   stream idempotent/superseding.
 - **At-most-once is per server incarnation.** A server restart (new epoch)
-  mid-call, or a tombstone evicted under cap pressure before the client stops
-  retrying, can re-execute the handler once. Make handlers idempotent if a
-  cross-restart duplicate is unacceptable; within one incarnation execution is
-  strictly at-most-once.
+  mid-call can re-execute the handler once — dedup state died with the old
+  instance. Make handlers idempotent if a cross-restart duplicate is
+  unacceptable; within one incarnation execution is strictly at-most-once,
+  and dedup survives even tombstone cap pressure (`PROTOCOL.md` §9.2).
 - **No authentication — deploy encrypted.** The wire has no auth by design
   (`PROTOCOL.md` §15); `epoch` is a correctness device, not a security token.
   On **raw UDP**, anyone who can sniff a live `(epoch, sid, seq)` and inject

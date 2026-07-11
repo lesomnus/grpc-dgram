@@ -134,7 +134,10 @@ func (s *sock) write(data []byte, timeout time.Duration) error {
 // read, so time spent blocked in Handle is not counted against the peer —
 // but while blocked, this side answers no pings either, and a peer wedged
 // beyond the peer's own keepalive timeout reads as dead. That is the bound
-// on backpressure patience.
+// on backpressure patience: the peer closes, this side's keepalive ping then
+// fails, and that failure — the one death signal that needs no pending
+// read — cancels the delivery ctx, unblocking Handle so the §4.5 teardown
+// can run.
 //
 // Frame-level Handle errors mean malformed input and never tear down the
 // channel (§4.2). Non-binary messages and unparseable envelops are ignored.
@@ -147,10 +150,11 @@ func serve(ctx context.Context, c *websocket.Conn, o options, rxCtx context.Cont
 	// extension by the read loop or a pong.
 	var mu sync.Mutex
 	stopped := false
+	var dead error
 	extend := func() bool {
 		mu.Lock()
 		defer mu.Unlock()
-		if stopped {
+		if stopped || dead != nil {
 			return false
 		}
 		c.SetReadDeadline(time.Now().Add(o.keepaliveTimeout))
@@ -164,13 +168,39 @@ func serve(ctx context.Context, c *websocket.Conn, o options, rxCtx context.Cont
 	})
 	defer stop()
 
+	// Delivery ctx: in reliable mode Handle may block in backpressure
+	// (PROTOCOL.md §4.2), and while it does, no read is pending — so the read
+	// deadline alone cannot deliver the §4.5 teardown. Death detected
+	// out-of-band (a failed keepalive ping) cancels this ctx, which is the
+	// documented bound on the blocked delivery.
+	dctx, dcancel := context.WithCancel(rxCtx)
+	defer dcancel()
+	fail := func(err error) {
+		mu.Lock()
+		if dead == nil {
+			dead = err
+		}
+		c.SetReadDeadline(unblockNow) // fail a pending read too
+		mu.Unlock()
+		dcancel()
+	}
+	deadErr := func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		return dead
+	}
+
 	c.SetPongHandler(func(string) error {
 		extend()
 		return nil
 	})
 
-	// Pings keep the deadline of an idle connection moving. A failed ping
-	// needs no handling: the read deadline is the arbiter of death.
+	// Pings keep the deadline of an idle connection moving. A ping the socket
+	// cannot even carry is transport death seen from this side — the one
+	// signal that still fires while the read loop is blocked in delivery.
+	// (A silent partition with room left in the send buffer is detected only
+	// once the peer's own keepalive gives up or the buffer fills — that, plus
+	// the peer's patience, bounds backpressure; see the serve comment.)
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -181,17 +211,25 @@ func serve(ctx context.Context, c *websocket.Conn, o options, rxCtx context.Cont
 			case <-done:
 				return
 			case <-t.C:
-				c.WriteControl(websocket.PingMessage, nil, time.Now().Add(o.keepaliveInterval))
+				if err := c.WriteControl(websocket.PingMessage, nil, time.Now().Add(o.keepaliveInterval)); err != nil {
+					if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+						fail(fmt.Errorf("gorilla: keepalive ping: %w", err))
+					}
+					return
+				}
 			}
 		}
 	}()
 
 	for {
 		if !extend() {
-			return nil
+			return deadErr() // nil on ctx stop / local close
 		}
 		typ, data, err := c.ReadMessage()
 		if err != nil {
+			if derr := deadErr(); derr != nil {
+				return derr
+			}
 			switch {
 			case ctx.Err() != nil,
 				errors.Is(err, net.ErrClosed),
@@ -210,7 +248,7 @@ func serve(ctx context.Context, c *websocket.Conn, o options, rxCtx context.Cont
 		if err := proto.Unmarshal(data, e); err != nil {
 			continue
 		}
-		drpc.Unpack(rxCtx, e, h)
+		drpc.Unpack(dctx, e, h)
 	}
 }
 

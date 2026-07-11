@@ -247,15 +247,32 @@ func (ch *channel) send(ctx context.Context, e *drpc.Envelop) error {
 // either way, so the caller owes the §4.5 teardown on every return.
 func (ch *channel) serve(ctx context.Context, h drpc.FrameHandler) error {
 	defer ch.stop()
+	// Delivery ctx, cancelled on channel death: in reliable mode Handle may
+	// block in backpressure (PROTOCOL.md §4.2), and while it does this loop
+	// cannot observe ch.dead — death detected out-of-band (OnError/OnClose,
+	// a send stall, Transport.Close) must cancel the ctx the blocked
+	// delivery waits on, or the §4.5 teardown never runs. The death flush
+	// below still delivers every frame that fits a stream buffer (the core
+	// prefers delivery over a dead ctx); only deliveries that would have to
+	// block fail their call instead.
+	dctx, dcancel := context.WithCancel(ctx)
+	defer dcancel()
+	go func() {
+		select {
+		case <-ch.dead:
+			dcancel()
+		case <-dctx.Done():
+		}
+	}()
 	for {
 		select {
 		case data := <-ch.rx:
-			deliver(ctx, data, h)
+			deliver(dctx, data, h)
 		case <-ch.dead:
 			for {
 				select {
 				case data := <-ch.rx:
-					deliver(ctx, data, h)
+					deliver(dctx, data, h)
 				default:
 					return ch.deathErr()
 				}

@@ -3,7 +3,6 @@ package drpc
 import (
 	"context"
 	"fmt"
-	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,6 +47,8 @@ type Server struct {
 	peers         map[epochKey]*peerState // per client incarnation (§9.4)
 	pendingResets map[callKey]*pendingReset
 	resetAt       map[callKey]int64 // immediate-RESET rate limit (§9.3)
+	livePeer      map[any]int       // live calls per transport peer (§15)
+	replyBudget   map[any]*replyBudget
 	drain         bool
 	closed        bool
 	wg            sync.WaitGroup
@@ -74,7 +75,7 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 	}
 
 	v := &Server{
-		epoch: rand.Uint32(),
+		epoch: nonzeroEpoch(),
 		tx:    tx,
 		mode:  resolveMode(tx, opt.reliable, opt.timing),
 		sw:    newSweeper(),
@@ -88,6 +89,8 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 		peers:         map[epochKey]*peerState{},
 		pendingResets: map[callKey]*pendingReset{},
 		resetAt:       map[callKey]int64{},
+		livePeer:      map[any]int{},
+		replyBudget:   map[any]*replyBudget{},
 
 		services: map[string]*serviceDesc{},
 	}
@@ -160,7 +163,7 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 			return nil
 		}
 		peer, _ := PeerFromContext(ctx)
-		s.resetByPeerSid(peer, f.GetSid())
+		s.resetByPeerSid(peer, f.GetSid(), f.GetPeerEpoch())
 		return nil
 	}
 
@@ -189,7 +192,11 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 		}
 		if ps != nil {
 			if tb := ps.tombs[key.sid]; tb != nil {
-				replay := ps.replayTombLocked(tb, now, s.mode.timing.Retransmit)
+				rti := s.mode.timing.Retransmit
+				var replay *Frame
+				if tb.replayDue(now, rti) && s.allowReplyLocked(key.peer, now.UnixNano()) {
+					replay = ps.replayTombLocked(tb, now, rti)
+				}
 				stored := tb.term != nil
 				s.mu.Unlock()
 				if replay != nil {
@@ -208,7 +215,7 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 	s.mu.Lock()
 	if st := s.calls[key]; st != nil {
 		s.mu.Unlock()
-		st.handleRx(f)
+		st.handleRx(ctx, f)
 		return nil
 	}
 
@@ -217,11 +224,24 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 	if ps := s.peers[ek]; ps != nil {
 		if tb := ps.tombs[key.sid]; tb != nil {
 			ps.lastRx.Store(now.UnixNano())
-			replay := ps.replayTombLocked(tb, now, s.mode.timing.Retransmit)
+			rti := s.mode.timing.Retransmit
+			var replay *Frame
+			if tb.replayDue(now, rti) && s.allowReplyLocked(key.peer, now.UnixNano()) {
+				replay = ps.replayTombLocked(tb, now, rti)
+			}
 			s.mu.Unlock()
 			if replay != nil {
 				return s.tx.Handle(ctx, replay)
 			}
+			return nil
+		}
+		if key.sid <= ps.tombFloor {
+			// Evicted under the entry cap: the floor keeps key-only semantics
+			// (validated, deduped, replay lost) at zero memory (PROTOCOL.md
+			// §9.2, §14) — this also swallows duplicate OPENs, so eviction
+			// opens no re-execution window.
+			ps.lastRx.Store(now.UnixNano())
+			s.mu.Unlock()
 			return nil
 		}
 	}
@@ -250,8 +270,9 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 	}
 	if _, ok := s.pendingResets[key]; !ok && len(s.pendingResets) < s.limits.MaxPendingResets {
 		s.pendingResets[key] = &pendingReset{
-			due:  now.Add(s.mode.timing.Hold),
-			echo: f.GetEpoch(),
+			due:      now.Add(s.mode.timing.Hold),
+			echo:     f.GetEpoch(),
+			peerEcho: f.GetPeerEpoch(),
 		}
 		s.sawUnreliable.Store(true)
 	}
@@ -260,8 +281,40 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 	return nil
 }
 
+// replyBudget is one transport peer's aggregate control-reply window: on top
+// of the per-object 1/RTI limits, a peer draws at most MaxRepliesPerRTI
+// volunteered replies (tombstone/ack replays, RESETs) per RTI (PROTOCOL.md
+// §15).
+type replyBudget struct {
+	windowStart int64
+	n           int
+}
+
+// allowReplyLocked spends one unit of peer's aggregate reply budget; Server.mu
+// held. Denial means silence — anti-amplification prefers dropping a reply
+// over answering a flood.
+func (s *Server) allowReplyLocked(peer any, now int64) bool {
+	b := s.replyBudget[peer]
+	if b == nil {
+		if len(s.replyBudget) >= s.limits.MaxPendingResets {
+			// Bounded: deny rather than grow (§15).
+			return false
+		}
+		b = &replyBudget{windowStart: now}
+		s.replyBudget[peer] = b
+	}
+	if now-b.windowStart >= int64(s.mode.timing.Retransmit) {
+		b.windowStart, b.n = now, 0
+	}
+	if b.n >= s.limits.MaxRepliesPerRTI {
+		return false
+	}
+	b.n++
+	return true
+}
+
 // sendReset answers a frame with an immediate RESET, rate-limited per call
-// key on unreliable channels (PROTOCOL.md §9.3, §15).
+// key and per peer on unreliable channels (PROTOCOL.md §9.3, §15).
 func (s *Server) sendReset(ctx context.Context, key callKey, f *Frame) error {
 	if !s.rxReliable(ctx) {
 		n := nowNano()
@@ -276,6 +329,10 @@ func (s *Server) sendReset(ctx context.Context, key callKey, f *Frame) error {
 			s.mu.Unlock()
 			return nil
 		}
+		if !s.allowReplyLocked(key.peer, n) {
+			s.mu.Unlock()
+			return nil
+		}
 		s.resetAt[key] = n
 		s.sawUnreliable.Store(true)
 		s.mu.Unlock()
@@ -284,14 +341,15 @@ func (s *Server) sendReset(ctx context.Context, key callKey, f *Frame) error {
 	return s.tx.Handle(ctx, resetFor(f))
 }
 
-// resetByPeerSid cancels every live call from peer with the given sid,
-// regardless of client epoch (a RESET echoes the server epoch, which does not
-// name the client incarnation).
-func (s *Server) resetByPeerSid(peer any, sid uint32) {
+// resetByPeerSid cancels live calls from peer with the given sid. A RESET's
+// peer_epoch names the client incarnation of the offending call (§9.3), so
+// only that incarnation's call dies; 0 (a crafted or foreign RESET) falls
+// back to every epoch with the sid.
+func (s *Server) resetByPeerSid(peer any, sid uint32, peerEpoch uint32) {
 	s.mu.Lock()
 	var targets []*serverStream
 	for k, st := range s.calls {
-		if k.peer == peer && k.sid == sid {
+		if k.peer == peer && k.sid == sid && (peerEpoch == 0 || k.epoch == peerEpoch) {
 			targets = append(targets, st)
 		}
 	}
@@ -307,6 +365,17 @@ func (s *Server) resetByPeerSid(peer any, sid uint32) {
 }
 
 func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
+	// Draining/stopped servers refuse new calls with RESET (PROTOCOL.md
+	// §9.4) — checked before method resolution, whose rejection terminal
+	// would otherwise create fresh peer state on a stopped server. The
+	// registration path re-checks under its lock (the race close).
+	s.mu.Lock()
+	if s.drain || s.closed {
+		s.mu.Unlock()
+		return s.sendReset(ctx, key, f)
+	}
+	s.mu.Unlock()
+
 	// The frame's channel mode governs the whole call (PROTOCOL.md §4.3):
 	// captured here, inherited by the stream and the peer container.
 	rel := s.rxReliable(ctx)
@@ -330,17 +399,17 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	sctx = newIncomingContext(sctx, f)
 
 	// The client-asserted budget bounds the handler ctx, clamped by the
-	// server cap when configured (PROTOCOL.md §10.2).
+	// server cap when configured (PROTOCOL.md §10.2). A non-positive budget
+	// (expired before the OPEN escaped) yields an already-expired ctx, not an
+	// unbounded one: the handler unwinds into T{DEADLINE_EXCEEDED} at once.
 	var cancelTimeout context.CancelFunc
 	if f.HasTimeout() {
 		d := f.GetTimeout().AsDuration()
 		if s.maxHandlerTimeout > 0 && d > s.maxHandlerTimeout {
 			d = s.maxHandlerTimeout
 		}
-		if d > 0 {
-			sctx, cancelTimeout = context.WithTimeoutCause(sctx, d,
-				status.Error(codes.DeadlineExceeded, "call timeout"))
-		}
+		sctx, cancelTimeout = context.WithTimeoutCause(sctx, d,
+			status.Error(codes.DeadlineExceeded, "call timeout"))
 	}
 
 	rxCfg := s.rx
@@ -379,7 +448,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	}
 	now := time.Now()
 	ps := s.ensurePeerLocked(epochKey{peer: key.peer, epoch: key.epoch}, now, rel)
-	if _, tombed := ps.tombs[key.sid]; tombed ||
+	if _, tombed := ps.tombs[key.sid]; tombed || key.sid <= ps.tombFloor ||
 		key.sid <= ps.hwmAgedLocked(now, s.mode.timing.Tombstone, ps.reliable) {
 		// Re-check under the registration lock: a concurrent duplicate OPEN
 		// may have run the whole call to completion since Handle's checks —
@@ -389,14 +458,16 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		release()
 		return nil
 	}
-	if ps.liveCalls >= ps.maxLive {
-		// Per-peer live-call cap (PROTOCOL.md §15): refuse rather than let a
-		// single peer's valid-method OPEN flood spawn unbounded handlers.
+	if s.livePeer[key.peer] >= s.limits.MaxLiveCalls {
+		// Live-call cap per transport peer (PROTOCOL.md §15): refuse rather
+		// than let one peer's OPEN flood spawn unbounded handlers. Counted
+		// across client epochs — an epoch-spoofing peer gets no more.
 		s.mu.Unlock()
 		release()
 		return s.rejectOpen(ctx, f, codes.ResourceExhausted, "too many concurrent calls")
 	}
 	s.calls[key] = st
+	s.livePeer[key.peer]++
 	if ps.hwm < key.sid {
 		ps.hwm = key.sid
 	}
@@ -450,6 +521,7 @@ func (s *Server) rejectOpen(ctx context.Context, f *Frame, code codes.Code, msg 
 	t.SetFlags(FlagClose)
 	t.SetCode(uint32(code))
 	t.SetDesc(fmt.Sprintf(msg, args...))
+	t.SetPeerEpoch(f.GetEpoch()) // name the client incarnation (§6.1)
 
 	if !s.rxReliable(ctx) {
 		peer, _ := PeerFromContext(ctx)
@@ -547,6 +619,11 @@ func (s *Server) finish(st *serverStream, term *Frame) {
 	now := time.Now()
 	s.mu.Lock()
 	delete(s.calls, st.key)
+	if n := s.livePeer[st.key.peer] - 1; n > 0 {
+		s.livePeer[st.key.peer] = n
+	} else {
+		delete(s.livePeer, st.key.peer)
+	}
 	if ps := st.ps; ps != nil {
 		ps.liveCalls--
 		if !st.reliable {
@@ -636,6 +713,7 @@ func (s *Server) DisconnectPeer(peer any, err error) {
 			delete(s.resetAt, k)
 		}
 	}
+	delete(s.replyBudget, peer)
 	s.mu.Unlock()
 
 	cause := status.Error(codes.Unavailable, "transport closed")

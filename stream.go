@@ -55,9 +55,35 @@ func ctxErr(ctx context.Context) error {
 	return toStatusErr(cause)
 }
 
+// enqueueRxReliable delivers f into the per-stream buffer, blocking until
+// there is room: dropping would violate the exact-sequence contract
+// (PROTOCOL.md §14), so a slow consumer stalls Handle instead and the stall
+// propagates into the transport's own flow control (§4.2). Bounded by the rx
+// ctx (adapter teardown) and by the stream ending — a frame for a finished
+// call is moot. It returns false only for the ctx bound: the frame is lost
+// while the call is still live, which on a reliable channel must fail loud,
+// not surface as a silent gap (the strict window already advanced).
+func enqueueRxReliable(ctx context.Context, rx chan *Frame, f *Frame, done <-chan struct{}) bool {
+	select {
+	case rx <- f:
+		// A ready buffer always wins: a dead rx ctx must not race delivery
+		// (an adapter flushing its queue after transport death still delivers
+		// every frame that fits).
+		return true
+	default:
+	}
+	select {
+	case rx <- f:
+	case <-done:
+	case <-ctx.Done():
+		return false
+	}
+	return true
+}
+
 // enqueueRx delivers f into the per-stream buffer under the configured drop
-// policy (PROTOCOL.md §4.2). DropNewest discards the arrival on a full
-// buffer; DropOldest evicts the oldest to admit it.
+// policy (unreliable mode, PROTOCOL.md §4.2). DropNewest discards the arrival
+// on a full buffer; DropOldest evicts the oldest to admit it.
 func enqueueRx(rx chan *Frame, f *Frame, policy DropPolicy, dropped *atomic.Uint32) {
 	select {
 	case rx <- f:
@@ -180,8 +206,9 @@ func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, cl
 }
 
 // handleRx processes one server frame for this stream. Called by Conn.Handle;
-// serialized per stream via rxMu for the window state.
-func (s *clientStream) handleRx(f *Frame) {
+// serialized per stream via rxMu for the window state. In reliable mode it
+// may block on a full buffer, bounded by the rx ctx (PROTOCOL.md §4.2).
+func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 	select {
 	case <-s.done:
 		return
@@ -245,7 +272,17 @@ func (s *clientStream) handleRx(f *Frame) {
 			return
 		}
 		s.latchHeader(f)
-		enqueueRx(s.rx, f, s.rxCfg.policy, &s.rxDropped)
+		if s.conn.mode.reliable {
+			if !enqueueRxReliable(ctx, s.rx, f, s.done) {
+				// The rx ctx died mid-delivery: the transport is tearing down
+				// (§4.5). The frame is gone and the window advanced — end the
+				// call rather than leave a silent gap (§14).
+				s.rxDropped.Add(1)
+				s.finishLocal(status.Error(codes.Unavailable, "transport closed during delivery"))
+			}
+		} else {
+			enqueueRx(s.rx, f, s.rxCfg.policy, &s.rxDropped)
+		}
 	default:
 		s.rxDropped.Add(1)
 	}
@@ -523,6 +560,12 @@ func (s *clientStream) abortFromCtx() {
 
 func (s *clientStream) sendAbort(code codes.Code) {
 	s.txMu.Lock()
+	if s.abortFrame != nil {
+		// A ctx AfterFunc and abandon() can both pass the done check; one
+		// abort obligation is enough (§10.3) — the first one stands.
+		s.txMu.Unlock()
+		return
+	}
 	s.txClosed = true
 	f := s.nextFrame()
 	f.SetFlags(FlagClose)
@@ -714,12 +757,20 @@ func newServerStream(ctx context.Context, srv *Server, key callKey, desc *servic
 }
 
 // handleRx processes one client frame for this live call. Called by
-// Server.Handle; serialized per stream via rxMu for the window state.
-func (s *serverStream) handleRx(f *Frame) {
+// Server.Handle; serialized per stream via rxMu for the window state. In
+// reliable mode it may block on a full buffer, bounded by the rx ctx
+// (PROTOCOL.md §4.2).
+func (s *serverStream) handleRx(ctx context.Context, f *Frame) {
 	if f.isOpen() {
 		if f.GetSeq() != 1 {
 			// Off-shape: an OPEN's seq MUST be 1 (PROTOCOL.md §8).
 			s.rxDropped.Add(1)
+			return
+		}
+		if s.reliable {
+			// No retransmission exists in reliable mode, so a duplicate OPEN
+			// means the transport duplicated a frame: fail loud (§10.6).
+			s.cancel(status.Error(codes.Internal, "reliable transport lost or reordered a frame"))
 			return
 		}
 		// Duplicate OPEN (its seq 1 is always a dedup). For streaming calls
@@ -763,7 +814,16 @@ func (s *serverStream) handleRx(f *Frame) {
 			s.rxDropped.Add(1)
 			return
 		}
-		enqueueRx(s.rx, f, s.rxCfg.policy, &s.rxDropped)
+		if s.reliable {
+			if !enqueueRxReliable(ctx, s.rx, f, s.ctx.Done()) {
+				// See the client twin: teardown ate the frame — fail loud
+				// rather than leave a silent gap on a reliable channel (§14).
+				s.rxDropped.Add(1)
+				s.cancel(status.Error(codes.Unavailable, "transport closed during delivery"))
+			}
+		} else {
+			enqueueRx(s.rx, f, s.rxCfg.policy, &s.rxDropped)
+		}
 	default:
 		s.rxDropped.Add(1)
 	}
@@ -804,12 +864,19 @@ func (s *serverStream) sendH() {
 }
 
 // replayH answers a duplicate OPEN with the creation ack, rate-limited to
-// one per RTI per call (PROTOCOL.md §8 ack recovery): the stored H replayed
-// byte-identically, else a freshly-seq'd H with the current header state.
+// one per RTI per call plus the peer's aggregate reply budget (PROTOCOL.md
+// §8 ack recovery, §15): the stored H replayed byte-identically, else a
+// freshly-seq'd H with the current header state.
 func (s *serverStream) replayH() {
 	n := nowNano()
 	last := s.hReplayAt.Load()
 	if n-last < int64(s.server.mode.timing.Retransmit) || !s.hReplayAt.CompareAndSwap(last, n) {
+		return
+	}
+	s.server.mu.Lock()
+	ok := s.server.allowReplyLocked(s.key.peer, n)
+	s.server.mu.Unlock()
+	if !ok {
 		return
 	}
 	s.txMu.Lock()
@@ -835,6 +902,7 @@ func (s *serverStream) probeDue(now time.Time, probe time.Duration, epoch uint32
 	f.SetEpoch(epoch)
 	f.SetSid(s.key.sid)
 	f.SetFlags(FlagPing)
+	f.SetPeerEpoch(s.key.epoch)
 	return f
 }
 
@@ -843,6 +911,9 @@ func (s *serverStream) nextFrameLocked() *Frame {
 	f.SetEpoch(s.server.epoch)
 	f.SetSid(s.key.sid)
 	f.SetSeq(s.txSeq.next())
+	// Name the client incarnation (PROTOCOL.md §6.1): a restarted client
+	// re-allocates sids, so the sid alone must never route this frame there.
+	f.SetPeerEpoch(s.key.epoch)
 	return f
 }
 
@@ -979,8 +1050,8 @@ func (s *serverStream) terminalFrame(err error) *Frame {
 	return f
 }
 
-// serviceDesc describes one registered method (PROTOCOL.md §13: indices are
-// 1-based in registration order; 0 means unset).
+// serviceDesc describes one registered method, addressed by its full name
+// always (PROTOCOL.md §13).
 type serviceDesc struct {
 	fullname string
 

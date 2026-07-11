@@ -30,6 +30,7 @@ const (
 	defaultMaxDeadPeers   = 4
 	defaultMaxResets      = 1024
 	defaultMaxLiveCalls   = 4096
+	defaultMaxReplies     = 64
 	defaultRxDropNewest   = DropNewest
 	defaultMaxHandlerZero = 0
 )
@@ -44,8 +45,9 @@ func (c rxConfig) withDefaults() rxConfig {
 // Limits bounds the server's per-peer bookkeeping (PROTOCOL.md §15). Zero
 // fields keep their defaults. On a Conn only MaxPendingResets applies.
 type Limits struct {
-	// MaxTombstones caps stored tombstone entries per peer incarnation;
-	// oldest are dropped to key-only past it.
+	// MaxTombstones caps stored tombstone entries per peer incarnation. Past
+	// it the lowest sid is evicted and the container's floor rises: evicted
+	// sids keep key-only semantics (deduped, replay lost) at zero memory.
 	MaxTombstones int
 	// MaxTombstoneBytes caps stored terminal-frame payload bytes per peer;
 	// oldest stored terminals degrade to key-only past it.
@@ -53,12 +55,18 @@ type Limits struct {
 	// MaxDeadPeers caps retained finished peer incarnations per transport
 	// peer; oldest are evicted (never one with live calls).
 	MaxDeadPeers int
-	// MaxPendingResets caps the RESET rate-limit / delayed-RESET maps.
+	// MaxPendingResets caps the RESET rate-limit / delayed-RESET / reply-
+	// budget maps.
 	MaxPendingResets int
-	// MaxLiveCalls caps concurrently live calls per peer incarnation; an
-	// OPEN past it is refused with RESOURCE_EXHAUSTED, bounding the handler
-	// goroutines a single peer can spawn.
+	// MaxLiveCalls caps concurrently live calls per transport peer, counted
+	// across client epochs; an OPEN past it is refused with
+	// RESOURCE_EXHAUSTED, bounding the handler goroutines a single peer can
+	// spawn even when it spoofs fresh epochs.
 	MaxLiveCalls int
+	// MaxRepliesPerRTI caps, per transport peer, the control replies the
+	// server volunteers within one RTI — tombstone/creation-ack replays and
+	// RESETs — on top of the per-object 1/RTI limits (anti-amplification).
+	MaxRepliesPerRTI int
 }
 
 func (l Limits) withDefaults() Limits {
@@ -76,6 +84,9 @@ func (l Limits) withDefaults() Limits {
 	}
 	if l.MaxLiveCalls <= 0 {
 		l.MaxLiveCalls = defaultMaxLiveCalls
+	}
+	if l.MaxRepliesPerRTI <= 0 {
+		l.MaxRepliesPerRTI = defaultMaxReplies
 	}
 	return l
 }

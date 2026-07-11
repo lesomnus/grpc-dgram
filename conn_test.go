@@ -13,7 +13,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// terminalFor builds a server terminal frame answering the request frame.
+// terminalFor builds a server terminal frame answering the request frame,
+// echoing the client incarnation as a conforming server does (PROTOCOL.md
+// §6.1).
 func terminalFor(req *drpc.Frame, epoch uint32, payload []byte) *drpc.Frame {
 	f := &drpc.Frame{}
 	f.SetEpoch(epoch)
@@ -22,6 +24,7 @@ func terminalFor(req *drpc.Frame, epoch uint32, payload []byte) *drpc.Frame {
 	f.SetFlags(drpc.FlagClose)
 	f.SetCode(uint32(codes.OK))
 	f.SetPayload(payload)
+	f.SetPeerEpoch(req.GetEpoch())
 	return f
 }
 

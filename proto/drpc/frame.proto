@@ -62,4 +62,14 @@ message Frame {
 
   Metadata header = 12;
   Metadata trailer = 13;
+
+  // The client incarnation this frame addresses (PROTOCOL.md §6.1).
+  // Server→client call frames (H, data, T, stream probes, keepalive) echo the
+  // client epoch of the call they belong to; the client accepts a frame into
+  // a stream only when this names its own epoch — a sid alone does not,
+  // because a restarted client re-allocates sids from 1. A client→server
+  // RESET echoes the offending frame's peer_epoch so the server can reset
+  // exactly that incarnation's call. Client→server call frames leave it 0
+  // (their field 1 already names the incarnation).
+  fixed32 peer_epoch = 14;
 }

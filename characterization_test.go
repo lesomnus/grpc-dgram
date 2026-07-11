@@ -443,7 +443,8 @@ func TestChar_ClientRejectsForeignEpochFrame(t *testing.T) {
 	x.NoError(t, err)
 	// Server-streaming emits its OPEN|CLOSE on the first SendMsg.
 	x.NoError(t, stream.SendMsg(echo.EchoRequest_builder{}.Build()))
-	<-frames // the client's OPEN
+	open := <-frames          // the client's OPEN
+	cEpoch := open.GetEpoch() // the incarnation every server frame must echo (§6.1)
 
 	sid := uint32(1) // first sid
 
@@ -452,6 +453,7 @@ func TestChar_ClientRejectsForeignEpochFrame(t *testing.T) {
 	good.SetEpoch(7)
 	good.SetSid(sid)
 	good.SetSeq(1)
+	good.SetPeerEpoch(cEpoch)
 	data, _ := proto.Marshal(echo.EchoResponse_builder{Message: "real"}.Build())
 	good.SetPayload(data)
 	x.NoError(t, conn.Handle(t.Context(), good))
@@ -460,12 +462,15 @@ func TestChar_ClientRejectsForeignEpochFrame(t *testing.T) {
 	x.NoError(t, stream.RecvMsg(got))
 	x.Equal(t, "real", got.GetMessage())
 
-	// A spoofer (epoch 99) injects a forward-seq data frame on the live sid.
-	// It is dropped: the next legitimate frame from epoch 7 still delivers.
+	// A spoofer (epoch 99) injects a forward-seq data frame on the live sid,
+	// even spoofing the peer_epoch echo correctly (§6.1 cannot help here).
+	// The stream's server-epoch lock drops it: the next legitimate frame from
+	// epoch 7 still delivers.
 	evil := &drpc.Frame{}
 	evil.SetEpoch(99)
 	evil.SetSid(sid)
 	evil.SetSeq(2)
+	evil.SetPeerEpoch(cEpoch)
 	edata, _ := proto.Marshal(echo.EchoResponse_builder{Message: "spoof"}.Build())
 	evil.SetPayload(edata)
 	x.NoError(t, conn.Handle(t.Context(), evil))
@@ -474,6 +479,7 @@ func TestChar_ClientRejectsForeignEpochFrame(t *testing.T) {
 	good2.SetEpoch(7)
 	good2.SetSid(sid)
 	good2.SetSeq(2)
+	good2.SetPeerEpoch(cEpoch)
 	data2, _ := proto.Marshal(echo.EchoResponse_builder{Message: "real2"}.Build())
 	good2.SetPayload(data2)
 	x.NoError(t, conn.Handle(t.Context(), good2))

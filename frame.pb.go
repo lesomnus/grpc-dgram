@@ -43,6 +43,7 @@ type Frame struct {
 	xxx_hidden_Desc        string                 `protobuf:"bytes,11,opt,name=desc"`
 	xxx_hidden_Header      *Metadata              `protobuf:"bytes,12,opt,name=header"`
 	xxx_hidden_Trailer     *Metadata              `protobuf:"bytes,13,opt,name=trailer"`
+	xxx_hidden_PeerEpoch   uint32                 `protobuf:"fixed32,14,opt,name=peer_epoch,json=peerEpoch"`
 	XXX_raceDetectHookData protoimpl.RaceDetectHookData
 	XXX_presence           [1]uint32
 	unknownFields          protoimpl.UnknownFields
@@ -158,6 +159,13 @@ func (x *Frame) GetTrailer() *Metadata {
 	return nil
 }
 
+func (x *Frame) GetPeerEpoch() uint32 {
+	if x != nil {
+		return x.xxx_hidden_PeerEpoch
+	}
+	return 0
+}
+
 func (x *Frame) SetEpoch(v uint32) {
 	x.xxx_hidden_Epoch = v
 }
@@ -191,12 +199,12 @@ func (x *Frame) SetPayload(v []byte) {
 		v = []byte{}
 	}
 	x.xxx_hidden_Payload = v
-	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 7, 12)
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 7, 13)
 }
 
 func (x *Frame) SetCode(v uint32) {
 	x.xxx_hidden_Code = v
-	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 8, 12)
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 8, 13)
 }
 
 func (x *Frame) SetDesc(v string) {
@@ -209,6 +217,10 @@ func (x *Frame) SetHeader(v *Metadata) {
 
 func (x *Frame) SetTrailer(v *Metadata) {
 	x.xxx_hidden_Trailer = v
+}
+
+func (x *Frame) SetPeerEpoch(v uint32) {
+	x.xxx_hidden_PeerEpoch = v
 }
 
 func (x *Frame) HasTimeout() bool {
@@ -301,6 +313,15 @@ type Frame_builder struct {
 	Desc    string
 	Header  *Metadata
 	Trailer *Metadata
+	// The client incarnation this frame addresses (PROTOCOL.md §6.1).
+	// Server→client call frames (H, data, T, stream probes, keepalive) echo the
+	// client epoch of the call they belong to; the client accepts a frame into
+	// a stream only when this names its own epoch — a sid alone does not,
+	// because a restarted client re-allocates sids from 1. A client→server
+	// RESET echoes the offending frame's peer_epoch so the server can reset
+	// exactly that incarnation's call. Client→server call frames leave it 0
+	// (their field 1 already names the incarnation).
+	PeerEpoch uint32
 }
 
 func (b0 Frame_builder) Build() *Frame {
@@ -315,16 +336,17 @@ func (b0 Frame_builder) Build() *Frame {
 	x.xxx_hidden_Codec = b.Codec
 	x.xxx_hidden_Timeout = b.Timeout
 	if b.Payload != nil {
-		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 7, 12)
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 7, 13)
 		x.xxx_hidden_Payload = b.Payload
 	}
 	if b.Code != nil {
-		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 8, 12)
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 8, 13)
 		x.xxx_hidden_Code = *b.Code
 	}
 	x.xxx_hidden_Desc = b.Desc
 	x.xxx_hidden_Header = b.Header
 	x.xxx_hidden_Trailer = b.Trailer
+	x.xxx_hidden_PeerEpoch = b.PeerEpoch
 	return m0
 }
 
@@ -332,7 +354,7 @@ var File_drpc_frame_proto protoreflect.FileDescriptor
 
 const file_drpc_frame_proto_rawDesc = "" +
 	"\n" +
-	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x1egoogle/protobuf/duration.proto\"\xf0\x02\n" +
+	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x1egoogle/protobuf/duration.proto\"\x8f\x03\n" +
 	"\x05Frame\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\aR\x05epoch\x12\x10\n" +
 	"\x03sid\x18\x02 \x01(\aR\x03sid\x12\x10\n" +
@@ -346,7 +368,9 @@ const file_drpc_frame_proto_rawDesc = "" +
 	" \x01(\rB\x05\xaa\x01\x02\b\x01R\x04code\x12\x12\n" +
 	"\x04desc\x18\v \x01(\tR\x04desc\x12&\n" +
 	"\x06header\x18\f \x01(\v2\x0e.drpc.MetadataR\x06header\x12(\n" +
-	"\atrailer\x18\r \x01(\v2\x0e.drpc.MetadataR\atrailerJ\x04\b\x06\x10\aR\fmethod_indexB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
+	"\atrailer\x18\r \x01(\v2\x0e.drpc.MetadataR\atrailer\x12\x1d\n" +
+	"\n" +
+	"peer_epoch\x18\x0e \x01(\aR\tpeerEpochJ\x04\b\x06\x10\aR\fmethod_indexB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
 
 var file_drpc_frame_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_drpc_frame_proto_goTypes = []any{

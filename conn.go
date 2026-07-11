@@ -3,7 +3,6 @@ package drpc
 import (
 	"context"
 	"io"
-	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 
@@ -48,7 +47,7 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 	}
 
 	v := &Conn{
-		epoch:  rand.Uint32(),
+		epoch:  nonzeroEpoch(),
 		tx:     tx,
 		mode:   resolveMode(tx, opt.reliable, opt.timing),
 		rx:     opt.rx.withDefaults(),
@@ -112,6 +111,21 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 		c.clearTombAbort(sid)
 		return nil
 	}
+	// Every other server frame echoes the client incarnation it addresses
+	// (PROTOCOL.md §6.1). One that names another — a dead incarnation
+	// coexisting behind this address, or an injection — must not touch this
+	// Conn's calls or clocks: sids restart at 1 across restarts, so a sid
+	// match means nothing without the epoch echo.
+	if f.GetPeerEpoch() != c.epoch {
+		if f.isPing() && sid == 0 {
+			return nil // another incarnation's keepalive: not ours to answer
+		}
+		// Tell the desynced server to stop (§9.3): the RESET echoes the
+		// offending frame's peer_epoch, so exactly that incarnation's call
+		// dies at the server.
+		return c.sendReset(ctx, f)
+	}
+
 	if f.isPing() {
 		// Well-formed PINGs are validated: refresh peer liveness
 		// (PROTOCOL.md §9.1, §10.4).
@@ -128,7 +142,7 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 	}
 
 	if s := c.lookup(sid); s != nil {
-		s.handleRx(f)
+		s.handleRx(ctx, f)
 		return nil
 	}
 
@@ -137,7 +151,7 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 	c.mu.Unlock()
 	if tomb != nil {
 		// Straggler for a finished call: validated, dropped. A matching
-		// terminal clears the pending abort (PROTOCOL.md §9.1-4b, §10.3).
+		// terminal clears the pending abort (PROTOCOL.md §9.1-5b, §10.3).
 		c.lastRx.Store(nowNano())
 		if f.isTerminal() {
 			c.clearTombAbort(sid)

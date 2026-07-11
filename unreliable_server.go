@@ -47,15 +47,19 @@ type peerState struct {
 	dead bool    // liveness expired; cleared state
 
 	tombs     map[uint32]*srvTomb
-	tombOrder []uint32 // insertion order for eviction
+	tombOrder []uint32 // insertion order for byte-cap degradation
 	tombBytes int
+	// tombFloor covers entry-cap evictions (§9.2, §15): sids at or below it
+	// keep key-only tombstone semantics — deduped, replay lost — at zero
+	// memory. sids are monotonic per incarnation (§6.2), so evicting the
+	// lowest sid and raising the floor loses nothing the entry could dedup.
+	tombFloor uint32
 
 	liveCalls int
 	created   time.Time
 
 	maxTombs     int // §15 caps, copied from the Server at creation
 	maxTombBytes int
-	maxLive      int
 
 	lastRx   atomic.Int64 // validated frames only (§9.1)
 	lastTx   atomic.Int64
@@ -79,6 +83,11 @@ func (ps *peerState) hwmAgedLocked(now time.Time, ttl time.Duration, reliable bo
 }
 
 func (ps *peerState) addTombLocked(sid uint32, term *Frame, expire time.Time) {
+	if sid <= ps.tombFloor {
+		// Already covered key-only by the floor: an entry would add nothing
+		// but the (lost) replay.
+		return
+	}
 	size := 0
 	if term != nil {
 		size = len(term.GetPayload())
@@ -103,13 +112,22 @@ func (ps *peerState) addTombLocked(sid uint32, term *Frame, expire time.Time) {
 			tb.term, tb.size = nil, 0
 		}
 	}
-	// Entry cap: drop oldest entries outright (a §14 residual).
-	for len(ps.tombs) > ps.maxTombs && len(ps.tombOrder) > 0 {
-		sid := ps.tombOrder[0]
-		ps.tombOrder = ps.tombOrder[1:]
-		if tb := ps.tombs[sid]; tb != nil {
+	// Entry cap: evict the lowest sid and raise the floor — dedup for the
+	// evicted sid survives at zero memory, so no re-execution window opens
+	// (§9.2, §14, §15). Only the stored replay is lost.
+	for len(ps.tombs) > ps.maxTombs {
+		lowest := uint32(0)
+		for tsid := range ps.tombs {
+			if lowest == 0 || tsid < lowest {
+				lowest = tsid
+			}
+		}
+		if tb := ps.tombs[lowest]; tb != nil {
 			ps.tombBytes -= tb.size
-			delete(ps.tombs, sid)
+		}
+		delete(ps.tombs, lowest)
+		if ps.tombFloor < lowest {
+			ps.tombFloor = lowest
 		}
 	}
 }
@@ -119,6 +137,14 @@ func (ps *peerState) removeTombLocked(sid uint32) {
 		ps.tombBytes -= tb.size
 		delete(ps.tombs, sid)
 	}
+}
+
+// replayDue reports whether the per-tombstone rate limit would allow a
+// replay now, without spending anything — callers check the aggregate reply
+// budget (§15) between this and replayTombLocked, so a budget-denied reply
+// burns neither the 1/RTI slot nor the keepalive clock.
+func (tb *srvTomb) replayDue(now time.Time, rti time.Duration) bool {
+	return tb.term != nil && now.Sub(tb.lastReplay) >= rti
 }
 
 // replayTombLocked returns the stored terminal if the per-tombstone rate
@@ -135,8 +161,9 @@ func (ps *peerState) replayTombLocked(tb *srvTomb, now time.Time, rti time.Durat
 // pendingReset is a scheduled delayed RESET for an unknown-sid frame whose
 // OPEN may merely be late (PROTOCOL.md §9.3).
 type pendingReset struct {
-	due  time.Time
-	echo uint32 // epoch of the offending frame
+	due      time.Time
+	echo     uint32 // epoch of the offending frame
+	peerEcho uint32 // peer_epoch of the offending frame (§9.3)
 }
 
 // ensurePeerLocked returns the container for ek, creating it and enforcing
@@ -180,7 +207,6 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time, reliable bool) *pe
 		created:      now,
 		maxTombs:     s.limits.MaxTombstones,
 		maxTombBytes: s.limits.MaxTombstoneBytes,
-		maxLive:      s.limits.MaxLiveCalls,
 	}
 	ps.lastRx.Store(now.UnixNano())
 	ps.lastTx.Store(now.UnixNano())
@@ -203,7 +229,7 @@ func (s *Server) kickSweep() {
 func (s *Server) hasWork() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.pendingResets) > 0 || len(s.resetAt) > 0 {
+	if len(s.pendingResets) > 0 || len(s.resetAt) > 0 || len(s.replyBudget) > 0 {
 		return true
 	}
 	for _, ps := range s.peers {
@@ -250,18 +276,27 @@ func (s *Server) sweep(now time.Time) {
 		if now.Before(pr.due) {
 			continue
 		}
-		delete(s.pendingResets, key)
 		if _, live := s.calls[key]; live {
+			delete(s.pendingResets, key)
 			continue
 		}
 		if ps := s.peers[epochKey{peer: key.peer, epoch: key.epoch}]; ps != nil {
 			if _, tombed := ps.tombs[key.sid]; tombed {
+				delete(s.pendingResets, key)
 				continue
 			}
 		}
+		if !s.allowReplyLocked(key.peer, n) {
+			// Aggregate reply budget spent (§15): keep the entry — the next
+			// sweep retries once the budget window turns over, so the RESET
+			// is deferred, not lost.
+			continue
+		}
+		delete(s.pendingResets, key)
 		r := &Frame{}
 		r.SetFlags(FlagReset)
 		r.SetEpoch(pr.echo)
+		r.SetPeerEpoch(pr.peerEcho)
 		r.SetSid(key.sid)
 		ctx := s.root
 		if key.peer != nil {
@@ -270,10 +305,15 @@ func (s *Server) sweep(now time.Time) {
 		jobs = append(jobs, txJob{ctx, r})
 	}
 
-	// Prune the immediate-RESET rate-limit history.
+	// Prune the immediate-RESET rate-limit history and reply budgets.
 	for key, at := range s.resetAt {
 		if n-at > int64(t.Tombstone) {
 			delete(s.resetAt, key)
+		}
+	}
+	for p, b := range s.replyBudget {
+		if n-b.windowStart > int64(t.Tombstone) {
+			delete(s.replyBudget, p)
 		}
 	}
 
@@ -331,6 +371,7 @@ func (s *Server) sweep(now time.Time) {
 				ping := &Frame{}
 				ping.SetEpoch(s.epoch)
 				ping.SetFlags(FlagPing)
+				ping.SetPeerEpoch(ps.epoch) // name the incarnation (§6.1)
 				jobs = append(jobs, txJob{ps.txCtx, ping})
 			}
 		}
