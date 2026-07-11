@@ -35,6 +35,11 @@ jobs:
       - name: Test
         run: go test -race -timeout 120s -count=1 ./...
 
+      - name: Fuzz smoke
+        run: |
+          go test -run '^$' -fuzz '^FuzzServerHandle$' -fuzztime 20s .
+          go test -run '^$' -fuzz '^FuzzConnHandle$' -fuzztime 20s .
+
   bench:
     runs-on: ubuntu-latest
 
