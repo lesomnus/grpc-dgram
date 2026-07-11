@@ -6,8 +6,9 @@ on:
       - "**/*.go"
       - "**/*.proto"
       - ".github/workflows/ci.yaml"
-      - "go.mod"
-      - "go.sum"
+      - "**/go.mod"
+      - "**/go.sum"
+      - "go.work"
       - "buf.yaml"
       - "buf.gen.yaml"
   push:
@@ -29,11 +30,20 @@ jobs:
       - name: Lint protos
         run: buf lint
 
+      # The repo is a workspace: the root module plus one module per adapter
+      # that carries third-party deps. ./... does not cross module boundaries,
+      # so vet/test iterate over every go.mod.
       - name: Vet
-        run: go vet ./...
+        run: |
+          for d in $(find . -name go.mod -not -path '*/.*' -printf '%h\n' | sort); do
+            (cd "$d" && go vet ./...)
+          done
 
       - name: Test
-        run: go test -race -timeout 120s -count=1 ./...
+        run: |
+          for d in $(find . -name go.mod -not -path '*/.*' -printf '%h\n' | sort); do
+            (cd "$d" && go test -race -timeout 120s -count=1 ./...)
+          done
 
       - name: Fuzz smoke
         run: |

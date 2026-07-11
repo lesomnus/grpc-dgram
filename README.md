@@ -21,8 +21,8 @@ generated impls <── drpc.Server <──(per frame)──── adapter (unpa
 - Package: `github.com/lesomnus/grpc-dgram` (import name `drpc`)
 - Status: **core + protocol complete and characterized** (unary / server- /
   client- / bidi-streaming, metadata, interceptors, codecs, timeouts,
-  liveness). Wire protocol: [`PROTOCOL.md`](./PROTOCOL.md). Transport adapters
-  (WebSocket, UDP, pion/webrtc) are the next milestone — see
+  liveness), **transport adapters shipped** (UDP, WebSocket, pion/webrtc).
+  Wire protocol: [`PROTOCOL.md`](./PROTOCOL.md); milestones:
   [`ROADMAP.md`](./ROADMAP.md).
 
 ---
@@ -51,7 +51,7 @@ subsequence** instead of stalling.
 | Reliable-mode (timers off over a reliable transport) | ✅ `WithReliable(true)` — the gRPC-over-WebSocket / reliable-datachannel path |
 | Per-stream buffering & drop policy (`DropNewest` / `DropOldest`) | ✅ per method / per role |
 | Resource caps (tombstones, live calls, reset maps) | ✅ bounded under a junk flood |
-| Transport adapters (WebSocket, `net.PacketConn`, pion/webrtc) | ⬜ next milestone |
+| Transport adapters: UDP, WebSocket, pion/webrtc | ✅ [`adapter/udp`](./adapter/udp), [`adapter/ws`](./adapter/ws), [`adapter/pion`](./adapter/pion) |
 | Stats handler, browser JS/TS port | ⬜ planned |
 
 ## Install
@@ -65,21 +65,22 @@ Requires Go 1.25+ (`testing/synctest` is used by the test suite).
 ## Usage
 
 `Conn` implements `grpc.ClientConnInterface` and `Server` implements
-`grpc.ServiceRegistrar`, so generated code plugs straight in. You provide a
-transport as a `FrameHandler` (send) and feed received frames back in via
-`Handle` (receive). An adapter bridges those to an actual channel; until the
-built-in adapters land you can wire any transport in a few lines.
+`grpc.ServiceRegistrar`, so generated code plugs straight in. An adapter
+bridges the core to an actual channel — over UDP (the sensor path):
 
 ```go
-// Server: register your generated service on a drpc.Server.
-srv := drpc.NewServer(sendToClient /* FrameHandler */)
+// Server
+pc, _ := net.ListenUDP("udp", laddr)
+gw := udp.NewGateway(pc)                 // github.com/lesomnus/grpc-dgram/adapter/udp
+srv := drpc.NewServer(gw)
 pb.RegisterSensorServiceServer(srv, &myHandler{})
-
-// deliver each received frame (an adapter reads the channel and calls this):
-srv.Handle(ctx, frame)
+go gw.Serve(ctx, srv)
 
 // Client: a drpc.Conn is a grpc.ClientConnInterface.
-conn := drpc.NewConn(sendToServer /* FrameHandler */)
+c, _ := net.Dial("udp", serverAddr)
+tp := udp.New(c)
+conn := drpc.NewConn(tp)
+go tp.Serve(ctx, conn)
 client := pb.NewSensorServiceClient(conn)
 
 stream, _ := client.Readings(ctx, &pb.Subscribe{...})
@@ -91,20 +92,36 @@ for {
 }
 ```
 
-The wire unit is one marshaled `Envelop` (1..n `Frame`s) per datagram. An
-adapter implements `EnvelopHandler`; `drpc.Wrap1` adapts the core's per-frame
-output to it (a `Coalescer` for batching is planned). See
-[`e2e_test.go`](./e2e_test.go) for a complete in-process wiring and
-[`PROTOCOL.md`](./PROTOCOL.md) §3–§4 for the adapter contract.
+Three adapters ship. `adapter/udp` is part of the core module (stdlib only);
+`adapter/ws` (gorilla/websocket) and `adapter/pion` (pion/webrtc) live in
+their own Go modules so importing the core never pulls their dependencies.
+
+| | transport | mode | wiring |
+|---|---|---|---|
+| [`adapter/udp`](./adapter/udp) | UDP socket | unreliable | `udp.New(conn)` / `udp.NewGateway(pc)` + `Serve` |
+| [`adapter/ws`](./adapter/ws) | WebSocket | reliable | `ws.New(wsc)` + `ServeConn` / `ws.NewGateway()` + `ServePeer` |
+| [`adapter/pion`](./adapter/pion) | WebRTC DataChannel | **derived from the channel config** | `pion.New(dc)` + `ServeConn` / `pion.NewGateway()` + `Bind`+`ServePeer` |
+
+To wire a custom transport instead: the wire unit is one marshaled `Envelop`
+(1..n `Frame`s) per transport message; implement `FrameHandler` (send) +
+`TransportInfo`, feed received frames to `Conn.Handle`/`Server.Handle`, and
+honor the teardown duty on connection-oriented channels. See
+[`PROTOCOL.md`](./PROTOCOL.md) §3–§4 for the contract and any shipped adapter
+as a reference.
 
 ### Reliable transports
 
-Over a reliable, ordered transport (WebSocket, or a reliable WebRTC data
-channel), pass `WithReliable(true)` to both ends (or implement
-`TransportInfo` on your adapter and it is detected automatically). Timers and
-retransmission are then off, delivery is the exact sequence, and any gap or
-duplicate is surfaced as `INTERNAL` (a broken "reliable" transport). This is
-the path to **plain gRPC-over-WebSocket / reliable-datachannel** semantics.
+Over a reliable, ordered transport, timers and retransmission are off,
+delivery is the exact sequence, and any gap or duplicate is surfaced as
+`INTERNAL` (a broken "reliable" transport). This is the path to **plain
+gRPC-over-WebSocket / reliable-datachannel** semantics, and it is
+auto-detected: `adapter/ws` always advertises reliable, `adapter/pion`
+derives it from the data-channel configuration (ordered, no
+retransmit/lifetime cap), and both ends of a pion channel derive the same
+answer with zero options. `WithReliable` remains as the explicit override for
+custom transports. With no protocol timers running, the adapter's death
+detection (keepalive, `OnClose`) is what fails live calls — the shipped
+adapters own that duty.
 
 ### Tuning (sensor streams)
 
