@@ -1,4 +1,4 @@
-module github.com/lesomnus/grpc-dgram/adapter/ws
+module github.com/lesomnus/grpc-dgram/transport/ws
 
 go 1.26.1
 

@@ -25,7 +25,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	drpc "github.com/lesomnus/grpc-dgram"
-	"github.com/lesomnus/grpc-dgram/adapter/ws"
+	"github.com/lesomnus/grpc-dgram/transport/ws"
 	"github.com/lesomnus/grpc-dgram/internal/echo"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

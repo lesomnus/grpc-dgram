@@ -51,7 +51,7 @@ subsequence** instead of stalling.
 | Reliable-mode (timers off over a reliable transport) | ✅ `WithReliable(true)` — the gRPC-over-WebSocket / reliable-datachannel path |
 | Per-stream buffering & drop policy (`DropNewest` / `DropOldest`) | ✅ per method / per role |
 | Resource caps (tombstones, live calls, reset maps) | ✅ bounded under a junk flood |
-| Transport adapters: UDP, WebSocket, pion/webrtc | ✅ [`adapter/udp`](./adapter/udp), [`adapter/ws`](./adapter/ws), [`adapter/pion`](./adapter/pion) |
+| Transport adapters: UDP, WebSocket, pion/webrtc | ✅ [`transport/udp`](./transport/udp), [`transport/ws`](./transport/ws), [`transport/pion`](./transport/pion) |
 | Stats handler, browser JS/TS port | ⬜ planned |
 
 ## Install
@@ -71,7 +71,7 @@ bridges the core to an actual channel — over UDP (the sensor path):
 ```go
 // Server
 pc, _ := net.ListenUDP("udp", laddr)
-gw := udp.NewGateway(pc)                 // github.com/lesomnus/grpc-dgram/adapter/udp
+gw := udp.NewGateway(pc)                 // github.com/lesomnus/grpc-dgram/transport/udp
 srv := drpc.NewServer(gw)
 pb.RegisterSensorServiceServer(srv, &myHandler{})
 go gw.Serve(ctx, srv)
@@ -92,15 +92,15 @@ for {
 }
 ```
 
-Three adapters ship. `adapter/udp` is part of the core module (stdlib only);
-`adapter/ws` (gorilla/websocket) and `adapter/pion` (pion/webrtc) live in
+Three adapters ship. `transport/udp` is part of the core module (stdlib only);
+`transport/ws` (gorilla/websocket) and `transport/pion` (pion/webrtc) live in
 their own Go modules so importing the core never pulls their dependencies.
 
 | | transport | mode | wiring |
 |---|---|---|---|
-| [`adapter/udp`](./adapter/udp) | UDP socket | unreliable | `udp.New(conn)` / `udp.NewGateway(pc)` + `Serve` |
-| [`adapter/ws`](./adapter/ws) | WebSocket | reliable | `ws.New(wsc)` + `ServeConn` / `ws.NewGateway()` + `ServePeer` |
-| [`adapter/pion`](./adapter/pion) | WebRTC DataChannel | **derived from the channel config** | `pion.New(dc)` + `ServeConn` / `pion.NewGateway()` + `Bind`+`ServePeer` |
+| [`transport/udp`](./transport/udp) | UDP socket | unreliable | `udp.New(conn)` / `udp.NewGateway(pc)` + `Serve` |
+| [`transport/ws`](./transport/ws) | WebSocket | reliable | `ws.New(wsc)` + `ServeConn` / `ws.NewGateway()` + `ServePeer` |
+| [`transport/pion`](./transport/pion) | WebRTC DataChannel | **derived from the channel config** | `pion.New(dc)` + `ServeConn` / `pion.NewGateway()` + `Bind`+`ServePeer` |
 
 To wire a custom transport instead: the wire unit is one marshaled `Envelop`
 (1..n `Frame`s) per transport message; implement `FrameHandler` (send) +
@@ -115,7 +115,7 @@ Over a reliable, ordered transport, timers and retransmission are off,
 delivery is the exact sequence, and any gap or duplicate is surfaced as
 `INTERNAL` (a broken "reliable" transport). This is the path to **plain
 gRPC-over-WebSocket / reliable-datachannel** semantics, and it is
-auto-detected: `adapter/ws` always advertises reliable, and `adapter/pion`
+auto-detected: `transport/ws` always advertises reliable, and `transport/pion`
 derives it from the data-channel configuration (ordered, no
 retransmit/lifetime cap) — a client `pion.New` always, a server
 `pion.Gateway` from its first channel when one is bound before

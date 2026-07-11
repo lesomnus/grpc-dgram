@@ -1,4 +1,4 @@
-# adapter/pion
+# transport/pion
 
 drpc over WebRTC DataChannels ([pion/webrtc](https://github.com/pion/webrtc)):
 **one channel message carries one marshaled `Envelop`**, and the protocol
@@ -17,7 +17,7 @@ stay with your application — the adapter takes an already-negotiated
 Its own Go module: importing the core never pulls pion.
 
 ```go
-import "github.com/lesomnus/grpc-dgram/adapter/pion"
+import "github.com/lesomnus/grpc-dgram/transport/pion"
 ```
 
 ## Client (the side that creates the channel)

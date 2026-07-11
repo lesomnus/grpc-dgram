@@ -2,6 +2,6 @@ go 1.26.1
 
 use (
 	.
-	./adapter/pion
-	./adapter/ws
+	./transport/pion
+	./transport/ws
 )

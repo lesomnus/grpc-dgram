@@ -1,4 +1,4 @@
-# adapter/udp
+# transport/udp
 
 drpc over UDP datagrams: **one datagram carries one marshaled `Envelop`**, the
 channel is unreliable (drpc's default mode, timers on), and nothing is ever
@@ -7,7 +7,7 @@ fragmented. This is the sensor-stream path.
 Part of the core module — importing it pulls no third-party dependencies.
 
 ```go
-import "github.com/lesomnus/grpc-dgram/adapter/udp"
+import "github.com/lesomnus/grpc-dgram/transport/udp"
 ```
 
 ## Server

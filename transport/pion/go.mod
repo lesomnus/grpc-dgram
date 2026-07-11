@@ -1,4 +1,4 @@
-module github.com/lesomnus/grpc-dgram/adapter/pion
+module github.com/lesomnus/grpc-dgram/transport/pion
 
 go 1.26.1
 

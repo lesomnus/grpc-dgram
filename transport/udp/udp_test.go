@@ -16,7 +16,7 @@ import (
 	"time"
 
 	drpc "github.com/lesomnus/grpc-dgram"
-	"github.com/lesomnus/grpc-dgram/adapter/udp"
+	"github.com/lesomnus/grpc-dgram/transport/udp"
 	"github.com/lesomnus/grpc-dgram/internal/echo"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

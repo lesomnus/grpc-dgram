@@ -1,4 +1,4 @@
-# adapter/ws
+# transport/ws
 
 drpc over WebSocket ([gorilla/websocket](https://github.com/gorilla/websocket)):
 **one binary message carries one marshaled `Envelop`**. The transport is
@@ -8,7 +8,7 @@ every protocol timer off — plain gRPC semantics over a WebSocket.
 Its own Go module: importing the core never pulls gorilla.
 
 ```go
-import "github.com/lesomnus/grpc-dgram/adapter/ws"
+import "github.com/lesomnus/grpc-dgram/transport/ws"
 ```
 
 ## Server

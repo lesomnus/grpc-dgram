@@ -15,7 +15,7 @@ import (
 	"time"
 
 	drpc "github.com/lesomnus/grpc-dgram"
-	"github.com/lesomnus/grpc-dgram/adapter/pion"
+	"github.com/lesomnus/grpc-dgram/transport/pion"
 	"github.com/lesomnus/grpc-dgram/internal/echo"
 	"github.com/pion/webrtc/v4"
 	"google.golang.org/grpc/codes"
