@@ -614,6 +614,28 @@ func (s *Server) DisconnectPeer(peer any, err error) {
 			targets = append(targets, st)
 		}
 	}
+	// The transport says this peer is gone, and gateways issue a fresh key
+	// per connection, so nothing can ever address this state again: the
+	// per-epoch containers — retained "until teardown" (§9.4, §10.6), and
+	// this IS the teardown — die here. Without this, every disconnected
+	// peer of a connection-oriented gateway would leak its container (the
+	// sweep never GCs reliable ones, and the §15 dead-container cap only
+	// evicts among containers of the *same* key).
+	for k := range s.peers {
+		if k.peer == peer {
+			delete(s.peers, k)
+		}
+	}
+	for k := range s.pendingResets {
+		if k.peer == peer {
+			delete(s.pendingResets, k)
+		}
+	}
+	for k := range s.resetAt {
+		if k.peer == peer {
+			delete(s.resetAt, k)
+		}
+	}
 	s.mu.Unlock()
 
 	cause := status.Error(codes.Unavailable, "transport closed")

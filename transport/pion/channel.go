@@ -241,11 +241,11 @@ func (ch *channel) send(ctx context.Context, e *drpc.Envelop) error {
 	return ch.dc.Send(data)
 }
 
-// serve pumps buffered messages into h until ctx is done or the channel dies;
-// on death it flushes what was received first. died reports that the caller
-// owes the §4.5 teardown call; err is the death cause (nil for a clean close
-// or ctx cancellation).
-func (ch *channel) serve(ctx context.Context, h drpc.FrameHandler) (died bool, err error) {
+// serve pumps buffered messages into h until ctx is done or the channel
+// dies; on death it flushes what was received first. err is the death cause
+// (nil for a clean close or ctx cancellation). Exiting abandons the channel
+// either way, so the caller owes the §4.5 teardown on every return.
+func (ch *channel) serve(ctx context.Context, h drpc.FrameHandler) error {
 	defer ch.stop()
 	for {
 		select {
@@ -257,11 +257,11 @@ func (ch *channel) serve(ctx context.Context, h drpc.FrameHandler) (died bool, e
 				case data := <-ch.rx:
 					deliver(ctx, data, h)
 				default:
-					return true, ch.deathErr()
+					return ch.deathErr()
 				}
 			}
 		case <-ctx.Done():
-			return false, nil
+			return nil
 		}
 	}
 }

@@ -3,8 +3,10 @@ package pion_test
 // Real pion stack end-to-end: generated gRPC stubs over in-process WebRTC
 // DataChannels, ICE on loopback host candidates (no STUN). The reliable
 // tests pass no mode or timing options anywhere — that the calls behave like
-// plain gRPC with every timer off is the point: the mode is discovered from
-// the channel configuration through drpc.TransportInfo.
+// plain gRPC with every timer off is the point: the client discovers the
+// mode from the channel configuration (drpc.TransportInfo), and the server
+// runs each peer in its channel's mode via ServePeer's annotation
+// (drpc.NewReliableContext).
 
 import (
 	"context"
@@ -96,9 +98,8 @@ type ends struct {
 }
 
 // serveReliable is the roadmap finale wiring: gRPC over a reliable
-// DataChannel, mode auto-detected on both sides. The server sits on the
-// offerer so its Bind precedes drpc.NewServer and fixes the gateway mode
-// from the channel configuration.
+// DataChannel, mode auto-detected on both sides — the client from its
+// channel config, the server from ServePeer's per-peer annotation.
 func serveReliable(t *testing.T) *ends {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -152,8 +153,8 @@ func serveReliable(t *testing.T) *ends {
 }
 
 // serveUnreliable wires an unordered, zero-retransmit channel: the client is
-// the offerer, the server the answerer — the server is built before the
-// channel arrives, so the gateway latches unreliable on its own.
+// the offerer, the server the answerer, and the peer runs unreliable via
+// ServePeer's annotation.
 func serveUnreliable(t *testing.T) *ends {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())

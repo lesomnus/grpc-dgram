@@ -86,7 +86,7 @@ timer machinery on the unreliable ones. No mode options anywhere.
 |---|---|---|
 | `WithMaxMessageSize(n)` | 1200 B unreliable / 16 KiB reliable | largest marshaled `Envelop` this endpoint will send; 0 removes the limit |
 | `WithMaxBufferedAmount(n)` | 1 MiB | outbound high-water mark: sends block while `dc.BufferedAmount()` is at or above it (pion queues without limit); 0 never blocks |
-| `WithSendStallTimeout(d)` | 30 s | how long one send may wait at the mark before the channel is declared dead; 0 waits on ctx alone |
+| `WithSendStallTimeout(d)` | 30 s | total budget for one send — the channel-open wait and the buffered-amount wait — before the channel is declared dead; 0 waits on ctx alone |
 
 ## Caveats
 

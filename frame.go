@@ -59,9 +59,9 @@ func (f EnvelopHandlerFunc) Handle(ctx context.Context, e *Envelop) error {
 //
 // The returned handler re-exposes nothing: if h also implements
 // TransportInfo, the wrapper hides it from NewConn/NewServer discovery
-// (PROTOCOL.md §3). Adapters should implement FrameHandler and TransportInfo
-// on one type instead — as the shipped adapters do — or pass WithReliable
-// explicitly.
+// (PROTOCOL.md §3). Single-mode adapters should implement FrameHandler and
+// TransportInfo on one type instead, mixed-mode gateways annotate per peer
+// (NewReliableContext), or pass WithReliable explicitly.
 func Wrap1(h EnvelopHandler) FrameHandler {
 	return FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
 		e := &Envelop{}

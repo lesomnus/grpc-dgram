@@ -105,8 +105,7 @@ func (t *Transport) AttachConn(conn *drpc.Conn) {
 		panic("pion: transport already attached to a Conn")
 	}
 	go func() {
-		_, err := t.ch.serve(context.Background(), conn)
-		conn.Close(err)
+		conn.Close(t.ch.serve(context.Background(), conn))
 	}()
 }
 
@@ -223,10 +222,12 @@ func (g *Gateway) drop(dc *webrtc.DataChannel, b *gwChannel) {
 // ServePeer delivers dc's frames to srv under a fresh peer key — annotated
 // with the channel's own reliability, so the server runs this peer in the
 // channel's mode (PROTOCOL.md §4.3) — until ctx is done or the channel
-// dies. On channel death it performs the §4.5 teardown duty —
-// srv.DisconnectPeer with the cause — deregisters the peer, and returns
-// that cause; it returns nil on a clean close or on ctx cancellation. Each
-// channel is served at most once.
+// dies. On EVERY exit it performs the §4.5 teardown duty —
+// srv.DisconnectPeer with the cause — and deregisters the peer: exiting
+// abandons the channel (the key is never reused), so the peer's live calls
+// and state must die with it whether the channel died or the caller
+// cancelled ctx. Returns nil on a clean close or on ctx cancellation, the
+// death cause otherwise. Each channel is served at most once.
 func (g *Gateway) ServePeer(ctx context.Context, srv *drpc.Server, dc *webrtc.DataChannel) error {
 	b := g.bind(dc)
 	if !b.served.CompareAndSwap(false, true) {
@@ -236,10 +237,8 @@ func (g *Gateway) ServePeer(ctx context.Context, srv *drpc.Server, dc *webrtc.Da
 
 	ctx = drpc.NewPeerContext(ctx, b.key)
 	ctx = drpc.NewReliableContext(ctx, b.ch.reliable)
-	died, err := b.ch.serve(ctx, srv)
-	if died {
-		srv.DisconnectPeer(b.key, err)
-	}
+	err := b.ch.serve(ctx, srv)
+	srv.DisconnectPeer(b.key, err)
 	return err
 }
 
