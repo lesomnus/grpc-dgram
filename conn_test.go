@@ -9,6 +9,7 @@ import (
 	"github.com/lesomnus/grpc-dgram/internal/echo"
 	"github.com/lesomnus/grpc-dgram/internal/x"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -25,6 +26,19 @@ func terminalFor(req *drpc.Frame, epoch uint32, payload []byte) *drpc.Frame {
 }
 
 func TestConn(t *testing.T) {
+	t.Run("closed conn refuses new calls", func(t *testing.T) {
+		// The closed latch: after Close the pump is gone and the sweeper is
+		// stopped, so a call admitted now could never terminate — it must be
+		// refused at the door instead (racing calls are caught by failAll).
+		conn := drpc.NewConn(drpc.FrameHandlerFunc(func(context.Context, *drpc.Frame) error {
+			return nil
+		}))
+		conn.Close(nil)
+
+		err := conn.Invoke(t.Context(), echo.EchoService_Once_FullMethodName,
+			&echo.EchoRequest{}, &echo.EchoResponse{})
+		x.Equal(t, codes.Unavailable, status.Code(err))
+	})
 	t.Run("Invoke", func(t *testing.T) {
 		ctx := t.Context()
 		msg := "Royale with Cheese"

@@ -31,11 +31,12 @@ const (
 // resume on OnBufferedAmountLow (half the mark).
 const DefaultMaxBufferedAmount = 1 << 20
 
-// DefaultSendStallTimeout bounds how long a send may wait at the
-// buffered-amount mark. In reliable mode the core runs no timers and does
-// not bound the tx ctx, so the adapter must bound a stalled write itself
-// (PROTOCOL.md §4.2): a peer that stops draining this long is transport
-// death, and the stall trips the same teardown as a channel error.
+// DefaultSendStallTimeout bounds how long one send may wait in total — for
+// the channel to open and at the buffered-amount mark. In reliable mode the
+// core runs no timers and does not bound the tx ctx, so the adapter must
+// bound a stalled write itself (PROTOCOL.md §4.2): a channel that will not
+// open or a peer that stops draining for this long is transport death, and
+// the stall trips the same teardown as a channel error.
 const DefaultSendStallTimeout = 30 * time.Second
 
 // rxBufferSize bounds messages held between pion's read loop and the serve
@@ -194,19 +195,27 @@ func (ch *channel) send(ctx context.Context, e *drpc.Envelop) error {
 			len(data), ch.max, drpc.ErrMessageTooLarge)
 	}
 
+	// One stall budget bounds the whole send — the open-gate wait and the
+	// buffered-amount wait: the core's abort path transmits with an
+	// unbounded ctx (context.WithoutCancel), so ctx alone cannot be the
+	// bound (PROTOCOL.md §4.2).
+	var stalled <-chan time.Time
+	if ch.stall > 0 {
+		timer := time.NewTimer(ch.stall)
+		defer timer.Stop()
+		stalled = timer.C
+	}
+
 	select {
 	case <-ch.opened:
+	case <-stalled:
+		err := fmt.Errorf("pion: send stalled: channel not open within %v", ch.stall)
+		ch.fail(err)
+		return err
 	case <-ch.dead:
 		return ch.closedErr()
 	case <-ctx.Done():
 		return ctx.Err()
-	}
-
-	var stalled <-chan time.Time
-	if ch.high > 0 && ch.stall > 0 {
-		timer := time.NewTimer(ch.stall)
-		defer timer.Stop()
-		stalled = timer.C
 	}
 	for ch.high > 0 {
 		// Acquire the broadcast channel before checking the amount: a

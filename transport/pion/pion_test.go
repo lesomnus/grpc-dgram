@@ -236,6 +236,52 @@ func conn2client(conn *drpc.Conn) echo.EchoServiceClient {
 	return echo.NewEchoServiceClient(conn)
 }
 
+// A channel whose association never establishes (a failed dial) fires no
+// pion callbacks at all — dc.Close included. Teardown and send bounds must
+// not depend on them: the send-stall budget bounds a call on the un-opened
+// channel, and Close trips the death latch itself.
+func TestNeverOpenedChannel(t *testing.T) {
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	dc, err := pc.CreateDataChannel("drpc", nil) // never signaled: never opens
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := drpc.NewConn(pion.New(dc, pion.WithSendStallTimeout(200*time.Millisecond)))
+
+	// Reliable config, deadline-less call: only the stall budget bounds it —
+	// including the abort path, which transmits with an unbounded ctx.
+	start := time.Now()
+	if _, err := conn2client(conn).Once(t.Context(), echo.EchoRequest_builder{
+		Message: "x",
+	}.Build()); err == nil {
+		t.Fatal("a call on a never-opened channel cannot succeed")
+	}
+	if e := time.Since(start); e > 2*time.Second {
+		t.Fatalf("call returned in %v, want the stall bound (~200ms)", e)
+	}
+
+	// Close must not block on callbacks that will never come...
+	done := make(chan struct{})
+	go func() {
+		conn.Close(nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close blocked on a never-opened channel")
+	}
+	// ...and the conn is latched closed.
+	_, err = conn2client(conn).Once(t.Context(), echo.EchoRequest_builder{}.Build())
+	if got := status.Code(err); got != codes.Unavailable {
+		t.Fatalf("call on a closed conn: got %v (%v), want Unavailable", got, err)
+	}
+}
+
 func TestReliableEcho(t *testing.T) {
 	e := serveReliable(t)
 

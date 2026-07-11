@@ -28,6 +28,7 @@ type Conn struct {
 	resetAt   map[uint32]int64
 	sidNext   uint32
 	exhausted bool
+	closed    bool
 
 	// Peer-liveness clocks (unreliable mode, PROTOCOL.md §10.4).
 	lastRx   atomic.Int64
@@ -159,6 +160,12 @@ func (c *Conn) Close(err error) {
 	if err != nil {
 		st = status.Errorf(codes.Unavailable, "transport closed: %v", err)
 	}
+	// Latch before failing: a stream inserted before the latch is caught by
+	// failAll's snapshot, one attempted after it is refused by newStream —
+	// nothing can slip between and hang with the pump gone.
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
 	c.failAll(st)
 	c.sw.stop()
 	if cl, ok := c.tx.(io.Closer); ok {
@@ -259,6 +266,12 @@ func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method stri
 func (c *Conn) newStream(ctx context.Context, method string, clientStreams, serverStreams bool) (*clientStream, error) {
 	c.mu.Lock()
 
+	if c.closed {
+		// With the pump gone and the sweeper stopped, nothing could ever
+		// terminate a call admitted now.
+		c.mu.Unlock()
+		return nil, status.Error(codes.Unavailable, "drpc: the connection is closed")
+	}
 	if c.exhausted {
 		c.mu.Unlock()
 		return nil, status.Error(codes.ResourceExhausted, "sid space exhausted; create a new Conn")

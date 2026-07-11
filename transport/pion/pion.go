@@ -53,9 +53,10 @@ func WithMaxBufferedAmount(n uint64) Option {
 	return func(o *options) { o.maxBufferedAmount = &n }
 }
 
-// WithSendStallTimeout bounds how long one send may wait at the
-// buffered-amount mark before the channel is declared dead (PROTOCOL.md
-// §4.2); 0 waits on ctx alone. Default DefaultSendStallTimeout.
+// WithSendStallTimeout bounds how long one send may wait in total — for the
+// channel to open and at the buffered-amount mark — before the channel is
+// declared dead (PROTOCOL.md §4.2); 0 waits on ctx alone. Default
+// DefaultSendStallTimeout.
 func WithSendStallTimeout(d time.Duration) Option {
 	return func(o *options) { o.sendStallTimeout = &d }
 }
@@ -120,9 +121,15 @@ func (t *Transport) AttachConn(conn *drpc.Conn) {
 }
 
 // Close closes the DataChannel; its death path flushes what was already
-// received, stops the pump, and fails any live calls. Idempotent.
+// received, stops the pump, and fails any live calls. The death latch is
+// tripped directly rather than through pion: a channel whose association
+// never established (a failed dial) never fires OnClose/OnError, and the
+// teardown must not depend on it. Idempotent.
 func (t *Transport) Close() error {
-	t.closer.Do(func() { t.ch.dc.Close() })
+	t.closer.Do(func() {
+		t.ch.fail(nil)
+		t.ch.dc.Close()
+	})
 	return nil
 }
 
@@ -241,6 +248,9 @@ func (g *Gateway) bind(dc *webrtc.DataChannel) *gwChannel {
 }
 
 func (g *Gateway) drop(dc *webrtc.DataChannel, b *gwChannel) {
+	// Trip the death latch ourselves: gated sends must unblock even when
+	// pion never fires OnClose (never-established association).
+	b.ch.fail(nil)
 	b.ch.stop()
 	g.mu.Lock()
 	delete(g.chans, dc)
