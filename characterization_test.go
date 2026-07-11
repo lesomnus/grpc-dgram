@@ -17,6 +17,7 @@ import (
 	"github.com/lesomnus/grpc-dgram/internal/echo"
 	"github.com/lesomnus/grpc-dgram/internal/lossy"
 	"github.com/lesomnus/grpc-dgram/internal/x"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -416,4 +417,80 @@ func TestChar_LiveCallCap(t *testing.T) {
 	r := is.recv(t)
 	x.True(t, r != nil, "expected a terminal")
 	x.Equal(t, codes.ResourceExhausted, codes.Code(r.GetCode()))
+}
+
+// ---------------------------------------------------------------------------
+// L3 hardening: a client stream locks to the server incarnation of its first
+// accepted frame — a foreign-epoch frame on a live client sid cannot inject
+// data, poison the window, or flip the learned-index epoch (symmetric with
+// the server's incarnation isolation). Raw-UDP injection is still possible
+// with a *matching* epoch; encrypted transport is the real mitigation (§15).
+// ---------------------------------------------------------------------------
+
+func TestChar_ClientRejectsForeignEpochFrame(t *testing.T) {
+	frames := make(chan *drpc.Frame, 16)
+	conn := drpc.NewConn(drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
+		frames <- f
+		return nil
+	}), drpc.WithReliable(true))
+	defer conn.Close(nil)
+
+	sd := &grpc.StreamDesc{StreamName: "Many", ServerStreams: true}
+	stream, err := conn.NewStream(t.Context(), sd, echo.EchoService_Many_FullMethodName)
+	x.NoError(t, err)
+	// Server-streaming emits its OPEN|CLOSE on the first SendMsg.
+	x.NoError(t, stream.SendMsg(echo.EchoRequest_builder{}.Build()))
+	<-frames // the client's OPEN
+
+	sid := uint32(1) // first sid
+
+	// The real server (epoch 7) sends a data frame: the stream locks to 7.
+	good := &drpc.Frame{}
+	good.SetEpoch(7)
+	good.SetSid(sid)
+	good.SetSeq(1)
+	data, _ := proto.Marshal(echo.EchoResponse_builder{Message: "real"}.Build())
+	good.SetPayload(data)
+	x.NoError(t, conn.Handle(t.Context(), good))
+
+	got := &echo.EchoResponse{}
+	x.NoError(t, stream.RecvMsg(got))
+	x.Equal(t, "real", got.GetMessage())
+
+	// A spoofer (epoch 99) injects a forward-seq data frame on the live sid.
+	// It is dropped: the next legitimate frame from epoch 7 still delivers.
+	evil := &drpc.Frame{}
+	evil.SetEpoch(99)
+	evil.SetSid(sid)
+	evil.SetSeq(2)
+	edata, _ := proto.Marshal(echo.EchoResponse_builder{Message: "spoof"}.Build())
+	evil.SetPayload(edata)
+	x.NoError(t, conn.Handle(t.Context(), evil))
+
+	good2 := &drpc.Frame{}
+	good2.SetEpoch(7)
+	good2.SetSid(sid)
+	good2.SetSeq(2)
+	data2, _ := proto.Marshal(echo.EchoResponse_builder{Message: "real2"}.Build())
+	good2.SetPayload(data2)
+	x.NoError(t, conn.Handle(t.Context(), good2))
+
+	got2 := &echo.EchoResponse{}
+	x.NoError(t, stream.RecvMsg(got2))
+	x.Equal(t, "real2", got2.GetMessage()) // spoof was dropped, not delivered
+}
+
+// ---------------------------------------------------------------------------
+// L8 verification: an OK response that marshals to zero bytes round-trips as a
+// valid empty message, not an Internal error (SetPayload forces presence).
+// ---------------------------------------------------------------------------
+
+func TestChar_EmptyOkResponseRoundTrips(t *testing.T) {
+	client, stop := unreliablePipe(nil, nil).Use(t)
+	defer stop()
+
+	// Noop echoes the request; an all-default request marshals to 0 bytes.
+	res, err := client.Noop(t.Context(), &echo.EchoRequest{})
+	x.NoError(t, err) // not Internal
+	x.Equal(t, "", res.GetMessage())
 }

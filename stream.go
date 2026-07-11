@@ -117,8 +117,10 @@ type clientStream struct {
 	lastProbe atomic.Int64
 
 	// rx sequencing, guarded by rxMu (transport side).
-	rxMu  sync.Mutex
-	rxWin rxWindow
+	rxMu        sync.Mutex
+	rxWin       rxWindow
+	srvEpoch    uint32 // server incarnation this stream is locked to
+	srvEpochSet bool
 
 	rx        chan *Frame
 	rxCfg     rxConfig
@@ -189,7 +191,18 @@ func (s *clientStream) handleRx(f *Frame) {
 	}
 
 	s.rxMu.Lock()
+	if s.srvEpochSet && f.GetEpoch() != s.srvEpoch {
+		// A frame from a different server incarnation (stale straggler after
+		// a restart, or a raw-UDP injection) must not touch this live call.
+		s.rxMu.Unlock()
+		s.rxDropped.Add(1)
+		return
+	}
 	v := s.rxWin.check(f.GetSeq())
+	if v == rxAccept && !s.srvEpochSet {
+		s.srvEpoch = f.GetEpoch()
+		s.srvEpochSet = true
+	}
 	s.rxMu.Unlock()
 
 	switch v {
@@ -655,8 +668,10 @@ type serverStream struct {
 	respSet  bool
 
 	// rx sequencing, guarded by rxMu (transport side).
-	rxMu  sync.Mutex
-	rxWin rxWindow
+	rxMu        sync.Mutex
+	rxWin       rxWindow
+	srvEpoch    uint32 // server incarnation this stream is locked to
+	srvEpochSet bool
 
 	rx        chan *Frame
 	rxCfg     rxConfig
