@@ -48,7 +48,7 @@ subsequence** instead of stalling.
 | Codecs (`grpc.ForceCodecV2`) | ✅ (proto default; JSON etc. via call option) |
 | Client & server deadlines | ✅ propagated on the wire, enforced both ends |
 | Default timeout / liveness so lost frames never hang a call | ✅ core design (see [Guarantees](#guarantees)) |
-| Reliable-mode (timers off over a reliable transport) | ✅ `WithReliable(true)` — the gRPC-over-WebSocket / reliable-datachannel path |
+| Reliable transports: loss machinery off, violations fail loud (`INTERNAL` on a seq gap/duplicate) | ✅ auto-detected per transport / per peer — see [Reliable transports](#reliable-transports) |
 | Per-stream buffering & drop policy (`DropNewest` / `DropOldest`) | ✅ per method / per role |
 | Resource caps (tombstones, live calls, reset maps) | ✅ bounded under a junk flood |
 | Transport adapters: UDP, WebSocket, pion/webrtc | ✅ [`transport/udp`](./transport/udp), [`transport/gorilla`](./transport/gorilla), [`transport/pion`](./transport/pion) |
