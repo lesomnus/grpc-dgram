@@ -667,11 +667,11 @@ type serverStream struct {
 	resp     []byte // captured SendAndClose payload (client-streaming)
 	respSet  bool
 
-	// rx sequencing, guarded by rxMu (transport side).
-	rxMu        sync.Mutex
-	rxWin       rxWindow
-	srvEpoch    uint32 // server incarnation this stream is locked to
-	srvEpochSet bool
+	// rx sequencing, guarded by rxMu (transport side). The server enforces
+	// incarnation isolation structurally — calls are keyed by
+	// (peer, epoch, sid) in the demux — so no per-stream epoch gate here.
+	rxMu  sync.Mutex
+	rxWin rxWindow
 
 	rx        chan *Frame
 	rxCfg     rxConfig
