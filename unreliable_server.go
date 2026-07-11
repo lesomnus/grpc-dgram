@@ -13,14 +13,6 @@ import (
 // peer containers (tombstones, aged watermark, liveness), delayed RESETs,
 // stream probes, and the sweep loop (PROTOCOL.md §9-§10, Appendix C).
 
-// Container resource bounds (PROTOCOL.md §15); option plumbing can follow.
-const (
-	maxTombEntries    = 1024
-	maxTombBytes      = 1 << 20
-	maxDeadContainers = 4
-	maxPendingResets  = 1024
-)
-
 // srvTomb remembers a finished call: its stored terminal frame is replayed
 // (rate-limited) when stragglers or probes hit it (PROTOCOL.md §9.2).
 type srvTomb struct {
@@ -54,6 +46,9 @@ type peerState struct {
 
 	liveCalls int
 	created   time.Time
+
+	maxTombs     int // §15 caps, copied from the Server at creation
+	maxTombBytes int
 
 	lastRx   atomic.Int64 // validated frames only (§9.1)
 	lastTx   atomic.Int64
@@ -95,14 +90,14 @@ func (ps *peerState) addTombLocked(sid uint32, term *Frame, expire time.Time) {
 	ps.tombBytes += size
 
 	// Byte cap: degrade oldest stored terminals to key-only (§9.2, §15).
-	for i := 0; ps.tombBytes > maxTombBytes && i < len(ps.tombOrder); i++ {
+	for i := 0; ps.tombBytes > ps.maxTombBytes && i < len(ps.tombOrder); i++ {
 		if tb := ps.tombs[ps.tombOrder[i]]; tb != nil && tb.term != nil {
 			ps.tombBytes -= tb.size
 			tb.term, tb.size = nil, 0
 		}
 	}
 	// Entry cap: drop oldest entries outright (a §14 residual).
-	for len(ps.tombs) > maxTombEntries && len(ps.tombOrder) > 0 {
+	for len(ps.tombs) > ps.maxTombs && len(ps.tombOrder) > 0 {
 		sid := ps.tombOrder[0]
 		ps.tombOrder = ps.tombOrder[1:]
 		if tb := ps.tombs[sid]; tb != nil {
@@ -153,7 +148,7 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time) *peerState {
 			dead = append(dead, p)
 		}
 	}
-	if len(dead) >= maxDeadContainers {
+	if len(dead) >= s.limits.MaxDeadPeers {
 		oldest := dead[0]
 		for _, p := range dead[1:] {
 			if p.created.Before(oldest.created) {
@@ -168,11 +163,13 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time) *peerState {
 		txCtx = NewPeerContext(txCtx, ek.peer)
 	}
 	ps = &peerState{
-		peer:    ek.peer,
-		epoch:   ek.epoch,
-		txCtx:   txCtx,
-		tombs:   map[uint32]*srvTomb{},
-		created: now,
+		peer:         ek.peer,
+		epoch:        ek.epoch,
+		txCtx:        txCtx,
+		tombs:        map[uint32]*srvTomb{},
+		created:      now,
+		maxTombs:     s.limits.MaxTombstones,
+		maxTombBytes: s.limits.MaxTombstoneBytes,
 	}
 	ps.lastRx.Store(now.UnixNano())
 	ps.lastTx.Store(now.UnixNano())

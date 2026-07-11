@@ -25,9 +25,6 @@ var (
 	_ grpc.ServerTransportStream = serverTransportStream{}
 )
 
-// defaultRxBuffer is the per-stream rx buffer size (PROTOCOL.md §4.2).
-const defaultRxBuffer = 32
-
 // toStatusErr converts err to a gRPC status error, mapping context errors to
 // their canonical codes and honoring a status cause if one was attached via
 // context.CancelCause.
@@ -52,6 +49,30 @@ func toStatusErr(err error) error {
 func ctxErr(ctx context.Context) error {
 	cause := context.Cause(ctx)
 	return toStatusErr(cause)
+}
+
+// enqueueRx delivers f into the per-stream buffer under the configured drop
+// policy (PROTOCOL.md §4.2). DropNewest discards the arrival on a full
+// buffer; DropOldest evicts the oldest to admit it.
+func enqueueRx(rx chan *Frame, f *Frame, policy DropPolicy, dropped *atomic.Uint32) {
+	select {
+	case rx <- f:
+		return
+	default:
+	}
+	if policy == DropOldest {
+		select {
+		case <-rx: // evict one
+			dropped.Add(1)
+		default:
+		}
+		select {
+		case rx <- f:
+			return
+		default:
+		}
+	}
+	dropped.Add(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +121,7 @@ type clientStream struct {
 	rxWin rxWindow
 
 	rx        chan *Frame
+	rxCfg     rxConfig
 	rxDropped atomic.Uint32
 
 	// header/trailer state, guarded by stMu.
@@ -119,6 +141,7 @@ type clientStream struct {
 }
 
 func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, clientStreams, serverStreams bool) *clientStream {
+	rxCfg := c.rx.withDefaults()
 	s := &clientStream{
 		conn: c,
 		sid:  sid,
@@ -130,7 +153,8 @@ func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, cl
 		codec:     defaultCodec,
 		callerCtx: ctx,
 
-		rx:       make(chan *Frame, defaultRxBuffer),
+		rx:       make(chan *Frame, rxCfg.size),
+		rxCfg:    rxCfg,
 		hdrReady: make(chan struct{}),
 		done:     make(chan struct{}),
 	}
@@ -206,11 +230,7 @@ func (s *clientStream) handleRx(f *Frame) {
 			return
 		}
 		s.latchHeader(f)
-		select {
-		case s.rx <- f:
-		default:
-			s.rxDropped.Add(1)
-		}
+		enqueueRx(s.rx, f, s.rxCfg.policy, &s.rxDropped)
 	default:
 		s.rxDropped.Add(1)
 	}
@@ -632,19 +652,21 @@ type serverStream struct {
 	rxWin rxWindow
 
 	rx        chan *Frame
+	rxCfg     rxConfig
 	rxDropped atomic.Uint32
 	eofOnce   sync.Once
 	rxEOF     chan struct{}
 }
 
-func newServerStream(ctx context.Context, srv *Server, key callKey, desc *serviceDesc, codec encoding.CodecV2) *serverStream {
+func newServerStream(ctx context.Context, srv *Server, key callKey, desc *serviceDesc, codec encoding.CodecV2, rxCfg rxConfig) *serverStream {
 	s := &serverStream{
 		server: srv,
 		key:    key,
 		desc:   desc,
 		codec:  codec,
 
-		rx:    make(chan *Frame, defaultRxBuffer),
+		rx:    make(chan *Frame, rxCfg.size),
+		rxCfg: rxCfg,
 		rxEOF: make(chan struct{}),
 	}
 	s.rxWin.l = 1 // the accepted OPEN
@@ -702,11 +724,7 @@ func (s *serverStream) handleRx(f *Frame) {
 			s.rxDropped.Add(1)
 			return
 		}
-		select {
-		case s.rx <- f:
-		default:
-			s.rxDropped.Add(1)
-		}
+		enqueueRx(s.rx, f, s.rxCfg.policy, &s.rxDropped)
 	default:
 		s.rxDropped.Add(1)
 	}

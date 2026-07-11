@@ -36,6 +36,9 @@ type Server struct {
 	mode  mode
 
 	maxHandlerTimeout time.Duration
+	rx                rxConfig
+	methodRx          map[string]rxConfig
+	limits            Limits
 
 	root       context.Context
 	rootCancel context.CancelCauseFunc
@@ -72,6 +75,9 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 		mode:  resolveMode(tx, opt.reliable, opt.timing),
 
 		maxHandlerTimeout: opt.maxHandlerTimeout,
+		rx:                opt.rx.withDefaults(),
+		methodRx:          opt.methodRx,
+		limits:            opt.limits.withDefaults(),
 
 		calls:         map[callKey]*serverStream{},
 		peers:         map[epochKey]*peerState{},
@@ -232,7 +238,7 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 		s.mu.Unlock()
 		return s.sendReset(ctx, key, f)
 	}
-	if _, ok := s.pendingResets[key]; !ok && len(s.pendingResets) < maxPendingResets {
+	if _, ok := s.pendingResets[key]; !ok && len(s.pendingResets) < s.limits.MaxPendingResets {
 		s.pendingResets[key] = &pendingReset{
 			due:  now.Add(s.mode.timing.Hold),
 			echo: f.GetEpoch(),
@@ -254,7 +260,7 @@ func (s *Server) sendReset(ctx context.Context, key callKey, f *Frame) error {
 				s.mu.Unlock()
 				return nil
 			}
-		} else if len(s.resetAt) >= maxPendingResets {
+		} else if len(s.resetAt) >= s.limits.MaxPendingResets {
 			// Bounded: drop rather than grow (anti-amplification, §15).
 			s.mu.Unlock()
 			return nil
@@ -327,7 +333,11 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		}
 	}
 
-	st := newServerStream(sctx, s, key, desc, codec)
+	rxCfg := s.rx
+	if c, ok := s.methodRx[desc.fullname]; ok {
+		rxCfg = c
+	}
+	st := newServerStream(sctx, s, key, desc, codec, rxCfg.withDefaults())
 	st.cancelTimeout = cancelTimeout
 
 	var transport *serverTransportUnary
@@ -612,6 +622,9 @@ type serverOption struct {
 	reliable          *bool
 	timing            Timing
 	maxHandlerTimeout time.Duration
+	rx                rxConfig
+	methodRx          map[string]rxConfig
+	limits            Limits
 }
 
 type serverOptionFunc func(*serverOption)

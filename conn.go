@@ -23,9 +23,11 @@ type learnedIndex struct {
 
 type Conn struct {
 	// epoch is this Conn incarnation's nonce (PROTOCOL.md §6.1).
-	epoch uint32
-	tx    FrameHandler
-	mode  mode
+	epoch  uint32
+	tx     FrameHandler
+	mode   mode
+	rx     rxConfig
+	limits Limits
 
 	mu        sync.Mutex
 	ss        map[uint32]*clientStream
@@ -57,10 +59,12 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 	}
 
 	v := &Conn{
-		epoch: rand.Uint32(),
-		tx:    tx,
-		mode:  resolveMode(tx, opt.reliable, opt.timing),
-		ss:    map[uint32]*clientStream{},
+		epoch:  rand.Uint32(),
+		tx:     tx,
+		mode:   resolveMode(tx, opt.reliable, opt.timing),
+		rx:     opt.rx.withDefaults(),
+		limits: opt.limits.withDefaults(),
+		ss:     map[uint32]*clientStream{},
 
 		tombs:   map[uint32]*clientTomb{},
 		resetAt: map[uint32]int64{},
@@ -306,6 +310,8 @@ type connOption struct {
 
 	reliable *bool
 	timing   Timing
+	rx       rxConfig
+	limits   Limits
 }
 
 type ConnOption interface {

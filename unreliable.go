@@ -189,7 +189,7 @@ func (c *Conn) sendReset(ctx context.Context, f *Frame) error {
 				c.mu.Unlock()
 				return nil
 			}
-		} else if len(c.resetAt) >= maxPendingResets {
+		} else if len(c.resetAt) >= c.limits.MaxPendingResets {
 			// Bounded: drop rather than grow (anti-amplification, §15).
 			c.mu.Unlock()
 			return nil
