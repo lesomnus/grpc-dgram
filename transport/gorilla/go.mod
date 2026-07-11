@@ -1,4 +1,4 @@
-module github.com/lesomnus/grpc-dgram/transport/ws
+module github.com/lesomnus/grpc-dgram/transport/gorilla
 
 go 1.26.1
 

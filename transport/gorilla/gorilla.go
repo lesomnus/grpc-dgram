@@ -1,4 +1,4 @@
-// Package ws runs drpc over WebSocket: one binary message carries one
+// Package gorilla runs drpc over WebSocket: one binary message carries one
 // marshaled Envelop. The channel is reliable and ordered, so the core runs
 // in reliable mode with every protocol timer and retransmission off
 // (PROTOCOL.md §10.6) — leaving this adapter the two duties the protocol no
@@ -21,7 +21,7 @@
 //
 // A ws:// wire is plaintext. Deploy wss:// (TLS) or stay on a trusted
 // network — see PROTOCOL.md §15.
-package ws
+package gorilla
 
 import (
 	"context"
@@ -98,7 +98,7 @@ func marshal(e *drpc.Envelop, limit int) ([]byte, error) {
 		return nil, err
 	}
 	if limit > 0 && len(data) > limit {
-		return nil, fmt.Errorf("ws: %d-byte envelop over the %d-byte limit: %w",
+		return nil, fmt.Errorf("gorilla: %d-byte envelop over the %d-byte limit: %w",
 			len(data), limit, drpc.ErrMessageTooLarge)
 	}
 	return data, nil
@@ -245,7 +245,7 @@ func New(c *websocket.Conn, opts ...Option) *Transport {
 // needs no peer key (PROTOCOL.md §6.4).
 func (t *Transport) AttachConn(conn *drpc.Conn) {
 	if !t.attached.CompareAndSwap(false, true) {
-		panic("ws: transport already attached to a Conn")
+		panic("gorilla: transport already attached to a Conn")
 	}
 	go func() {
 		err := serve(t.ctx, t.s.c, t.o, t.ctx, conn)
@@ -322,17 +322,17 @@ func (g *Gateway) Handle(ctx context.Context, f *drpc.Frame) error {
 func (g *Gateway) Send(ctx context.Context, e *drpc.Envelop) error {
 	key, ok := drpc.PeerFromContext(ctx)
 	if !ok {
-		return errors.New("ws: no peer in context")
+		return errors.New("gorilla: no peer in context")
 	}
 	k, ok := key.(peerKey)
 	if !ok {
-		return fmt.Errorf("ws: foreign peer key %T", key)
+		return fmt.Errorf("gorilla: foreign peer key %T", key)
 	}
 	g.mu.Lock()
 	s := g.peers[k]
 	g.mu.Unlock()
 	if s == nil {
-		return fmt.Errorf("ws: peer %d is disconnected", k)
+		return fmt.Errorf("gorilla: peer %d is disconnected", k)
 	}
 	data, err := marshal(e, g.o.maxMessageSize)
 	if err != nil {

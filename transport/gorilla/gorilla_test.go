@@ -1,4 +1,4 @@
-package ws_test
+package gorilla_test
 
 // Real-socket end-to-end: generated gRPC stubs over loopback WebSockets
 // (httptest + gorilla Upgrader). These are real timers and real TCP, not
@@ -26,7 +26,7 @@ import (
 	"github.com/gorilla/websocket"
 	drpc "github.com/lesomnus/grpc-dgram"
 	"github.com/lesomnus/grpc-dgram/internal/echo"
-	"github.com/lesomnus/grpc-dgram/transport/ws"
+	"github.com/lesomnus/grpc-dgram/transport/gorilla"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -36,10 +36,10 @@ type testServer struct {
 	srv *drpc.Server
 }
 
-func serveEcho(t *testing.T, opts ...ws.Option) *testServer {
+func serveEcho(t *testing.T, opts ...gorilla.Option) *testServer {
 	t.Helper()
 
-	gw := ws.NewGateway(opts...)
+	gw := gorilla.NewGateway(opts...)
 	srv := drpc.NewServer(gw)
 	echo.RegisterEchoServiceServer(srv, &echo.EchoServer{})
 
@@ -72,10 +72,10 @@ func serveEcho(t *testing.T, opts ...ws.Option) *testServer {
 
 type testClient struct {
 	echo.EchoServiceClient
-	ws *websocket.Conn
+	sock *websocket.Conn
 }
 
-func (s *testServer) dial(t *testing.T, opts ...ws.Option) *testClient {
+func (s *testServer) dial(t *testing.T, opts ...gorilla.Option) *testClient {
 	t.Helper()
 
 	c, _, err := websocket.DefaultDialer.Dial(s.url, nil)
@@ -85,11 +85,11 @@ func (s *testServer) dial(t *testing.T, opts ...ws.Option) *testClient {
 	// drpc.NewConn discovers the transport: reliable mode via TransportInfo
 	// and the receive pump via ConnAttacher — no goroutine here, and Close
 	// tears the socket down too.
-	conn := drpc.NewConn(ws.New(c, opts...))
+	conn := drpc.NewConn(gorilla.New(c, opts...))
 	t.Cleanup(func() { conn.Close(nil) })
 	return &testClient{
 		EchoServiceClient: echo.NewEchoServiceClient(conn),
-		ws:                c,
+		sock:              c,
 	}
 }
 
@@ -199,7 +199,7 @@ func TestLargeMessage(t *testing.T) {
 // drpc.ErrMessageTooLarge, which the core maps to ResourceExhausted on the
 // owning call — without disturbing the connection.
 func TestMaxMessageSize(t *testing.T) {
-	client := serveEcho(t).dial(t, ws.WithMaxMessageSize(1024))
+	client := serveEcho(t).dial(t, gorilla.WithMaxMessageSize(1024))
 
 	_, err := client.Once(t.Context(), echo.EchoRequest_builder{
 		Message: strings.Repeat("x", 2048),
@@ -248,7 +248,7 @@ func TestTransportDeath(t *testing.T) {
 		recvErr <- err
 	}()
 
-	client.ws.UnderlyingConn().Close() // hard TCP close, no close handshake
+	client.sock.UnderlyingConn().Close() // hard TCP close, no close handshake
 
 	select {
 	case err := <-recvErr:
@@ -314,7 +314,7 @@ func TestPeerIsolation(t *testing.T) {
 // A peer that never reads answers no pings (gorilla replies to pings only
 // from within a read), so the gateway must declare it dead by keepalive.
 func TestKeepaliveDeath(t *testing.T) {
-	gw := ws.NewGateway(ws.WithKeepalive(50*time.Millisecond, 250*time.Millisecond))
+	gw := gorilla.NewGateway(gorilla.WithKeepalive(50*time.Millisecond, 250*time.Millisecond))
 	srv := drpc.NewServer(gw)
 	echo.RegisterEchoServiceServer(srv, &echo.EchoServer{})
 	defer srv.Stop()

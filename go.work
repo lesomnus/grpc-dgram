@@ -3,5 +3,5 @@ go 1.26.1
 use (
 	.
 	./transport/pion
-	./transport/ws
+	./transport/gorilla
 )

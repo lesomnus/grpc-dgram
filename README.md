@@ -51,7 +51,7 @@ subsequence** instead of stalling.
 | Reliable-mode (timers off over a reliable transport) | ✅ `WithReliable(true)` — the gRPC-over-WebSocket / reliable-datachannel path |
 | Per-stream buffering & drop policy (`DropNewest` / `DropOldest`) | ✅ per method / per role |
 | Resource caps (tombstones, live calls, reset maps) | ✅ bounded under a junk flood |
-| Transport adapters: UDP, WebSocket, pion/webrtc | ✅ [`transport/udp`](./transport/udp), [`transport/ws`](./transport/ws), [`transport/pion`](./transport/pion) |
+| Transport adapters: UDP, WebSocket, pion/webrtc | ✅ [`transport/udp`](./transport/udp), [`transport/gorilla`](./transport/gorilla), [`transport/pion`](./transport/pion) |
 | Stats handler, browser JS/TS port | ⬜ planned |
 
 ## Install
@@ -94,13 +94,13 @@ for {
 ```
 
 Three adapters ship. `transport/udp` is part of the core module (stdlib only);
-`transport/ws` (gorilla/websocket) and `transport/pion` (pion/webrtc) live in
+`transport/gorilla` (gorilla/websocket) and `transport/pion` (pion/webrtc) live in
 their own Go modules so importing the core never pulls their dependencies.
 
 | | transport | mode | client | server |
 |---|---|---|---|---|
 | [`transport/udp`](./transport/udp) | UDP socket | unreliable | `udp.New(conn)` | `udp.NewGateway(pc)` + `Serve` |
-| [`transport/ws`](./transport/ws) | WebSocket | reliable | `ws.New(wsc)` | `ws.NewGateway()` + `ServePeer` |
+| [`transport/gorilla`](./transport/gorilla) | WebSocket | reliable | `gorilla.New(wsc)` | `gorilla.NewGateway()` + `ServePeer` |
 | [`transport/pion`](./transport/pion) | WebRTC DataChannel | **derived from the channel config** | `pion.New(dc)` | `pion.NewGateway()` + `Bind`+`ServePeer` |
 
 Clients are gRPC-shaped: `drpc.NewConn(tp)` attaches the transport and its
@@ -124,7 +124,7 @@ Over a reliable, ordered transport, timers and retransmission are off,
 delivery is the exact sequence, and any gap or duplicate is surfaced as
 `INTERNAL` (a broken "reliable" transport). This is the path to **plain
 gRPC-over-WebSocket / reliable-datachannel** semantics, and it is
-auto-detected: `transport/ws` always advertises reliable, and `transport/pion`
+auto-detected: `transport/gorilla` always advertises reliable, and `transport/pion`
 derives it from the data-channel configuration (ordered, no
 retransmit/lifetime cap) — a client `pion.New` always, a server
 `pion.Gateway` from its first channel when one is bound before

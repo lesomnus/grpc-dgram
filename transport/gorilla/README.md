@@ -1,4 +1,4 @@
-# transport/ws
+# transport/gorilla
 
 drpc over WebSocket ([gorilla/websocket](https://github.com/gorilla/websocket)):
 **one binary message carries one marshaled `Envelop`**. The transport is
@@ -8,7 +8,7 @@ every protocol timer off — plain gRPC semantics over a WebSocket.
 Its own Go module: importing the core never pulls gorilla.
 
 ```go
-import "github.com/lesomnus/grpc-dgram/transport/ws"
+import "github.com/lesomnus/grpc-dgram/transport/gorilla"
 ```
 
 ## Server
@@ -16,7 +16,7 @@ import "github.com/lesomnus/grpc-dgram/transport/ws"
 One `Gateway` serves many WebSocket connections, one peer each.
 
 ```go
-gw := ws.NewGateway()
+gw := gorilla.NewGateway()
 srv := drpc.NewServer(gw)
 pb.RegisterEchoServiceServer(srv, &myHandler{})
 
@@ -42,7 +42,7 @@ transport owns the WebSocket from then on.
 c, _, err := websocket.DefaultDialer.DialContext(ctx, "wss://host/rpc", nil)
 if err != nil { ... }
 
-conn := drpc.NewConn(ws.New(c)) // reliable mode auto-detected via TransportInfo
+conn := drpc.NewConn(gorilla.New(c)) // reliable mode auto-detected via TransportInfo
 client := pb.NewEchoServiceClient(conn)
 
 // shutdown — one call closes the conn, the transport, and the socket:
