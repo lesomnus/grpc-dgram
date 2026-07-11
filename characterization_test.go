@@ -154,14 +154,15 @@ func TestChar_InjectionMatrix(t *testing.T) {
 		r := is.recv(t)
 		x.True(t, r != nil && r.GetFlags() == drpc.FlagReset, "seq!=1 OPEN must not create a call")
 	})
-	t.Run("OPEN with out-of-range method_index -> UNIMPLEMENTED terminal", func(t *testing.T) {
+	t.Run("OPEN with no method -> UNIMPLEMENTED terminal", func(t *testing.T) {
+		// Methods are addressed by string, always (PROTOCOL.md §13); an OPEN
+		// without one cannot dispatch and is rejected loud, not dropped.
 		is := newInjectServer(t)
 		f := &drpc.Frame{}
 		f.SetEpoch(1)
 		f.SetSid(6)
 		f.SetSeq(1)
 		f.SetFlags(drpc.FlagOpen | drpc.FlagClose)
-		f.SetMethodIndex(1 << 20)
 		f.SetPayload([]byte{})
 		is.handle(f)
 		r := is.recv(t)

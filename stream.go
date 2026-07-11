@@ -3,7 +3,6 @@ package drpc
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -89,7 +88,6 @@ type clientStream struct {
 	sid  uint32
 
 	method        string
-	methodIndex   uint32 // learned index snapshotted at stream creation; 0 = send the string
 	clientStreams bool
 	serverStreams bool
 
@@ -168,11 +166,6 @@ func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, cl
 	if md, ok := metadata.FromOutgoingContext(ctx); ok {
 		s.openHdr = md
 	}
-	if v, ok := c.methods.Load(method); ok {
-		if li := v.(learnedIndex); li.epoch == c.serverEpoch.Load() {
-			s.methodIndex = li.index
-		}
-	}
 	s.rxWin.strict = c.mode.reliable
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
@@ -234,9 +227,6 @@ func (s *clientStream) handleRx(f *Frame) {
 	}
 	s.noteValidatedRx()
 
-	// Accepted: epoch tracking and method-index learning (PROTOCOL.md §13).
-	s.conn.noteServerFrame(f, s.method)
-
 	switch {
 	case f.isTerminal():
 		s.latchHeader(f)
@@ -282,11 +272,7 @@ func (s *clientStream) openFrame() *Frame {
 	f.SetSid(s.sid)
 	f.SetSeq(s.txSeq.next()) // 1
 	f.SetFlags(FlagOpen)
-	if s.methodIndex > 0 {
-		f.SetMethodIndex(s.methodIndex)
-	} else {
-		f.SetMethod(s.method)
-	}
+	f.SetMethod(s.method)
 	if s.codecName != "" {
 		f.SetCodec(s.codecName)
 	}
@@ -851,7 +837,6 @@ func (s *serverStream) nextFrameLocked() *Frame {
 	f.SetEpoch(s.server.epoch)
 	f.SetSid(s.key.sid)
 	f.SetSeq(s.txSeq.next())
-	f.SetMethodIndex(s.desc.index)
 	return f
 }
 
@@ -991,7 +976,6 @@ func (s *serverStream) terminalFrame(err error) *Frame {
 // serviceDesc describes one registered method (PROTOCOL.md §13: indices are
 // 1-based in registration order; 0 means unset).
 type serviceDesc struct {
-	index    uint32
 	fullname string
 
 	service *grpc.ServiceDesc
@@ -1004,5 +988,5 @@ type serviceDesc struct {
 func (d *serviceDesc) IsUnary() bool { return d.method != nil }
 
 func (d *serviceDesc) String() string {
-	return fmt.Sprintf("%s#%d", d.fullname, d.index)
+	return d.fullname
 }

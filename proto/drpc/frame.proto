@@ -31,12 +31,15 @@ message Frame {
   // Flag bitmask; see message comment.
   uint32 flags = 4;
 
-  // Full method name (e.g. "/echo.EchoService/Once"); OPEN frames only.
+  // Full method name (e.g. "/echo.EchoService/Once"); OPEN frames only,
+  // where it MUST be present — methods are addressed by string, always.
   string method = 5;
 
-  // 1-based method index in server registration order; 0 = unset.
-  // Servers attach it to every frame they send (the learning channel).
-  uint32 method_index = 6;
+  // Field 6 carried a learned method index; removed pre-release (a stale
+  // index could silently dispatch the wrong method across a different-build
+  // server restart, and the savings were negligible for stream workloads).
+  reserved 6;
+  reserved method_index;
 
   // Codec name; OPEN frames only; "" means proto.
   string codec = 7;

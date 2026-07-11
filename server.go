@@ -56,7 +56,6 @@ type Server struct {
 	// serving flips on the first Handle; the registry is immutable after
 	// that (PROTOCOL.md §13).
 	serving  atomic.Bool
-	methods  []*serviceDesc // 1-based: methods[i-1] has index i
 	services map[string]*serviceDesc
 
 	unary_int  grpc.UnaryServerInterceptor
@@ -85,7 +84,6 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 		pendingResets: map[callKey]*pendingReset{},
 		resetAt:       map[callKey]int64{},
 
-		methods:  []*serviceDesc{},
 		services: map[string]*serviceDesc{},
 	}
 	v.root, v.rootCancel = context.WithCancelCause(context.Background())
@@ -114,12 +112,7 @@ func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
 	register := func(fullname string) *serviceDesc {
 		d, ok := s.services[fullname]
 		if !ok {
-			s.methods = append(s.methods, nil)
-			d = &serviceDesc{
-				index:    uint32(len(s.methods)), // 1-based (PROTOCOL.md §13)
-				fullname: fullname,
-			}
-			s.methods[d.index-1] = d
+			d = &serviceDesc{fullname: fullname}
 			s.services[fullname] = d
 		}
 		return d
@@ -296,20 +289,14 @@ func (s *Server) resetByPeerSid(peer any, sid uint32) {
 }
 
 func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
-	var desc *serviceDesc
-	if i := f.GetMethodIndex(); i > 0 {
-		if uint64(i) <= uint64(len(s.methods)) { // 32-bit-safe bounds check
-			desc = s.methods[i-1]
-		}
-	} else if m := f.GetMethod(); m != "" {
-		desc = s.services[m]
-	}
+	// Methods are addressed by full name, always (PROTOCOL.md §13).
+	desc := s.services[f.GetMethod()]
 	if desc == nil {
-		return s.rejectOpen(ctx, f, 0, codes.Unimplemented, "method not found")
+		return s.rejectOpen(ctx, f, codes.Unimplemented, "method not found")
 	}
 	codec := f.getCodec()
 	if codec == nil {
-		return s.rejectOpen(ctx, f, desc.index, codes.Unimplemented, "unsupported codec: %s", f.GetCodec())
+		return s.rejectOpen(ctx, f, codes.Unimplemented, "unsupported codec: %s", f.GetCodec())
 	}
 
 	// The handler ctx derives from the Server root — never from the
@@ -385,7 +372,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		// single peer's valid-method OPEN flood spawn unbounded handlers.
 		s.mu.Unlock()
 		release()
-		return s.rejectOpen(ctx, f, desc.index, codes.ResourceExhausted, "too many concurrent calls")
+		return s.rejectOpen(ctx, f, codes.ResourceExhausted, "too many concurrent calls")
 	}
 	s.calls[key] = st
 	if ps.hwm < key.sid {
@@ -433,7 +420,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 // rejectOpen answers an OPEN that cannot start a call with a terminal frame,
 // tombstone-stored so duplicates elicit a rate-limited replay instead of a
 // fresh answer each (PROTOCOL.md §9.4).
-func (s *Server) rejectOpen(ctx context.Context, f *Frame, idx uint32, code codes.Code, msg string, args ...any) error {
+func (s *Server) rejectOpen(ctx context.Context, f *Frame, code codes.Code, msg string, args ...any) error {
 	t := &Frame{}
 	t.SetEpoch(s.epoch)
 	t.SetSid(f.GetSid())
@@ -441,9 +428,6 @@ func (s *Server) rejectOpen(ctx context.Context, f *Frame, idx uint32, code code
 	t.SetFlags(FlagClose)
 	t.SetCode(uint32(code))
 	t.SetDesc(fmt.Sprintf(msg, args...))
-	if idx > 0 {
-		t.SetMethodIndex(idx)
-	}
 
 	if !s.mode.reliable {
 		peer, _ := PeerFromContext(ctx)

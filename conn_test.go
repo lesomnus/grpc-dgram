@@ -51,7 +51,10 @@ func TestConn(t *testing.T) {
 		x.NoError(t, err)
 		x.Equal(t, msg, res.GetMessage())
 	})
-	t.Run("index learning", func(t *testing.T) {
+	t.Run("every OPEN carries the method string", func(t *testing.T) {
+		// Methods are addressed by string, always (PROTOCOL.md §13): repeat
+		// calls must not switch to any learned shorthand — a restarted,
+		// differently-built server must never mis-dispatch an OPEN.
 		ctx := t.Context()
 
 		data, err := proto.Marshal(&echo.EchoResponse{})
@@ -65,10 +68,7 @@ func TestConn(t *testing.T) {
 		var conn *drpc.Conn
 		conn = drpc.NewConn(drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
 			frame_in = f
-			// The server teaches its method index on every frame it sends
-			// (PROTOCOL.md §13); indices are valid per server epoch.
 			res := terminalFor(f, 7, data)
-			res.SetMethodIndex(42)
 			wg.Go(func() {
 				err := conn.Handle(t.Context(), res)
 				x.NoError(t, err)
@@ -78,15 +78,11 @@ func TestConn(t *testing.T) {
 
 		req := &echo.EchoRequest{}
 		res := &echo.EchoResponse{}
-		err = conn.Invoke(ctx, echo.EchoService_Once_FullMethodName, req, res)
-		x.NoError(t, err)
-		x.Equal(t, echo.EchoService_Once_FullMethodName, frame_in.GetMethod())
-		x.Equal(t, 0, frame_in.GetMethodIndex())
-
-		err = conn.Invoke(ctx, echo.EchoService_Once_FullMethodName, req, res)
-		x.NoError(t, err)
-		x.Equal(t, "", frame_in.GetMethod())
-		x.Equal(t, 42, frame_in.GetMethodIndex())
+		for range 2 {
+			err = conn.Invoke(ctx, echo.EchoService_Once_FullMethodName, req, res)
+			x.NoError(t, err)
+			x.Equal(t, echo.EchoService_Once_FullMethodName, frame_in.GetMethod())
+		}
 	})
 	t.Run("delayed response", func(t *testing.T) {
 		ctx := t.Context()

@@ -14,13 +14,6 @@ import (
 
 var _ grpc.ClientConnInterface = &Conn{}
 
-// learnedIndex is a method index learned from a server, valid only for the
-// epoch it was learned under (PROTOCOL.md §13).
-type learnedIndex struct {
-	epoch uint32
-	index uint32
-}
-
 type Conn struct {
 	// epoch is this Conn incarnation's nonce (PROTOCOL.md §6.1).
 	epoch  uint32
@@ -41,11 +34,6 @@ type Conn struct {
 	lastTx   atomic.Int64
 	lastPing atomic.Int64
 	sw       sweeper
-
-	// serverEpoch tracks the peer incarnation; learned method indices are
-	// keyed by it (PROTOCOL.md §6.1, §13).
-	serverEpoch atomic.Uint32
-	methods     sync.Map // string -> learnedIndex
 
 	call_opts  []grpc.CallOption
 	unary_int  grpc.UnaryClientInterceptor
@@ -171,23 +159,6 @@ func (c *Conn) lookup(sid uint32) *clientStream {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.ss[sid]
-}
-
-// noteServerFrame runs for every frame accepted by a live stream: it tracks
-// the server epoch (flushing learned indices on change) and learns method
-// indices (PROTOCOL.md §6.1, §13).
-func (c *Conn) noteServerFrame(f *Frame, method string) {
-	e := f.GetEpoch()
-	if c.serverEpoch.Load() != e {
-		c.serverEpoch.Store(e)
-		c.methods.Range(func(k, _ any) bool {
-			c.methods.Delete(k)
-			return true
-		})
-	}
-	if idx := f.GetMethodIndex(); idx > 0 {
-		c.methods.Store(method, learnedIndex{epoch: e, index: idx})
-	}
 }
 
 func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...grpc.CallOption) error {

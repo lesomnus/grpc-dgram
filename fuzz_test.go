@@ -65,12 +65,11 @@ func seed(f *testing.F) {
 		b.SetFlags(drpc.FlagOpen | drpc.FlagClose)
 		b.SetMethod(echo.EchoService_Once_FullMethodName)
 	}))
-	f.Add(mk(func(b *drpc.Frame) { // OPEN by out-of-range index
+	f.Add(mk(func(b *drpc.Frame) { // OPEN with no method
 		b.SetEpoch(2)
 		b.SetSid(7)
 		b.SetSeq(1)
 		b.SetFlags(drpc.FlagOpen)
-		b.SetMethodIndex(1 << 20)
 	}))
 	f.Add(mk(func(b *drpc.Frame) { // stray RESET
 		b.SetEpoch(3)
