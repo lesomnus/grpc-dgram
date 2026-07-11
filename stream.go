@@ -379,7 +379,23 @@ func (s *clientStream) send(m any) error {
 
 	// Transmit outside txMu: a blocking adapter must not stall the whole
 	// Conn through retire()'s c.mu -> txMu ordering.
-	return s.transmit(s.ctx, f)
+	if err := s.transmit(s.ctx, f); err != nil {
+		s.undoRefused(f, err)
+		return err
+	}
+	return nil
+}
+
+// undoRefused reclaims f's seq when the adapter refused the send
+// synchronously — the frame never reached the wire, so the next frame (the
+// abort, or a later message) must reuse the number (see txSeq.undo).
+func (s *clientStream) undoRefused(f *Frame, err error) {
+	if !errors.Is(err, ErrMessageTooLarge) {
+		return
+	}
+	s.txMu.Lock()
+	s.txSeq.undo(f.GetSeq())
+	s.txMu.Unlock()
 }
 
 func (s *clientStream) SendMsg(m any) error {
@@ -860,7 +876,11 @@ func (s *serverStream) SendHeader(md metadata.MD) error {
 	f := s.nextFrameLocked()
 	s.attachHeaderLocked(f)
 	s.txMu.Unlock()
-	return s.transmit(s.ctx, f)
+	if err := s.transmit(s.ctx, f); err != nil {
+		s.undoRefused(f, err)
+		return err
+	}
+	return nil
 }
 
 func (s *serverStream) SetTrailer(md metadata.MD) {
@@ -901,7 +921,24 @@ func (s *serverStream) SendMsg(m any) error {
 		// grpc-go returns the status describing why the stream ended.
 		return ctxErr(s.ctx)
 	}
-	return s.transmit(s.ctx, f)
+	if err := s.transmit(s.ctx, f); err != nil {
+		// A synchronous adapter refusal reclaims the seq so the terminal
+		// carrying the handler's real status stays gap-free (see txSeq.undo).
+		s.undoRefused(f, err)
+		return err
+	}
+	return nil
+}
+
+// undoRefused reclaims f's seq when the adapter refused the send
+// synchronously — the frame never reached the wire (see txSeq.undo).
+func (s *serverStream) undoRefused(f *Frame, err error) {
+	if !errors.Is(err, ErrMessageTooLarge) {
+		return
+	}
+	s.txMu.Lock()
+	s.txSeq.undo(f.GetSeq())
+	s.txMu.Unlock()
 }
 
 func (s *serverStream) RecvMsg(m any) error {

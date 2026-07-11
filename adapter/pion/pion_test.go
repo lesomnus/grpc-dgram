@@ -195,6 +195,63 @@ func serveUnreliable(t *testing.T) *ends {
 	return &ends{client: echo.NewEchoServiceClient(conn), tp: tp, gw: gw, srv: srv}
 }
 
+// The common answerer-server flow: the server is built before any channel
+// exists, so the gateway latches unreliable — which must still serve a
+// default-config (reliable) channel, merely with redundant timers. This is
+// the ordering shown in Bind's own OnDataChannel example.
+func TestAnswererServerServesReliableChannel(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+
+	gw := pion.NewGateway()
+	srv := drpc.NewServer(gw, drpc.WithTiming(timing)) // latches unreliable
+	echo.RegisterEchoServiceServer(srv, &echo.EchoServer{})
+
+	var tp *pion.Transport
+	served := make(chan error, 1)
+	dial(t, nil, // default config: a reliable channel
+		func(dc *webrtc.DataChannel) {
+			tp = pion.New(dc)
+		},
+		func(dc *webrtc.DataChannel) {
+			gw.Bind(dc)
+			go func() { served <- gw.ServePeer(ctx, srv, dc) }()
+		},
+	)
+
+	conn := drpc.NewConn(tp, drpc.WithTiming(timing))
+	cdone := make(chan struct{})
+	go func() {
+		defer close(cdone)
+		tp.ServeConn(ctx, conn)
+	}()
+	t.Cleanup(func() {
+		srv.Stop()
+		conn.Close(nil)
+		cancel()
+		<-cdone
+	})
+
+	res, err := conn2client(conn).Once(t.Context(), echo.EchoRequest_builder{
+		Message:       "abc",
+		CircularShift: 1,
+	}.Build())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.GetMessage(); got != "bca" {
+		t.Fatalf("got %q, want %q", got, "bca")
+	}
+	select {
+	case err := <-served:
+		t.Fatalf("ServePeer refused the reliable channel: %v", err)
+	default:
+	}
+}
+
+func conn2client(conn *drpc.Conn) echo.EchoServiceClient {
+	return echo.NewEchoServiceClient(conn)
+}
+
 func TestReliableEcho(t *testing.T) {
 	e := serveReliable(t)
 

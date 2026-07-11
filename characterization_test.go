@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -519,6 +520,34 @@ func TestChar_AdapterRefusesTooLargeSend(t *testing.T) {
 		err = stream.Send(echo.EchoRequest_builder{
 			Message: "far larger than eight bytes",
 		}.Build())
+		x.Equal(t, codes.ResourceExhausted, status.Code(err))
+	})
+	t.Run("server-side refusal surfaces the handler's status, not INTERNAL", func(t *testing.T) {
+		// A refused frame must not burn its seq: in reliable mode the strict
+		// window would then reject the terminal carrying the real status and
+		// fail the call with INTERNAL "lost or reordered a frame" instead.
+		var conn *drpc.Conn
+		srv := drpc.NewServer(drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
+			if len(f.GetPayload()) > 64 {
+				return fmt.Errorf("refused %d bytes: %w", len(f.GetPayload()), drpc.ErrMessageTooLarge)
+			}
+			return conn.Handle(ctx, f)
+		}), drpc.WithReliable(true))
+		defer srv.Stop()
+		echo.RegisterEchoServiceServer(srv, &echo.EchoServer{})
+		conn = drpc.NewConn(drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
+			return srv.Handle(ctx, f)
+		}), drpc.WithReliable(true))
+		defer conn.Close(nil)
+		client := echo.NewEchoServiceClient(conn)
+
+		// The response mirrors the 100-byte request: over the server's limit.
+		stream, err := client.Many(t.Context(), echo.EchoRequest_builder{
+			Message: strings.Repeat("x", 100),
+			Repeat:  1,
+		}.Build())
+		x.NoError(t, err)
+		_, err = stream.Recv()
 		x.Equal(t, codes.ResourceExhausted, status.Code(err))
 	})
 }

@@ -42,6 +42,12 @@ func (f EnvelopHandlerFunc) Handle(ctx context.Context, e *Envelop) error {
 
 // Wrap1 adapts an EnvelopHandler to a FrameHandler by wrapping each frame in
 // a single-frame envelop (the no-batching default).
+//
+// The returned handler re-exposes nothing: if h also implements
+// TransportInfo, the wrapper hides it from NewConn/NewServer discovery
+// (PROTOCOL.md §3). Adapters should implement FrameHandler and TransportInfo
+// on one type instead — as the shipped adapters do — or pass WithReliable
+// explicitly.
 func Wrap1(h EnvelopHandler) FrameHandler {
 	return FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
 		e := &Envelop{}

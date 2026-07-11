@@ -14,7 +14,7 @@ It is **not** a general-purpose or reliable RPC framework, and it is **not**
 wire-compatible with standard gRPC. See [What it is / isn't](#what-it-is--isnt).
 
 ```
-generated stubs ──> drpc.Conn ──(FrameHandler)──> [Wrap1 | Coalescer] ──> adapter ──> channel
+generated stubs ──> drpc.Conn ──(FrameHandler)──> adapter (1 Envelop per message) ──> channel
 generated impls <── drpc.Server <──(per frame)──── adapter (unpacks Envelop) <──────── channel
 ```
 
@@ -60,7 +60,7 @@ subsequence** instead of stalling.
 go get github.com/lesomnus/grpc-dgram
 ```
 
-Requires Go 1.25+ (`testing/synctest` is used by the test suite).
+Requires Go 1.26+.
 
 ## Usage
 
@@ -115,13 +115,15 @@ Over a reliable, ordered transport, timers and retransmission are off,
 delivery is the exact sequence, and any gap or duplicate is surfaced as
 `INTERNAL` (a broken "reliable" transport). This is the path to **plain
 gRPC-over-WebSocket / reliable-datachannel** semantics, and it is
-auto-detected: `adapter/ws` always advertises reliable, `adapter/pion`
+auto-detected: `adapter/ws` always advertises reliable, and `adapter/pion`
 derives it from the data-channel configuration (ordered, no
-retransmit/lifetime cap), and both ends of a pion channel derive the same
-answer with zero options. `WithReliable` remains as the explicit override for
-custom transports. With no protocol timers running, the adapter's death
-detection (keepalive, `OnClose`) is what fails live calls — the shipped
-adapters own that duty.
+retransmit/lifetime cap) — a client `pion.New` always, a server
+`pion.Gateway` from its first channel when one is bound before
+`drpc.NewServer` (a server built earlier defaults to unreliable, which is
+correct on any channel, or takes `pion.WithReliable(true)`). `WithReliable`
+remains as the explicit override for custom transports. With no protocol
+timers running, the adapter's death detection (keepalive, `OnClose`, send
+stall) is what fails live calls — the shipped adapters own that duty.
 
 ### Tuning (sensor streams)
 
@@ -145,7 +147,8 @@ drpc.NewConn(tx,
 Over an unreliable datagram channel, `grpc-dgram` keeps standard gRPC
 code-generation and call semantics while degrading gracefully under loss,
 reorder, and duplication. Every item below is pinned by an executable test
-(`characterization_test.go`, `timeout_test.go`).
+(`characterization_test.go`, `timeout_test.go`, `restart_test.go`,
+`shutdown_test.go`).
 
 - **Ordered, de-duplicated delivery** — what the app receives is an ordered
   *subsequence* of what was sent: never reordered, never duplicated. Gaps are
@@ -240,4 +243,7 @@ go test -run '^$' -fuzz FuzzServerHandle -fuzztime 20s .   # fuzz the frame entr
 - Wire protocol & design rationale: [`PROTOCOL.md`](./PROTOCOL.md)
 - Milestones & status: [`ROADMAP.md`](./ROADMAP.md)
 - Behavioral evidence for every guarantee/limitation above:
-  [`characterization_test.go`](./characterization_test.go)
+  [`characterization_test.go`](./characterization_test.go),
+  [`timeout_test.go`](./timeout_test.go),
+  [`restart_test.go`](./restart_test.go),
+  [`shutdown_test.go`](./shutdown_test.go)

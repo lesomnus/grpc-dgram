@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	drpc "github.com/lesomnus/grpc-dgram"
 	"github.com/pion/webrtc/v4"
@@ -30,6 +31,13 @@ const (
 // resume on OnBufferedAmountLow (half the mark).
 const DefaultMaxBufferedAmount = 1 << 20
 
+// DefaultSendStallTimeout bounds how long a send may wait at the
+// buffered-amount mark. In reliable mode the core runs no timers and does
+// not bound the tx ctx, so the adapter must bound a stalled write itself
+// (PROTOCOL.md §4.2): a peer that stops draining this long is transport
+// death, and the stall trips the same teardown as a channel error.
+const DefaultSendStallTimeout = 30 * time.Second
+
 // rxBufferSize bounds messages held between pion's read loop and the serve
 // loop. It absorbs traffic arriving before ServeConn/ServePeer starts; once
 // full, OnMessage blocks the channel's read loop, which on a reliable channel
@@ -54,8 +62,9 @@ func channelReliable(dc *webrtc.DataChannel) bool {
 type channel struct {
 	dc       *webrtc.DataChannel
 	reliable bool
-	max      int    // send limit in bytes; <= 0 is unlimited
-	high     uint64 // BufferedAmount high-water mark; 0 disables blocking
+	max      int           // send limit in bytes; <= 0 is unlimited
+	high     uint64        // BufferedAmount high-water mark; 0 disables blocking
+	stall    time.Duration // max wait at the mark; <= 0 waits on ctx alone
 
 	opened  chan struct{}
 	dead    chan struct{}
@@ -83,12 +92,17 @@ func newChannel(dc *webrtc.DataChannel, reliable bool, o options) *channel {
 	if o.maxBufferedAmount != nil {
 		high = *o.maxBufferedAmount
 	}
+	stall := time.Duration(DefaultSendStallTimeout)
+	if o.sendStallTimeout != nil {
+		stall = *o.sendStallTimeout
+	}
 
 	ch := &channel{
 		dc:       dc,
 		reliable: reliable,
 		max:      maxSize,
 		high:     high,
+		stall:    stall,
 		opened:   make(chan struct{}),
 		dead:     make(chan struct{}),
 		stopped:  make(chan struct{}),
@@ -188,6 +202,12 @@ func (ch *channel) send(ctx context.Context, e *drpc.Envelop) error {
 		return ctx.Err()
 	}
 
+	var stalled <-chan time.Time
+	if ch.high > 0 && ch.stall > 0 {
+		timer := time.NewTimer(ch.stall)
+		defer timer.Stop()
+		stalled = timer.C
+	}
 	for ch.high > 0 {
 		// Acquire the broadcast channel before checking the amount: a
 		// notification between the two is then observed, not missed.
@@ -197,6 +217,12 @@ func (ch *channel) send(ctx context.Context, e *drpc.Envelop) error {
 		}
 		select {
 		case <-low:
+		case <-stalled:
+			// The peer stopped draining: transport death (PROTOCOL.md §4.2),
+			// tripping the same teardown as a channel error.
+			err := fmt.Errorf("pion: send stalled at the buffered-amount mark for %v", ch.stall)
+			ch.fail(err)
+			return err
 		case <-ch.dead:
 			return ch.closedErr()
 		case <-ctx.Done():

@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -137,7 +138,7 @@ func TestEcho(t *testing.T) {
 			}
 			got = append(got, res.GetMessage())
 		}
-		if want := []string{"bca", "cab", "abc"}; len(got) != len(want) {
+		if want := []string{"bca", "cab", "abc"}; !slices.Equal(got, want) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	})

@@ -15,6 +15,17 @@ type txSeq struct{ v uint32 }
 
 func (s *txSeq) next() uint32 { s.v++; return s.v }
 
+// undo returns seq to the pool after the adapter refused its frame
+// synchronously (drpc.ErrMessageTooLarge): the frame never reached the wire,
+// so the number must be reused — a permanent hole would fail every later
+// frame of the stream under reliable mode's strict window (PROTOCOL.md
+// §4.4, §10.6). No-op unless seq is the latest allocation.
+func (s *txSeq) undo(seq uint32) {
+	if seq != 0 && s.v == seq {
+		s.v--
+	}
+}
+
 type rxVerdict int
 
 const (

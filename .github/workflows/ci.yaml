@@ -52,6 +52,11 @@ jobs:
 
   bench:
     runs-on: ubuntu-latest
+    # The old commit is checked out INSIDE the current tree; without this,
+    # Go's walk-up finds the new top-level go.work, which does not `use` old/,
+    # and the old benchmark fails at setup.
+    env:
+      GOWORK: off
 
     steps:
       - uses: actions/checkout@v6

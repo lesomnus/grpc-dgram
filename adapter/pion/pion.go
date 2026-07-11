@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	drpc "github.com/lesomnus/grpc-dgram"
 	"github.com/pion/webrtc/v4"
@@ -31,6 +32,7 @@ import (
 type options struct {
 	maxMessageSize    *int
 	maxBufferedAmount *uint64
+	sendStallTimeout  *time.Duration
 	reliable          *bool
 }
 
@@ -51,11 +53,18 @@ func WithMaxBufferedAmount(n uint64) Option {
 	return func(o *options) { o.maxBufferedAmount = &n }
 }
 
+// WithSendStallTimeout bounds how long one send may wait at the
+// buffered-amount mark before the channel is declared dead (PROTOCOL.md
+// §4.2); 0 waits on ctx alone. Default DefaultSendStallTimeout.
+func WithSendStallTimeout(d time.Duration) Option {
+	return func(o *options) { o.sendStallTimeout = &d }
+}
+
 // WithReliable declares the mode of every channel a Gateway will serve, for
-// deployments where the server is built before the first channel arrives (see
-// Gateway.Reliable). ServePeer refuses channels that contradict it. New
-// ignores this option: a Transport always derives the mode from its own
-// channel.
+// deployments where the server is built before the first channel arrives
+// (see Gateway.Reliable). With true, ServePeer refuses unreliable channels —
+// a lossy channel cannot run with timers off. New ignores this option: a
+// Transport always derives the mode from its own channel.
 func WithReliable(v bool) Option {
 	return func(o *options) { o.reliable = &v }
 }
@@ -163,12 +172,14 @@ func NewGateway(opts ...Option) *Gateway {
 // exists — so the gateway cannot derive the mode from traffic it has not
 // seen: the mode is WithReliable if given, else the configuration of the
 // first channel passed to Bind or ServePeer, else unreliable; it latches at
-// whichever of Reliable, Bind, or ServePeer runs first and ServePeer refuses
-// channels that contradict it (mixed configs would need mixed timer modes,
-// which one Server cannot run). A server built before its first channel
-// therefore runs unreliable unless WithReliable(true) says otherwise —
-// correct on any channel, merely with timers a reliable channel does not
-// need.
+// whichever of Reliable, Bind, or ServePeer runs first. The unreliable
+// machinery is correct on any channel (timers on a reliable channel are
+// merely redundant), so an unreliable-latched gateway serves reliable
+// channels too; the reverse is refused — timers off over a lossy channel
+// would hang — so ServePeer rejects an unreliable channel once the gateway
+// latched reliable. A server built before its first channel therefore runs
+// unreliable and serves everything, unless WithReliable(true) says
+// otherwise.
 func (g *Gateway) Reliable() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -204,10 +215,14 @@ func (g *Gateway) bind(dc *webrtc.DataChannel) *gwChannel {
 		return b
 	}
 	r := channelReliable(dc)
+	m := g.latchLocked(r)
 	b := &gwChannel{
-		ch:  newChannel(dc, g.latchLocked(r), g.o),
+		ch:  newChannel(dc, m, g.o),
 		key: peerKey(g.next.Add(1)),
-		ok:  r == g.latchLocked(r),
+		// Only one combination is unservable: a lossy channel under a server
+		// whose timers are off. A reliable channel under an unreliable-latched
+		// gateway merely runs redundant timers (see Reliable).
+		ok: r || !m,
 	}
 	g.chans[dc] = b
 	g.peers[b.key] = b.ch

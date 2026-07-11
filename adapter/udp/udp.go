@@ -7,7 +7,10 @@
 // UDP is connectionless: there is no transport-death signal to hook the §4.5
 // teardown duty on. Vanished peers are handled by the core's own liveness
 // machinery; tearing the endpoint down is the application's move (close the
-// socket, then Conn.Close / Server.Stop).
+// socket, then Conn.Close / Server.Stop). Consequently an ICMP unreachable —
+// surfaced by the OS as ECONNREFUSED on a connected socket's reads and
+// writes — is treated as datagram loss, not as an error: a momentarily
+// absent peer (a restarting server) is exactly what the protocol rides out.
 //
 // The wire is plaintext. Deploy over an encrypted channel (e.g. DTLS) or on a
 // trusted network — see PROTOCOL.md §15.
@@ -19,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"syscall"
 	"time"
 
 	drpc "github.com/lesomnus/grpc-dgram"
@@ -28,6 +32,16 @@ import (
 // unblockNow is a read deadline in the past: setting it fails the pending
 // blocking read so Serve can observe ctx cancellation.
 var unblockNow = time.Unix(1, 0)
+
+// transient reports errors that mean "this datagram (or a previous one) went
+// nowhere", not "this socket is broken" — chiefly ICMP unreachable surfacing
+// as ECONNREFUSED/EHOSTUNREACH/ENETUNREACH. The socket stays usable; the
+// condition is indistinguishable from loss, which UDP already promises.
+func transient(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH)
+}
 
 // DefaultMaxMessageSize keeps a datagram under the typical 1500-byte path
 // MTU with room for IP/UDP headers and a tunnel or two.
@@ -80,6 +94,9 @@ func serve(ctx context.Context, h drpc.FrameHandler, read func([]byte) (int, con
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+			if transient(err) {
+				continue
+			}
 			return err
 		}
 		e := &drpc.Envelop{}
@@ -114,14 +131,19 @@ func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
 	return t.Send(ctx, e)
 }
 
-// Send transmits one envelop as one datagram.
+// Send transmits one envelop as one datagram. A transient unreachable
+// condition is reported as success: the datagram is lost, which UDP already
+// promises — failing the call instead would defeat the retransmission
+// machinery that rides out a restarting peer.
 func (t *Transport) Send(_ context.Context, e *drpc.Envelop) error {
 	data, err := marshal(e, t.max)
 	if err != nil {
 		return err
 	}
-	_, err = t.c.Write(data)
-	return err
+	if _, err := t.c.Write(data); err != nil && !transient(err) {
+		return err
+	}
+	return nil
 }
 
 // Serve delivers received frames to h — normally the *drpc.Conn — until ctx
@@ -174,8 +196,10 @@ func (g *Gateway) Send(ctx context.Context, e *drpc.Envelop) error {
 	if err != nil {
 		return err
 	}
-	_, err = g.c.WriteToUDPAddrPort(data, addr)
-	return err
+	if _, err := g.c.WriteToUDPAddrPort(data, addr); err != nil && !transient(err) {
+		return err
+	}
+	return nil
 }
 
 // Serve delivers received frames to h — normally the *drpc.Server — with the
