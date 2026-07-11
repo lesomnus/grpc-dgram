@@ -20,7 +20,7 @@ func TestShutdown(t *testing.T) {
 
 			// A blocking handler: Once with OverVoid blocks on ctx.Done.
 			ctxHit := make(chan struct{})
-			client.service.Hit = func() { close(ctxHit) }
+			client.service.SetHit(func() { close(ctxHit) })
 
 			errc := make(chan error, 1)
 			go func() {
@@ -88,7 +88,7 @@ func TestShutdown(t *testing.T) {
 			defer stop()
 
 			ctxHit := make(chan struct{})
-			client.service.Hit = func() { close(ctxHit) }
+			client.service.SetHit(func() { close(ctxHit) })
 
 			errc := make(chan error, 1)
 			go func() {

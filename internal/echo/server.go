@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"maps"
+	"sync"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -28,18 +29,33 @@ type EchoServer struct {
 	Err error
 	// MD holds the metadata from the incoming context of the request.
 	MD metadata.MD
-	// It is called when the request.OverVoid is set.
-	Hit context.CancelFunc
 
 	LazyHeader bool
+
+	// hitFn is called when request.OverVoid is set; the handler then parks
+	// in <-ctx.Done(). Set via SetHit: handlers read it from their own
+	// goroutines, and over a real-socket transport nothing else establishes
+	// a happens-before edge with the test goroutine's write.
+	hitMu sync.Mutex
+	hitFn context.CancelFunc
+}
+
+// SetHit installs the OverVoid hook (see hitFn).
+func (s *EchoServer) SetHit(f context.CancelFunc) {
+	s.hitMu.Lock()
+	s.hitFn = f
+	s.hitMu.Unlock()
 }
 
 func (s *EchoServer) hit(ctx context.Context) {
-	if s.Hit == nil {
+	s.hitMu.Lock()
+	f := s.hitFn
+	s.hitMu.Unlock()
+	if f == nil {
 		panic("Hit is not set for void request")
 	}
 
-	s.Hit()
+	f()
 	<-ctx.Done()
 }
 

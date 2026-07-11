@@ -814,7 +814,7 @@ func TestE2E(t *testing.T) {
 			client, stop := pipe(t)
 
 			ctx, cancel := context.WithCancel(t.Context())
-			client.service.Hit = cancel
+			client.service.SetHit(cancel)
 
 			return client, ctx, func() {
 				cancel()

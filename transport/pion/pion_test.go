@@ -94,6 +94,7 @@ type ends struct {
 	tp       *pion.Transport
 	gw       *pion.Gateway
 	srv      *drpc.Server
+	svc      *echo.EchoServer
 	clientDC *webrtc.DataChannel
 }
 
@@ -120,7 +121,8 @@ func serveReliable(t *testing.T) *ends {
 	)
 
 	srv := drpc.NewServer(gw)
-	echo.RegisterEchoServiceServer(srv, &echo.EchoServer{})
+	svc := &echo.EchoServer{}
+	echo.RegisterEchoServiceServer(srv, svc)
 	sdone := make(chan struct{})
 	go func() {
 		defer close(sdone)
@@ -148,6 +150,7 @@ func serveReliable(t *testing.T) *ends {
 		tp:       tp,
 		gw:       gw,
 		srv:      srv,
+		svc:      svc,
 		clientDC: <-dcc,
 	}
 }
@@ -545,6 +548,54 @@ func TestTeardownDuty(t *testing.T) {
 	case <-stopped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("GracefulStop still blocked 5s after the channel closed")
+	}
+}
+
+// The serve loop blocked in reliable-mode backpressure (PROTOCOL.md §4.2)
+// must still be torn down when the channel dies: a blocked loop cannot
+// observe ch.dead between deliveries, so channel death (OnClose/OnError,
+// send stall, Transport.Close) cancels the delivery ctx the blocked Handle
+// waits on (§4.5). Before that link existed, this scenario wedged ServePeer,
+// the handler, and the peer state permanently.
+func TestBlockedDeliveryDeath(t *testing.T) {
+	e := serveReliable(t)
+	hit := make(chan struct{})
+	e.svc.SetHit(func() { close(hit) })
+
+	// The handler parks in a pure ctx-wait: nothing ever drains this call's
+	// rx buffer again.
+	stream, err := e.client.Live(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(echo.EchoRequest_builder{OverVoid: true}.Build()); err != nil {
+		t.Fatal(err)
+	}
+	<-hit
+
+	// Flood past the rx buffer (default 32): the server's serve loop is now
+	// blocked inside Handle delivering the overflow frame.
+	for range 40 {
+		if err := stream.Send(echo.EchoRequest_builder{Message: "x"}.Build()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The client vanishes. Only the OnClose→dead→delivery-ctx link can reach
+	// the blocked serve loop.
+	if err := e.clientDC.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		e.srv.GracefulStop()
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked delivery wedged: channel death was never delivered (§4.5)")
 	}
 }
 

@@ -34,6 +34,7 @@ import (
 type testServer struct {
 	url string
 	srv *drpc.Server
+	svc *echo.EchoServer
 }
 
 func serveEcho(t *testing.T, opts ...gorilla.Option) *testServer {
@@ -41,7 +42,8 @@ func serveEcho(t *testing.T, opts ...gorilla.Option) *testServer {
 
 	gw := gorilla.NewGateway(opts...)
 	srv := drpc.NewServer(gw)
-	echo.RegisterEchoServiceServer(srv, &echo.EchoServer{})
+	svc := &echo.EchoServer{}
+	echo.RegisterEchoServiceServer(srv, svc)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	var wg sync.WaitGroup
@@ -67,6 +69,55 @@ func serveEcho(t *testing.T, opts ...gorilla.Option) *testServer {
 	return &testServer{
 		url: "ws" + strings.TrimPrefix(hs.URL, "http"),
 		srv: srv,
+		svc: svc,
+	}
+}
+
+// The read pump blocked in reliable-mode backpressure (PROTOCOL.md §4.2)
+// must still be torn down when the peer dies: a blocked loop reads nothing,
+// so death detection cannot live in read errors or read deadlines — the
+// keepalive's failed ping cancels the delivery ctx instead (§4.5). Before
+// that out-of-band path existed, this scenario wedged the pump, the handler,
+// the socket, and the peer state permanently; only Server.Stop recovered.
+func TestBlockedDeliveryDeath(t *testing.T) {
+	ts := serveEcho(t, gorilla.WithKeepalive(100*time.Millisecond, 300*time.Millisecond))
+	hit := make(chan struct{})
+	ts.svc.SetHit(func() { close(hit) })
+	client := ts.dial(t)
+
+	// The handler parks in a pure ctx-wait: it will never Recv again, so
+	// nothing ever drains this call's rx buffer.
+	stream, err := client.Live(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(echo.EchoRequest_builder{OverVoid: true}.Build()); err != nil {
+		t.Fatal(err)
+	}
+	<-hit
+
+	// Flood past the rx buffer (default 32): the server's read pump is now
+	// blocked inside Handle delivering the overflow frame.
+	for range 40 {
+		if err := stream.Send(echo.EchoRequest_builder{Message: "x"}.Build()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The client process dies without a word. The server cannot see the
+	// death by reading — it is not reading — so the ping-write failure must
+	// carry the teardown.
+	client.sock.Close()
+
+	done := make(chan struct{})
+	go func() {
+		ts.srv.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked delivery wedged: transport death was never detected (§4.5)")
 	}
 }
 
