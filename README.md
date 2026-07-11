@@ -1,61 +1,224 @@
 # grpc-dgram
 
-*grpc-dgram* is a message-oriented transport layer that reuses code generated for [gRPC](https://grpc.io/) while running over an unreliable datagram-style channel such as UDP or [WebRTC data channels](https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Using_data_channels).
+**gRPC programming model over unreliable datagram channels (UDP, WebRTC data
+channels) — built for real-time sensor streams.**
 
-Strictly speaking, this project is not gRPC.
+`grpc-dgram` lets you keep your `.proto` files, your generated gRPC stubs, and
+your handler code, and run them over a datagram transport instead of HTTP/2.
+It is designed for one job well: **streaming frequently-produced messages where
+a lost message is superseded by the next one** — sensor telemetry, game/robot
+state, live tracking — with latency and graceful degradation prioritized over
+perfect reliability.
 
-gRPC is defined on top of HTTP/2, and it also carries a set of behavioral conventions around request/response handling, streaming, metadata, deadlines, and status propagation.
-This project intentionally does not preserve that wire-level or runtime contract as is.
-Instead, it adapts the programming model to a datagram environment where loss, reordering, duplication, and partial delivery need to be considered first.
-That means this project is designed with unreliable channels in mind, not as a generic reliability layer that turns an unreliable transport into a reliable one.
+It is **not** a general-purpose or reliable RPC framework, and it is **not**
+wire-compatible with standard gRPC. See [What it is / isn't](#what-it-is--isnt).
 
-The name *grpc-dgram* is practical: the project is designed so that code generated from `.proto` files for gRPC can be reused with minimal friction.
-In other words, the goal is not "gRPC over datagram" in the protocol-spec sense, but "a datagram transport that can work with gRPC-generated stubs and service definitions":
+```
+generated stubs ──> drpc.Conn ──(FrameHandler)──> [Wrap1 | Coalescer] ──> adapter ──> channel
+generated impls <── drpc.Server <──(per frame)──── adapter (unpacks Envelop) <──────── channel
+```
 
-- you can keep using code generated for gRPC.
-- you can keep implementing handlers in the familiar gRPC service shape.
-- you can swap the underlying transport model to a datagram-oriented one.
+- Package: `github.com/lesomnus/grpc-dgram` (import name `drpc`)
+- Status: **core + protocol complete and characterized** (unary / server- /
+  client- / bidi-streaming, metadata, interceptors, codecs, timeouts,
+  liveness). Wire protocol: [`PROTOCOL.md`](./PROTOCOL.md). Transport adapters
+  (WebSocket, UDP, pion/webrtc) are the next milestone — see
+  [`ROADMAP.md`](./ROADMAP.md).
+
+---
+
+## Why
+
+Standard gRPC needs HTTP/2, which needs a reliable ordered byte stream. A
+sensor feed over UDP or an unreliable WebRTC data channel does not have one,
+and does not want one: retransmitting a 20 ms-old reading just delays the
+current one. `grpc-dgram` keeps the *gRPC programming model* — service
+definitions, generated clients/servers, streaming, metadata, interceptors,
+deadlines, status codes — and drops the parts that assume reliability, so the
+same code runs over a lossy channel and degrades into an **ordered
+subsequence** instead of stalling.
 
 ## Features
 
-- [x] Unary Call
-- [x] Server-side Streaming Call
-- [x] Client-side Streaming Call
-- [x] Bidirectional Streaming Call
-- [x] Metadata
-- [x] Header
-- [x] Trailer
-- [x] Codecs
-- [x] Interceptors
-- [ ] Stats Handler
-- [ ] Adaptor for [net#PacketConn](https://pkg.go.dev/net#PacketConn)
-- [ ] Adaptor for [pion/webrtc](https://github.com/pion/webrtc)
-- [ ] Adaptor for [gorilla/websocket](https://github.com/gorilla/websocket)
-- [ ] Browser JS port
+| | |
+|---|---|
+| Unary / Server- / Client- / Bidi-streaming | ✅ standard gRPC surface, generated stubs unchanged |
+| Metadata (header / trailer) | ✅ on success and on error |
+| Interceptors (unary + stream, client + server, chained) | ✅ |
+| Codecs (`grpc.ForceCodecV2`) | ✅ (proto default; JSON etc. via call option) |
+| Client & server deadlines | ✅ propagated on the wire, enforced both ends |
+| Default timeout / liveness so lost frames never hang a call | ✅ core design (see [Guarantees](#guarantees)) |
+| Reliable-mode (timers off over a reliable transport) | ✅ `WithReliable(true)` — the gRPC-over-WebSocket / reliable-datachannel path |
+| Per-stream buffering & drop policy (`DropNewest` / `DropOldest`) | ✅ per method / per role |
+| Resource caps (tombstones, live calls, reset maps) | ✅ bounded under a junk flood |
+| Transport adapters (WebSocket, `net.PacketConn`, pion/webrtc) | ⬜ next milestone |
+| Stats handler, browser JS/TS port | ⬜ planned |
+
+## Install
+
+```sh
+go get github.com/lesomnus/grpc-dgram
+```
+
+Requires Go 1.25+ (`testing/synctest` is used by the test suite).
 
 ## Usage
 
-TBD
+`Conn` implements `grpc.ClientConnInterface` and `Server` implements
+`grpc.ServiceRegistrar`, so generated code plugs straight in. You provide a
+transport as a `FrameHandler` (send) and feed received frames back in via
+`Handle` (receive). An adapter bridges those to an actual channel; until the
+built-in adapters land you can wire any transport in a few lines.
 
-## What This Project Is
+```go
+// Server: register your generated service on a drpc.Server.
+srv := drpc.NewServer(sendToClient /* FrameHandler */)
+pb.RegisterSensorServiceServer(srv, &myHandler{})
 
-- A transport/runtime for message-based communication.
-- A transport/runtime designed for datagram-style channels, where message loss, duplication, and reordering are possible.
-- A compatibility layer around gRPC-generated interfaces such as `grpc.ClientConnInterface`, `grpc.ServiceRegistrar`, and generated service/client code (and possibly for other languages).
+// deliver each received frame (an adapter reads the channel and calls this):
+srv.Handle(ctx, frame)
 
-## What This Project Is Not
+// Client: a drpc.Conn is a grpc.ClientConnInterface.
+conn := drpc.NewConn(sendToServer /* FrameHandler */)
+client := pb.NewSensorServiceClient(conn)
 
-- It is not HTTP/2-based gRPC.
-- It does not aim to be wire-compatible with standard gRPC implementations.
-- It does not fully preserve the service processing rules, transport semantics, or feature set expected by the official gRPC stack.
-- It does not implement a general-purpose reliability protocol on top of an unreliable channel.
+stream, _ := client.Readings(ctx, &pb.Subscribe{...})
+for {
+    r, err := stream.Recv()
+    if err == io.EOF { break } // clean end of stream
+    if err != nil { /* a gRPC status: DEADLINE_EXCEEDED, UNAVAILABLE, ... */ }
+    use(r) // r may be an ordered *subsequence* of what was sent — see below
+}
+```
 
-If you need interoperability with existing gRPC servers, proxies, observability tooling, or the HTTP/2 ecosystem, this project is the wrong transport.
+The wire unit is one marshaled `Envelop` (1..n `Frame`s) per datagram. An
+adapter implements `EnvelopHandler`; `drpc.Wrap1` adapts the core's per-frame
+output to it (a `Coalescer` for batching is planned). See
+[`e2e_test.go`](./e2e_test.go) for a complete in-process wiring and
+[`PROTOCOL.md`](./PROTOCOL.md) §3–§4 for the adapter contract.
 
-## Non-Goals
+### Reliable transports
 
-- Full gRPC protocol compliance
-- HTTP/2 transport compatibility
-- Transparent interoperability with standard gRPC implementations
-- Exact reproduction of all gRPC metadata, streaming, and lifecycle semantics
-- Providing a general-purpose reliability layer over unreliable transports
+Over a reliable, ordered transport (WebSocket, or a reliable WebRTC data
+channel), pass `WithReliable(true)` to both ends (or implement
+`TransportInfo` on your adapter and it is detected automatically). Timers and
+retransmission are then off, delivery is the exact sequence, and any gap or
+duplicate is surfaced as `INTERNAL` (a broken "reliable" transport). This is
+the path to **plain gRPC-over-WebSocket / reliable-datachannel** semantics.
+
+### Tuning (sensor streams)
+
+```go
+drpc.NewServer(tx,
+    // Keep the freshest readings when a consumer lags: evict the oldest.
+    drpc.WithMethodRxBuffer("/sensor.SensorService/Readings", 64, drpc.DropOldest),
+    // Bound handler goroutines a single peer can spawn.
+    drpc.WithLimits(drpc.Limits{MaxLiveCalls: 256}),
+)
+
+drpc.NewConn(tx,
+    drpc.WithTiming(drpc.Timing{Call: 2*time.Second, Liveness: 10*time.Second}),
+)
+```
+
+---
+
+## Guarantees
+
+Over an unreliable datagram channel, `grpc-dgram` keeps standard gRPC
+code-generation and call semantics while degrading gracefully under loss,
+reorder, and duplication. Every item below is pinned by an executable test
+(`characterization_test.go`, `timeout_test.go`).
+
+- **Ordered, de-duplicated delivery** — what the app receives is an ordered
+  *subsequence* of what was sent: never reordered, never duplicated. Gaps are
+  the only distortion; a one-step network reorder surfaces as a gap, not an
+  out-of-order message.
+- **Exactly one terminal per call** — every call ends with exactly one
+  outcome: a value, a gRPC status, or `io.EOF`. End-of-stream is the terminal
+  frame, never inferred from silence; a lost terminal is recovered by a probe
+  or retransmit hitting the server's tombstone.
+- **At-most-once execution per server incarnation** — a handler runs at most
+  once even under duplicated or stale OPENs (sid dedup + tombstone replay +
+  aged watermark). The *response* is delivered at-least-once; the *execution*
+  is deduplicated.
+- **Bounded termination** — no call hangs forever. A deadline-less unary fails
+  within `T_call`; a broken stream within `T_live`; a lost control frame
+  recovers within an RTI-backoff round; an idle stream recovers a lost
+  terminal within `T_probe + RTI`. Every path has a stated ceiling.
+- **Deadlines enforced on both ends** — the client deadline travels on the
+  OPEN; the server enforces `DEADLINE_EXCEEDED` independently, never waiting
+  for a frame. `WithMaxHandlerTimeout` clamps a client-asserted deadline.
+- **Incarnation isolation** — calls are keyed by `(peer, epoch, sid)` on the
+  server; each client stream locks to one server incarnation. A wrong-epoch
+  frame — dead incarnation or stale straggler — cannot touch a live call.
+- **Bounded state under garbage** — tombstones, live calls, and RESET/PING
+  rate-limit maps are all capped; a junk flood costs bounded CPU and zero
+  unbounded memory, and cannot keep a vanished peer's liveness alive.
+- **Handlers never wedge** — a vanished client cannot pin a server handler:
+  liveness expiry cancels it within `T_live`. `Stop`, `GracefulStop`, and
+  `DisconnectPeer` drain handlers deterministically.
+
+The standard gRPC surface (value+status on all four RPC types, header/trailer
+on success and error, `Header()` blocking correctly, interceptor chaining,
+metadata round-trip, `Unimplemented` for unknown methods) matches gRPC; see
+the divergences below.
+
+## Limitations & caveats
+
+The honest list. Under the sensor use case most of these are *features*, not
+bugs — a lost reading is superseded by the next.
+
+- **Ordered subsequence, not the exact sequence.** Any dropped, reordered, or
+  over-buffered data frame in unreliable mode is a silent gap with no error
+  until the terminal (a skipped-count is exposed via stats, planned). *Need
+  every message?* Use `WithReliable(true)` over a reliable adapter, or make the
+  stream idempotent/superseding.
+- **At-most-once is per server incarnation.** A server restart (new epoch)
+  mid-call, or a tombstone evicted under cap pressure before the client stops
+  retrying, can re-execute the handler once. Make handlers idempotent if a
+  cross-restart duplicate is unacceptable; within one incarnation execution is
+  strictly at-most-once.
+- **No authentication — deploy encrypted.** The wire has no auth by design
+  (`PROTOCOL.md` §15); `epoch` is a correctness device, not a security token.
+  On **raw UDP**, anyone who can sniff a live `(epoch, sid, seq)` and inject
+  datagrams can forge a RESET to kill a call or force a `DATA_LOSS`. Deploy
+  over **DTLS / WSS / WebRTC** (all encrypted) and this is unreachable. Client
+  streams reject foreign-epoch frames, so cross-incarnation poisoning is
+  closed; same-epoch injection is the transport's job to prevent.
+- **Status details are dropped.** `code` and `message` travel; a
+  `status.WithDetails` payload does not (the frame carries only `code`+`desc`).
+  Put needed detail in the message string or in trailer metadata (which does
+  travel).
+- **Best-effort, single-datagram messages.** No `WaitForReady`, no transparent
+  retry, no per-RPC size override. One global `MaxMessageSize`; a message that
+  doesn't fit one datagram fails `ResourceExhausted` at send — never
+  fragmented. Batched frames in one datagram fate-share. Set explicit
+  deadlines; keep messages within a datagram (natural for sensor readings).
+- **Not HTTP/2 gRPC.** No wire-compatibility with standard gRPC, proxies, or
+  the HTTP/2 ecosystem. If you need interop with existing gRPC infrastructure,
+  this is the wrong transport.
+
+## What it is / isn't
+
+**Is:** a transport/runtime for message-based RPC over datagram-style channels,
+a compatibility layer around gRPC-generated interfaces (`grpc.ClientConnInterface`,
+`grpc.ServiceRegistrar`, generated service/client code), tuned for real-time
+streams that tolerate loss.
+
+**Isn't:** HTTP/2-based gRPC; a general-purpose reliability layer over an
+unreliable channel; wire-compatible with standard gRPC; a faithful
+reproduction of every gRPC lifecycle detail (see divergences above).
+
+## Development
+
+```sh
+go test -race ./...     # fast & deterministic — timing tests use testing/synctest
+buf generate            # regenerate protobuf bindings after editing proto/
+go test -run '^$' -fuzz FuzzServerHandle -fuzztime 20s .   # fuzz the frame entry points
+```
+
+- Wire protocol & design rationale: [`PROTOCOL.md`](./PROTOCOL.md)
+- Milestones & status: [`ROADMAP.md`](./ROADMAP.md)
+- Behavioral evidence for every guarantee/limitation above:
+  [`characterization_test.go`](./characterization_test.go)
