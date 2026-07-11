@@ -193,10 +193,15 @@ func (s *Server) hasWork() bool {
 func (s *Server) sweepLoop() {
 	tick := time.NewTicker(s.mode.timing.tick())
 	defer tick.Stop()
-	for now := range tick.C {
-		s.sweep(now)
-		if s.sw.idle(s.hasWork) {
+	for {
+		select {
+		case <-s.sw.quit:
 			return
+		case now := <-tick.C:
+			s.sweep(now)
+			if s.sw.idle(s.hasWork) {
+				return
+			}
 		}
 	}
 }

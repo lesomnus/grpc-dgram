@@ -73,6 +73,7 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 		epoch: rand.Uint32(),
 		tx:    tx,
 		mode:  resolveMode(tx, opt.reliable, opt.timing),
+		sw:    newSweeper(),
 
 		maxHandlerTimeout: opt.maxHandlerTimeout,
 		rx:                opt.rx.withDefaults(),
@@ -566,6 +567,7 @@ func (s *Server) GracefulStop() {
 	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()
+	s.sw.stop()
 }
 
 // Stop cancels every in-flight handler and refuses new calls
@@ -586,6 +588,7 @@ func (s *Server) Stop() {
 	}
 	s.wg.Wait()
 	s.rootCancel(cause)
+	s.sw.stop()
 }
 
 // DisconnectPeer fails every live call from peer. Adapters call it when a

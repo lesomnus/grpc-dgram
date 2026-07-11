@@ -27,16 +27,24 @@ type clientTomb struct {
 
 // sweeper drives periodic work while there is any; it stops itself when idle
 // and is kicked back to life by state mutations (PROTOCOL.md Appendix C).
+// A closed quit channel terminates the running loop at once — Conn.Close /
+// Server.Stop use it to reclaim the goroutine immediately instead of waiting
+// for the last tombstone to expire.
 type sweeper struct {
-	mu sync.Mutex
-	on bool
+	mu       sync.Mutex
+	on       bool
+	stopped  bool
+	quit     chan struct{}
+	quitOnce sync.Once
 }
 
-// kick starts run in a goroutine unless one is already running. run must
-// return false (via its sweep result and hasWork re-check) to stop.
+func newSweeper() sweeper { return sweeper{quit: make(chan struct{})} }
+
+// kick starts run in a goroutine unless one is already running or the sweeper
+// has been stopped.
 func (w *sweeper) kick(run func()) {
 	w.mu.Lock()
-	if !w.on {
+	if !w.on && !w.stopped {
 		w.on = true
 		go run()
 	}
@@ -54,6 +62,14 @@ func (w *sweeper) idle(hasWork func() bool) bool {
 	}
 	w.on = false
 	return true
+}
+
+// stop terminates the sweeper loop and prevents future kicks.
+func (w *sweeper) stop() {
+	w.mu.Lock()
+	w.stopped = true
+	w.mu.Unlock()
+	w.quitOnce.Do(func() { close(w.quit) })
 }
 
 // ---------------------------------------------------------------------------
@@ -236,10 +252,15 @@ func (c *Conn) hasWork() bool {
 func (c *Conn) sweepLoop() {
 	tick := time.NewTicker(c.mode.timing.tick())
 	defer tick.Stop()
-	for now := range tick.C {
-		c.sweep(now)
-		if c.sw.idle(c.hasWork) {
+	for {
+		select {
+		case <-c.sw.quit:
 			return
+		case now := <-tick.C:
+			c.sweep(now)
+			if c.sw.idle(c.hasWork) {
+				return
+			}
 		}
 	}
 }

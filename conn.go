@@ -64,6 +64,7 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 		mode:   resolveMode(tx, opt.reliable, opt.timing),
 		rx:     opt.rx.withDefaults(),
 		limits: opt.limits.withDefaults(),
+		sw:     newSweeper(),
 		ss:     map[uint32]*clientStream{},
 
 		tombs:   map[uint32]*clientTomb{},
@@ -163,6 +164,7 @@ func (c *Conn) Close(err error) {
 		st = status.Errorf(codes.Unavailable, "transport closed: %v", err)
 	}
 	c.failAll(st)
+	c.sw.stop()
 }
 
 func (c *Conn) lookup(sid uint32) *clientStream {
