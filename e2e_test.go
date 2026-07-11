@@ -115,7 +115,19 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 	wg.Go(pump(cb, c2s))
 
 	return c, func() {
-		server.GracefulStop()
+		// GracefulStop waits for in-flight RPCs (gRPC semantics). A
+		// characterization test may deliberately leave a streaming call open
+		// with a still-connected client, which would block forever — fall
+		// back to a forceful Stop so teardown is always bounded.
+		graceful := make(chan struct{})
+		go func() { server.GracefulStop(); close(graceful) }()
+		select {
+		case <-graceful:
+		case <-time.After(2 * time.Second):
+			server.Stop()
+			<-graceful
+		}
+		conn.Close(nil) // fail any lingering client calls, stop its sweeper
 		cancel()
 		wg.Wait()
 	}

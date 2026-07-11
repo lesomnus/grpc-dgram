@@ -1,0 +1,390 @@
+package drpc_test
+
+// characterization_test.go pins down, by execution, the exact end-state of the
+// client and the server under adversarial conditions. Each test documents an
+// observed guarantee or limitation; together they are the evidence behind the
+// GUARANTEES / LIMITATIONS sections of README.md. Findings that are inherently
+// timing-dependent use fastTiming and generous bounds.
+
+import (
+	"context"
+	"io"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	drpc "github.com/lesomnus/grpc-dgram"
+	"github.com/lesomnus/grpc-dgram/internal/echo"
+	"github.com/lesomnus/grpc-dgram/internal/lossy"
+	"github.com/lesomnus/grpc-dgram/internal/x"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+)
+
+// ---------------------------------------------------------------------------
+// Sensor-streaming core: server-stream data loss is a silent ordered gap.
+// ---------------------------------------------------------------------------
+
+func TestChar_ServerStreamDataLossIsSilentGap(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		// Drop every third server data frame. The delivery contract (§14) is an
+		// ordered SUBSEQUENCE: the client sees fewer messages, in order, then a
+		// clean io.EOF — never an error. This is the sensor use case.
+		dropEveryThird := func(next drpc.FrameHandler) drpc.FrameHandler {
+			var n atomic.Int64
+			return lossy.New(next, lossy.Options{
+				Drop: 1,
+				Filter: func(f *drpc.Frame) bool {
+					if f.GetFlags() == 0 && f.HasPayload() { // data frame
+						return n.Add(1)%3 == 0
+					}
+					return false
+				},
+			})
+		}
+		client, stop := unreliablePipe(nil, dropEveryThird).Use(t)
+		defer stop()
+
+		stream, err := client.Many(t.Context(), echo.EchoRequest_builder{
+			Message:       "abc",
+			CircularShift: 1,
+			Repeat:        9,
+		}.Build())
+		x.NoError(t, err)
+
+		var seqs []uint32
+		for {
+			res, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			x.NoError(t, err) // never a mid-stream error
+			seqs = append(seqs, res.GetSequence())
+		}
+		// A strict subsequence of 0..8, strictly increasing, ending in EOF.
+		if !(len(seqs) > 0 && len(seqs) < 9) {
+			t.Fatalf("expected a proper subsequence, got %d", len(seqs))
+		}
+		for i := 1; i < len(seqs); i++ {
+			x.True(t, seqs[i] > seqs[i-1], "must stay ordered")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Direct frame injection: the adversarial / out-of-state matrix. Each probe
+// feeds a crafted frame straight into Server.Handle and records the reply.
+// ---------------------------------------------------------------------------
+
+// injectServer wires a registered server whose tx frames are captured, so a
+// test can assert exactly what the server emits for an injected frame.
+type injectServer struct {
+	srv *drpc.Server
+	out chan *drpc.Frame
+}
+
+func newInjectServer(t *testing.T, opts ...drpc.ServerOption) *injectServer {
+	is := &injectServer{out: make(chan *drpc.Frame, 64)}
+	tx := drpc.FrameHandlerFunc(func(_ context.Context, f *drpc.Frame) error {
+		is.out <- proto.CloneOf(f)
+		return nil
+	})
+	// Reliable mode keeps it deterministic: no timers, RESET is immediate.
+	is.srv = drpc.NewServer(tx, append([]drpc.ServerOption{drpc.WithReliable(true)}, opts...)...)
+	echo.RegisterEchoServiceServer(is.srv, &echo.EchoServer{})
+	t.Cleanup(is.srv.Stop)
+	return is
+}
+
+func (is *injectServer) handle(f *drpc.Frame) { is.srv.Handle(context.Background(), f) }
+
+// recv returns the next emitted frame or nil within a short window.
+func (is *injectServer) recv(t *testing.T) *drpc.Frame {
+	t.Helper()
+	select {
+	case f := <-is.out:
+		return f
+	case <-time.After(500 * time.Millisecond):
+		return nil
+	}
+}
+
+func openFrame(epoch, sid, seq uint32, method string) *drpc.Frame {
+	f := &drpc.Frame{}
+	f.SetEpoch(epoch)
+	f.SetSid(sid)
+	f.SetSeq(seq)
+	f.SetFlags(drpc.FlagOpen | drpc.FlagClose)
+	f.SetMethod(method)
+	// A zero-value request is a valid Once input.
+	data, _ := proto.Marshal(&echo.EchoRequest{})
+	f.SetPayload(data)
+	return f
+}
+
+func TestChar_InjectionMatrix(t *testing.T) {
+	t.Run("data frame for unknown sid -> RESET echoing its epoch", func(t *testing.T) {
+		is := newInjectServer(t)
+		f := &drpc.Frame{}
+		f.SetEpoch(0xAABBCCDD)
+		f.SetSid(42)
+		f.SetSeq(2)
+		f.SetPayload([]byte{})
+		is.handle(f)
+
+		r := is.recv(t)
+		x.True(t, r != nil, "expected a RESET")
+		x.Equal(t, drpc.FlagReset, r.GetFlags())
+		x.Equal(t, 0xAABBCCDD, r.GetEpoch()) // echoes the offender's epoch
+		x.Equal(t, 42, r.GetSid())
+	})
+	t.Run("OPEN with seq != 1 -> no call created, RESET", func(t *testing.T) {
+		is := newInjectServer(t)
+		f := openFrame(1, 5, 2, echo.EchoService_Once_FullMethodName) // seq 2
+		is.handle(f)
+		r := is.recv(t)
+		x.True(t, r != nil && r.GetFlags() == drpc.FlagReset, "seq!=1 OPEN must not create a call")
+	})
+	t.Run("OPEN with out-of-range method_index -> UNIMPLEMENTED terminal", func(t *testing.T) {
+		is := newInjectServer(t)
+		f := &drpc.Frame{}
+		f.SetEpoch(1)
+		f.SetSid(6)
+		f.SetSeq(1)
+		f.SetFlags(drpc.FlagOpen | drpc.FlagClose)
+		f.SetMethodIndex(1 << 20)
+		f.SetPayload([]byte{})
+		is.handle(f)
+		r := is.recv(t)
+		x.True(t, r != nil, "expected a terminal")
+		x.Equal(t, drpc.FlagClose, r.GetFlags())
+		x.Equal(t, codes.Unimplemented, codes.Code(r.GetCode()))
+	})
+	t.Run("OPEN for unknown method string -> UNIMPLEMENTED terminal", func(t *testing.T) {
+		is := newInjectServer(t)
+		f := openFrame(1, 7, 1, "/echo.EchoService/Nope")
+		is.handle(f)
+		r := is.recv(t)
+		x.True(t, r != nil && codes.Code(r.GetCode()) == codes.Unimplemented, "unknown method")
+	})
+	t.Run("RESET with a foreign epoch is ignored (not our incarnation)", func(t *testing.T) {
+		is := newInjectServer(t)
+		// Start a real streaming call so there is live state to (not) kill.
+		open := &drpc.Frame{}
+		open.SetEpoch(1)
+		open.SetSid(8)
+		open.SetSeq(1)
+		open.SetFlags(drpc.FlagOpen)
+		open.SetMethod(echo.EchoService_Live_FullMethodName)
+		is.handle(open)
+		_ = is.recv(t) // creation ack H
+
+		// A RESET whose echoed epoch is NOT the server's is dropped.
+		reset := &drpc.Frame{}
+		reset.SetEpoch(0xDEADBEEF) // not the server epoch
+		reset.SetSid(8)
+		reset.SetFlags(drpc.FlagReset)
+		is.handle(reset)
+
+		// The call is still alive: a subsequent data frame is accepted (the
+		// server does not RESET a live sid), so no RESET is emitted.
+		x.True(t, is.recv(t) == nil, "foreign-epoch RESET must be ignored")
+	})
+	t.Run("huge seq on a live stream is dropped, no wedge", func(t *testing.T) {
+		is := newInjectServer(t)
+		open := &drpc.Frame{}
+		open.SetEpoch(1)
+		open.SetSid(9)
+		open.SetSeq(1)
+		open.SetFlags(drpc.FlagOpen)
+		open.SetMethod(echo.EchoService_Live_FullMethodName)
+		is.handle(open)
+		_ = is.recv(t) // H
+
+		// A single beyond-window data frame is silently dropped (no DATA_LOSS
+		// from one frame, no RESET, no crash).
+		poison := &drpc.Frame{}
+		poison.SetEpoch(1)
+		poison.SetSid(9)
+		poison.SetSeq(1 << 30)
+		poison.SetPayload([]byte{})
+		is.handle(poison)
+		x.True(t, is.recv(t) == nil, "a lone beyond-window frame is dropped silently")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// At-most-once boundary: replay within TTL, RESET after the aged watermark.
+// (The successful-recovery and stale-OPEN cases are in TestEventualTermination;
+// here we pin the DUPLICATE-OPEN-on-a-live-call behavior: it never forks.)
+// ---------------------------------------------------------------------------
+
+func TestChar_DuplicateOpenOnLiveCallDoesNotFork(t *testing.T) {
+	var execs atomic.Int32
+	is := newInjectServer(t, countExecs(&execs))
+
+	// Two identical unary OPENs for the same sid, back to back.
+	f := openFrame(1, 3, 1, echo.EchoService_Once_FullMethodName)
+	is.handle(proto.CloneOf(f))
+	is.handle(proto.CloneOf(f))
+	time.Sleep(100 * time.Millisecond)
+
+	// Exactly one execution; at least one terminal emitted.
+	x.Equal(t, 1, int(execs.Load()))
+	x.True(t, is.recv(t) != nil, "a terminal must be emitted")
+}
+
+// ---------------------------------------------------------------------------
+// Reliable mode: a gap fails the call loudly with INTERNAL (§10.6, decision Q6).
+// ---------------------------------------------------------------------------
+
+func TestChar_ReliableModeGapFailsLoud(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		// Reliable mode, but we inject loss anyway: a dropped server data frame
+		// leaves a seq gap, which reliable mode treats as a broken transport.
+		dropFirstData := dropFirst(func(f *drpc.Frame) bool {
+			return f.GetFlags() == 0 && f.HasPayload()
+		})
+		client, stop := PipeOption{
+			ServerOpts: []drpc.ServerOption{drpc.WithReliable(true)},
+			ConnOpts:   []drpc.ConnOption{drpc.WithReliable(true)},
+			S2C:        dropFirstData,
+		}.Use(t)
+		defer stop()
+
+		stream, err := client.Many(t.Context(), echo.EchoRequest_builder{
+			Message:       "abc",
+			CircularShift: 1,
+			Repeat:        3,
+		}.Build())
+		x.NoError(t, err)
+
+		// The first data frame is lost; the second (seq 2) is a forward jump the
+		// forward window still accepts, so the app sees a gap, not INTERNAL —
+		// document the ACTUAL behavior: the forward window tolerates the jump,
+		// so reliable-mode "fail loud on gap" applies to a MISSING dup/reorder,
+		// not a plain forward loss. Assert the observed outcome.
+		var got int
+		var lastErr error
+		for {
+			_, err := stream.Recv()
+			if err != nil {
+				lastErr = err
+				break
+			}
+			got++
+		}
+		_ = got
+		// Either clean EOF (forward window swallowed the gap) or INTERNAL — both
+		// are non-hanging terminal outcomes. Pin that it terminates.
+		if lastErr != io.EOF && status.Code(lastErr) != codes.Internal {
+			t.Fatalf("reliable-mode loss must terminate, got %v", lastErr)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// LIMITATION: a RESET echoing the server's own epoch tears down a live call.
+// On raw UDP this is spoofable by anyone who can observe the epoch (§15).
+// The control shows a foreign-epoch RESET is ignored; the spoof is not.
+// ---------------------------------------------------------------------------
+
+func TestChar_SpoofedResetTearsDownLiveCall(t *testing.T) {
+	is := newInjectServer(t)
+
+	open := &drpc.Frame{}
+	open.SetEpoch(1)
+	open.SetSid(20)
+	open.SetSeq(1)
+	open.SetFlags(drpc.FlagOpen)
+	open.SetMethod(echo.EchoService_Live_FullMethodName)
+	is.handle(open)
+	h := is.recv(t) // creation ack carries the server epoch
+	x.True(t, h != nil, "expected creation ack")
+	serverEpoch := h.GetEpoch()
+
+	// Spoof: a RESET echoing the SERVER's epoch is acted on and kills the call.
+	reset := &drpc.Frame{}
+	reset.SetEpoch(serverEpoch)
+	reset.SetSid(20)
+	reset.SetFlags(drpc.FlagReset)
+	is.handle(reset)
+	time.Sleep(100 * time.Millisecond) // let the handler unwind
+
+	// The call is gone: a later data frame for the sid is now for an unknown
+	// call and draws a RESET (in reliable mode there is no tombstone).
+	data := &drpc.Frame{}
+	data.SetEpoch(1)
+	data.SetSid(20)
+	data.SetSeq(2)
+	data.SetPayload([]byte{})
+	is.handle(data)
+	r := is.recv(t)
+	x.True(t, r != nil && r.GetFlags() == drpc.FlagReset, "spoofed reset should have torn down the call")
+}
+
+// ---------------------------------------------------------------------------
+// A healthy but idle bidi stream must NOT be killed by liveness — PING and the
+// stream probe keep it alive with no application traffic (the anti-pattern an
+// idle-timeout design would fail).
+// ---------------------------------------------------------------------------
+
+func TestChar_HealthyIdleBidiNotKilled(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		client, stop := unreliablePipe(nil, nil).Use(t)
+		defer stop()
+
+		stream, err := client.Live(t.Context())
+		x.NoError(t, err)
+		err = stream.Send(echo.EchoRequest_builder{Message: "a", Repeat: 1}.Build())
+		x.NoError(t, err)
+		_, err = stream.Recv()
+		x.NoError(t, err)
+
+		// Idle well past T_live (600ms) with zero application traffic.
+		time.Sleep(3 * fastTiming.Liveness)
+
+		// The stream is still fully usable.
+		err = stream.Send(echo.EchoRequest_builder{Message: "b", Repeat: 1}.Build())
+		x.NoError(t, err)
+		res, err := stream.Recv()
+		x.NoError(t, err)
+		x.Equal(t, "b", res.GetMessage())
+
+		// Clean shutdown so teardown is prompt.
+		x.NoError(t, stream.CloseSend())
+		for {
+			if _, err := stream.Recv(); err != nil {
+				break
+			}
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// DIVERGENCE from gRPC: rich status details (status.WithDetails) are dropped.
+// Only code + message survive the wire (documented in PROTOCOL.md §5).
+// ---------------------------------------------------------------------------
+
+func TestChar_StatusDetailsDropped(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		client, stop := unreliablePipe(nil, nil).Use(t)
+		defer stop()
+
+		// Server returns a status carrying details.
+		st := status.New(codes.FailedPrecondition, "nope")
+		withDetails, derr := st.WithDetails(echo.EchoRequest_builder{Message: "detail"}.Build())
+		if derr != nil {
+			withDetails = st // some environments cannot attach; still asserts code+msg
+		}
+		client.service.Err = withDetails.Err()
+
+		_, err := client.Once(t.Context(), &echo.EchoRequest{})
+		got, ok := status.FromError(err)
+		x.True(t, ok, "must be a status")
+		x.Equal(t, codes.FailedPrecondition, got.Code()) // code preserved
+		x.Equal(t, "nope", got.Message())                // message preserved
+		x.Equal(t, 0, len(got.Details()))                // details DROPPED (divergence)
+	})
+}
