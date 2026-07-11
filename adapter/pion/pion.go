@@ -1,0 +1,282 @@
+// Package pion runs drpc over pion WebRTC DataChannels: one channel message
+// carries one marshaled Envelop, and the protocol mode is derived from the
+// channel's own configuration — an ordered channel with no retransmit or
+// lifetime cap is reliable, so the core runs with every timer off
+// (PROTOCOL.md §10.6); any other configuration is unreliable and the full
+// timer machinery is on. Same adapter, mode decided by the channel.
+//
+// The adapter takes an already-negotiated *webrtc.DataChannel; PeerConnection
+// setup and signaling stay with the application.
+//
+// DataChannels are connection-oriented, so the §4.5 teardown duty applies:
+// ServeConn and ServePeer hook OnClose and call Conn.Close /
+// Server.DisconnectPeer when the channel dies — in reliable mode the only
+// unblocking mechanism. A PeerConnection can be severed without a close ever
+// surfacing on the channel (the SCTP shutdown needs a live transport to
+// travel over); applications should watch the PeerConnection state and close
+// the channel — or the Conn/Server — themselves when it fails.
+package pion
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	drpc "github.com/lesomnus/grpc-dgram"
+	"github.com/pion/webrtc/v4"
+)
+
+type options struct {
+	maxMessageSize    *int
+	maxBufferedAmount *uint64
+	reliable          *bool
+}
+
+type Option func(*options)
+
+// WithMaxMessageSize sets the largest marshaled Envelop this endpoint will
+// send, in bytes; 0 removes the limit. It bounds sends only; receives accept
+// any message. Unset, the limit follows the channel mode:
+// DefaultMaxMessageSizeUnreliable or DefaultMaxMessageSizeReliable.
+func WithMaxMessageSize(n int) Option {
+	return func(o *options) { o.maxMessageSize = &n }
+}
+
+// WithMaxBufferedAmount sets the outbound high-water mark, in bytes: sends
+// block while dc.BufferedAmount is at or above it (pion itself queues without
+// limit); 0 never blocks. Default DefaultMaxBufferedAmount.
+func WithMaxBufferedAmount(n uint64) Option {
+	return func(o *options) { o.maxBufferedAmount = &n }
+}
+
+// WithReliable declares the mode of every channel a Gateway will serve, for
+// deployments where the server is built before the first channel arrives (see
+// Gateway.Reliable). ServePeer refuses channels that contradict it. New
+// ignores this option: a Transport always derives the mode from its own
+// channel.
+func WithReliable(v bool) Option {
+	return func(o *options) { o.reliable = &v }
+}
+
+func buildOptions(opts []Option) options {
+	o := options{}
+	for _, f := range opts {
+		f(&o)
+	}
+	return o
+}
+
+// Transport is the client-side endpoint: one DataChannel talking to one
+// server, so no peer key is needed (PROTOCOL.md §6.4). It is the tx handler
+// for drpc.NewConn — implementing drpc.TransportInfo directly so mode
+// discovery is not masked by a wrapper.
+type Transport struct {
+	ch     *channel
+	served atomic.Bool
+}
+
+// New wraps an already-negotiated DataChannel. It registers the channel
+// handlers immediately and buffers inbound messages until ServeConn drains
+// them — pion drops messages that arrive with no handler registered. For a
+// remotely-announced channel, call New synchronously inside OnDataChannel:
+// pion holds the channel's read loop until that callback returns, so handlers
+// registered there observe every message, while a handler registered from a
+// spawned goroutine races the read loop.
+func New(dc *webrtc.DataChannel, opts ...Option) *Transport {
+	o := buildOptions(opts)
+	return &Transport{ch: newChannel(dc, channelReliable(dc), o)}
+}
+
+// Reliable reports the mode derived from the channel configuration; see
+// channelReliable. drpc.NewConn reads it once at construction.
+func (t *Transport) Reliable() bool { return t.ch.reliable }
+
+// Handle sends one frame as a single-frame envelop.
+func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
+	e := &drpc.Envelop{}
+	e.SetFrames([]*drpc.Frame{f})
+	return t.Send(ctx, e)
+}
+
+// Send transmits one envelop as one channel message. It waits for the channel
+// to open and applies backpressure per WithMaxBufferedAmount, both bounded by
+// ctx; an envelop over the size limit is refused synchronously with an error
+// wrapping drpc.ErrMessageTooLarge (PROTOCOL.md §4.4).
+func (t *Transport) Send(ctx context.Context, e *drpc.Envelop) error {
+	return t.ch.send(ctx, e)
+}
+
+// ServeConn delivers received frames to conn until ctx is done or the channel
+// dies. On channel death it performs the §4.5 teardown duty — conn.Close with
+// the cause — and returns that cause; it returns nil on a clean close or on
+// ctx cancellation, where conn stays open and is the caller's to close. Call
+// it once, promptly after New: past rxBufferSize buffered messages the
+// channel's read loop blocks waiting for it.
+func (t *Transport) ServeConn(ctx context.Context, conn *drpc.Conn) error {
+	if !t.served.CompareAndSwap(false, true) {
+		return errors.New("pion: ServeConn already called")
+	}
+	died, err := t.ch.serve(ctx, conn)
+	if died {
+		conn.Close(err)
+	}
+	return err
+}
+
+// peerKey identifies one served channel within a Gateway. Keys are never
+// reused, so a peer that reconnects on a fresh channel is a fresh peer.
+type peerKey uint64
+
+// Gateway is the server-side endpoint: one drpc.Server serving many peers,
+// one DataChannel each. It is the tx handler for drpc.NewServer.
+type Gateway struct {
+	o    options
+	next atomic.Uint64
+
+	mu    sync.Mutex
+	mode  *bool // latched channel mode; nil until first decided
+	chans map[*webrtc.DataChannel]*gwChannel
+	peers map[peerKey]*channel
+}
+
+type gwChannel struct {
+	ch     *channel
+	key    peerKey
+	ok     bool // channel config matches the gateway mode
+	served atomic.Bool
+}
+
+func NewGateway(opts ...Option) *Gateway {
+	o := buildOptions(opts)
+	return &Gateway{
+		o:     o,
+		mode:  o.reliable,
+		chans: map[*webrtc.DataChannel]*gwChannel{},
+		peers: map[peerKey]*channel{},
+	}
+}
+
+// Reliable reports the mode of the channels this gateway serves.
+// drpc.NewServer reads it once at construction — usually before any channel
+// exists — so the gateway cannot derive the mode from traffic it has not
+// seen: the mode is WithReliable if given, else the configuration of the
+// first channel passed to Bind or ServePeer, else unreliable; it latches at
+// whichever of Reliable, Bind, or ServePeer runs first and ServePeer refuses
+// channels that contradict it (mixed configs would need mixed timer modes,
+// which one Server cannot run). A server built before its first channel
+// therefore runs unreliable unless WithReliable(true) says otherwise —
+// correct on any channel, merely with timers a reliable channel does not
+// need.
+func (g *Gateway) Reliable() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.latchLocked(false)
+}
+
+func (g *Gateway) latchLocked(v bool) bool {
+	if g.mode == nil {
+		g.mode = &v
+	}
+	return *g.mode
+}
+
+// Bind registers the gateway's handlers on dc and starts buffering its
+// inbound messages; it is idempotent per channel. For a remotely-announced
+// channel it MUST run synchronously inside OnDataChannel — pion holds the
+// channel's read loop until that callback returns, so handlers registered
+// there observe every message, while ServePeer spawned from the callback
+// races it. ServePeer, which must not run inside OnDataChannel (it blocks,
+// and with it pion's accept loop), binds implicitly for channels created
+// locally:
+//
+//	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+//		gw.Bind(dc)
+//		go gw.ServePeer(ctx, srv, dc)
+//	})
+func (g *Gateway) Bind(dc *webrtc.DataChannel) { g.bind(dc) }
+
+func (g *Gateway) bind(dc *webrtc.DataChannel) *gwChannel {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if b, ok := g.chans[dc]; ok {
+		return b
+	}
+	r := channelReliable(dc)
+	b := &gwChannel{
+		ch:  newChannel(dc, g.latchLocked(r), g.o),
+		key: peerKey(g.next.Add(1)),
+		ok:  r == g.latchLocked(r),
+	}
+	g.chans[dc] = b
+	g.peers[b.key] = b.ch
+	return b
+}
+
+func (g *Gateway) drop(dc *webrtc.DataChannel, b *gwChannel) {
+	b.ch.stop()
+	g.mu.Lock()
+	delete(g.chans, dc)
+	delete(g.peers, b.key)
+	g.mu.Unlock()
+}
+
+// ServePeer delivers dc's frames to srv under a fresh peer key until ctx is
+// done or the channel dies. On channel death it performs the §4.5 teardown
+// duty — srv.DisconnectPeer with the cause — deregisters the peer, and
+// returns that cause; it returns nil on a clean close or on ctx cancellation.
+// It refuses a channel whose configuration contradicts the gateway mode (see
+// Reliable) and serves each channel at most once.
+func (g *Gateway) ServePeer(ctx context.Context, srv *drpc.Server, dc *webrtc.DataChannel) error {
+	b := g.bind(dc)
+	if !b.ok {
+		g.drop(dc, b)
+		return fmt.Errorf("pion: %s channel on a gateway locked %s",
+			modeName(channelReliable(dc)), modeName(g.Reliable()))
+	}
+	if !b.served.CompareAndSwap(false, true) {
+		return errors.New("pion: channel already served")
+	}
+	defer g.drop(dc, b)
+
+	died, err := b.ch.serve(drpc.NewPeerContext(ctx, b.key), srv)
+	if died {
+		srv.DisconnectPeer(b.key, err)
+	}
+	return err
+}
+
+// Handle sends one frame as a single-frame envelop to the peer named in ctx.
+func (g *Gateway) Handle(ctx context.Context, f *drpc.Frame) error {
+	e := &drpc.Envelop{}
+	e.SetFrames([]*drpc.Frame{f})
+	return g.Send(ctx, e)
+}
+
+// Send transmits one envelop as one channel message to the peer named in
+// ctx, with the same gating as Transport.Send.
+func (g *Gateway) Send(ctx context.Context, e *drpc.Envelop) error {
+	key, ok := drpc.PeerFromContext(ctx)
+	if !ok {
+		return errors.New("pion: no peer in context")
+	}
+	k, ok := key.(peerKey)
+	if !ok {
+		return fmt.Errorf("pion: foreign peer key %T", key)
+	}
+	g.mu.Lock()
+	ch := g.peers[k]
+	g.mu.Unlock()
+	if ch == nil {
+		return fmt.Errorf("pion: peer %d is gone", k)
+	}
+	return ch.send(ctx, e)
+}
+
+func modeName(reliable bool) string {
+	if reliable {
+		return "reliable"
+	}
+	return "unreliable"
+}
