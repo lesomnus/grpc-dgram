@@ -131,7 +131,7 @@ func (o modeOption) applyServer(s *serverOption) {
 }
 
 // WithMaxHandlerTimeout clamps client-asserted timeouts on the server
-// (PROTOCOL.md §10.2, decision Q5). Off unless set.
+// (PROTOCOL.md §10.2). Off unless set.
 func WithMaxHandlerTimeout(d time.Duration) ServerOption {
 	return serverOptionFunc(func(o *serverOption) {
 		o.maxHandlerTimeout = d

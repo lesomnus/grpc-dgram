@@ -351,7 +351,7 @@ func TestChar_StatusDetailsDropped(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // L5 fix: in reliable mode a seq gap or duplicate fails the call with INTERNAL
-// (§10.6, decision Q6) — a broken "reliable" transport is surfaced, not hidden.
+// (§10.6) — a broken "reliable" transport is surfaced, not hidden.
 // ---------------------------------------------------------------------------
 
 func TestChar_ReliableModeGapIsInternal(t *testing.T) {

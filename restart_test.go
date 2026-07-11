@@ -151,7 +151,7 @@ func (p *restartPipe) stop() {
 }
 
 // ---------------------------------------------------------------------------
-// §6.5 / §17 L2: a server restart while a unary call is in flight. The
+// §6.5 / §16 L2: a server restart while a unary call is in flight. The
 // retransmitted OPEN is a fresh call to the new incarnation — the handler
 // runs a SECOND time (the documented cross-incarnation re-execution) — and
 // the not-yet-locked client accepts the new-epoch response: the call

@@ -1,7 +1,7 @@
 package drpc
 
-// This file holds the configurable delivery buffers (decision Q3) and the
-// resource caps (PROTOCOL.md §15).
+// This file holds the configurable delivery buffers (PROTOCOL.md §4.2) and
+// the resource caps (PROTOCOL.md §15).
 
 // DropPolicy selects what a full per-stream rx buffer discards in unreliable
 // mode (PROTOCOL.md §4.2).
@@ -81,7 +81,7 @@ func (l Limits) withDefaults() Limits {
 }
 
 // WithRxBuffer sets the default per-stream rx buffer size and drop policy for
-// every call (PROTOCOL.md §4.2, decision Q3). size <= 0 keeps the default 32.
+// every call (PROTOCOL.md §4.2). size <= 0 keeps the default 32.
 func WithRxBuffer(size int, policy DropPolicy) interface {
 	ConnOption
 	ServerOption

@@ -9,9 +9,9 @@ import (
 	"github.com/lesomnus/grpc-dgram/internal/x"
 )
 
-// TestRxBufferOptions checks that the Q3 buffer knobs are accepted per method,
-// per Conn, and globally, and that streams still work under a tight buffer and
-// each drop policy.
+// TestRxBufferOptions checks that the §4.2 buffer knobs are accepted per
+// method, per Conn, and globally, and that streams still work under a tight
+// buffer and each drop policy.
 func TestRxBufferOptions(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

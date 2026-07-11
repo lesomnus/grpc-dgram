@@ -39,7 +39,7 @@ const (
 	// rxDataLoss: kLoud consistent beyond-window arrivals; fail the call.
 	rxDataLoss
 	// rxProtocolError: reliable mode saw a gap or duplicate — the transport
-	// is broken; fail the call with INTERNAL (PROTOCOL.md §10.6, Q6).
+	// is broken; fail the call with INTERNAL (PROTOCOL.md §10.6).
 	rxProtocolError
 )
 
