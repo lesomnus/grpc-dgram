@@ -191,10 +191,12 @@ bugs — a lost reading is superseded by the next.
   Put needed detail in the message string or in trailer metadata (which does
   travel).
 - **Best-effort, single-datagram messages.** No `WaitForReady`, no transparent
-  retry, no per-RPC size override. One global `MaxMessageSize`; a message that
-  doesn't fit one datagram fails `ResourceExhausted` at send — never
-  fragmented. Batched frames in one datagram fate-share. Set explicit
-  deadlines; keep messages within a datagram (natural for sensor readings).
+  retry. The message-size limit is **your transport's, not drpc's**: the core
+  is size-agnostic and never fragments; an unreliable adapter rejects a
+  message that doesn't fit its datagram at send (`ResourceExhausted`), while a
+  reliable transport carries any size. Batched frames in one datagram
+  fate-share. Set explicit deadlines; keep messages within a datagram
+  (natural for sensor readings).
 - **Not HTTP/2 gRPC.** No wire-compatibility with standard gRPC, proxies, or
   the HTTP/2 ecosystem. If you need interop with existing gRPC infrastructure,
   this is the wrong transport.
