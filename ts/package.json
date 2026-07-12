@@ -1,11 +1,12 @@
 {
-  "name": "tsdown-starter",
+  "name": "@lesomnus/grpc-dgram",
   "type": "module",
   "version": "0.0.0",
   "private": true,
-  "description": "A simple example library built by tsdown",
+  "description": "gRPC over unreliable datagram channels — TypeScript port of grpc-dgram (wire protocol v1.0)",
   "exports": {
     ".": "./dist/index.mjs",
+    "./webrtc": "./dist/webrtc.mjs",
     "./package.json": "./package.json"
   },
   "files": [
@@ -13,10 +14,13 @@
   ],
   "scripts": {
     "build": "tsdown",
-    "dev": "tsdown --watch"
+    "dev": "tsdown --watch",
+    "check": "tsc --noEmit",
+    "test": "vitest run"
   },
   "devDependencies": {
     "tsdown": "^0.22.5",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   }
 }
