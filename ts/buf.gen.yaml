@@ -1,0 +1,10 @@
+# Regenerate the protobuf-es fixtures used by test/protobufes-gen.test.ts:
+#   pnpm gen   (== buf generate ../proto --template buf.gen.yaml)
+# Uses @bufbuild/protoc-gen-es against the same proto/ the Go module uses.
+version: v2
+plugins:
+  - local: protoc-gen-es
+    out: test/gen
+    opt:
+      - target=ts
+      - import_extension=js
