@@ -1,4 +1,4 @@
-// The WebRTC DataChannel adapter (src/webrtc.ts) against a mock channel pair
+// The WebRTC DataChannel adapter (src/transport/webrtc.ts) against a mock channel pair
 // implementing the standard RTCDataChannel surface — reliability
 // autodetection, §4.4 size refusal, open/backpressure gating, and the §4.5
 // teardown duty. The reliable echo e2e at the top is the TS twin of the Go
@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Conn } from '../src/conn'
 import { Server } from '../src/server'
 import { Code, type StatusError } from '../src/status'
-import { channelReliable, DataChannelGateway, DataChannelTransport, type DataChannelLike } from '../src/webrtc'
+import { channelReliable, DataChannelGateway, DataChannelTransport, type DataChannelLike } from '../src/transport/webrtc'
 import { echo, registerEcho, tick } from './helpers'
 
 class MockDC implements DataChannelLike {

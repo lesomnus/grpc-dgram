@@ -1,4 +1,4 @@
-// The protobuf-es binding (src/protobufes.ts): a real protobuf-es v2 message
+// The protobuf-es binding (src/transport/protobuf-es.ts): a real protobuf-es v2 message
 // round-trips over the transport through a descriptor DERIVED from a
 // protobuf-es method descriptor — no hand-written path, streaming kind, or
 // codec. Uses the well-known StringValue wrapper as a stand-in for a generated
@@ -9,7 +9,7 @@ import { create, type DescMethod, type DescService } from '@bufbuild/protobuf'
 import { StringValueSchema, type StringValue } from '@bufbuild/protobuf/wkt'
 import { describe, expect, it } from 'vitest'
 import { Conn } from '../src/conn'
-import { fromMethod } from '../src/protobufes'
+import { fromMethod } from '../src/transport/protobuf-es'
 import { Server } from '../src/server'
 import { isOpen, type Frame } from '../src/wire'
 

@@ -18,7 +18,7 @@ import { metadataJoin, type Metadata } from './metadata'
 import { RxVerdict, RxWindow, TxSeq } from './seq'
 import { abortCause, Code, isMessageTooLarge, StatusError, statusError, toStatusError } from './status'
 import { resolveTiming, type Mode, type Timing } from './timing'
-import { hasTransportInfo, type FrameContext, type FrameHandler } from './transport'
+import { hasTransportInfo, type FrameContext, type FrameHandler } from './seam'
 import { FrameQueue, Latch, nonzeroEpoch, noop, nowMs, Sweeper, unrefTimer } from './util'
 import { FlagClose, FlagPing, FlagReset, frame, frameStatus, isClose, isData, isHalfClose, isOpen, isPing, isReset, isTerminal, resetFor, setFrameError, type Frame } from './wire'
 

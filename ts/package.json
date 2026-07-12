@@ -6,10 +6,10 @@
   "description": "gRPC over unreliable datagram channels — TypeScript port of grpc-dgram (wire protocol v1.0)",
   "exports": {
     ".": "./dist/index.mjs",
-    "./webrtc": "./dist/webrtc.mjs",
-    "./protobuf-es": "./dist/protobufes.mjs",
-    "./node-udp": "./dist/node-udp.mjs",
-    "./connect": "./dist/connect.mjs",
+    "./transport/webrtc": "./dist/transport/webrtc.mjs",
+    "./transport/node-udp": "./dist/transport/node-udp.mjs",
+    "./transport/protobuf-es": "./dist/transport/protobuf-es.mjs",
+    "./transport/connect": "./dist/transport/connect.mjs",
     "./package.json": "./package.json"
   },
   "files": [

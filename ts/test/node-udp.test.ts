@@ -7,7 +7,7 @@ import { EventEmitter } from 'node:events'
 import type { Socket } from 'node:dgram'
 import { describe, expect, it, vi } from 'vitest'
 import type { Conn } from '../src/conn'
-import { UdpTransport } from '../src/node-udp'
+import { UdpTransport } from '../src/transport/node-udp'
 
 // A minimal dgram.Socket stand-in: the transport only uses on/close/send.
 class FakeSocket extends EventEmitter {

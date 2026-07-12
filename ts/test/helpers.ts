@@ -5,7 +5,7 @@
 import { Conn, type ConnOptions } from '../src/conn'
 import { bidiMethod, clientStreamingMethod, serverStreamingMethod, unaryMethod, type PayloadCodec } from '../src/desc'
 import { Server, type ServerOptions } from '../src/server'
-import type { FrameContext, FrameHandler } from '../src/transport'
+import type { FrameContext, FrameHandler } from '../src/seam'
 import { decodeFrame, encodeFrame, type Frame } from '../src/wire'
 
 export interface TestReq {

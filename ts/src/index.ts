@@ -35,7 +35,7 @@ export {
 } from './server'
 export { abortCause, Code, isMessageTooLarge, MessageTooLargeError, StatusError, statusError, toStatusError } from './status'
 export { type Timing } from './timing'
-export { hasConnAttacher, hasTransportInfo, unpack, type ConnAttacher, type FrameContext, type FrameHandler, type TransportInfo } from './transport'
+export { hasConnAttacher, hasTransportInfo, unpack, type ConnAttacher, type FrameContext, type FrameHandler, type TransportInfo } from './seam'
 export {
   decodeEnvelop,
   decodeFrame,

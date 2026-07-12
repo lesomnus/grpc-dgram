@@ -5,7 +5,7 @@
 // owning call (PROTOCOL.md §4.4). This is the TS twin of the Go
 // `transport/udp` adapter, and interoperates with it on the wire.
 //
-// Entry: `@lesomnus/grpc-dgram/node-udp` (Node only — it imports `node:dgram`;
+// Entry: `@lesomnus/grpc-dgram/transport/node-udp` (Node only — it imports `node:dgram`;
 // the browser uses the WebRTC adapter instead).
 //
 // UDP is connectionless: there is no transport-death signal to hook the §4.5
@@ -16,12 +16,12 @@
 // protocol rides out.
 
 import { createSocket, type RemoteInfo, type Socket } from 'node:dgram'
-import type { Conn } from './conn'
-import { MessageTooLargeError } from './status'
-import type { Server } from './server'
-import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from './transport'
-import { unpack } from './transport'
-import { decodeEnvelop, encodeEnvelop, type Frame } from './wire'
+import type { Conn } from '../conn'
+import { MessageTooLargeError } from '../status'
+import type { Server } from '../server'
+import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '../seam'
+import { unpack } from '../seam'
+import { decodeEnvelop, encodeEnvelop, type Frame } from '../wire'
 
 // DefaultMaxMessageSize keeps a datagram under the typical 1500-byte path MTU
 // with room for IP/UDP headers and a tunnel or two.

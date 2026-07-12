@@ -9,7 +9,7 @@ server and vice versa.
 - **Zero runtime dependencies.** The three wire messages (`Frame`, `Envelop`,
   `Metadata`) are hand-encoded; user payloads go through pluggable
   per-method marshallers (protobuf-es, JSON, anything that produces bytes).
-  A **protobuf-es binding** (`@lesomnus/grpc-dgram/protobuf-es`, optional peer
+  A **protobuf-es binding** (`@lesomnus/grpc-dgram/transport/protobuf-es`, optional peer
   dep) derives the whole method descriptor — path, streaming kind, codec —
   from a generated `protoc-gen-es` service, so RPC types are never re-declared
   by hand. The core itself stays dependency-free.
@@ -18,19 +18,19 @@ server and vice versa.
   isolation, control-frame retransmission, tombstones + aged watermark,
   PING/probe liveness, and the §15 resource caps. On a reliable transport all
   timers are off and sequencing is strict fail-loud (§10.6).
-- **WebRTC DataChannel adapter** (`@lesomnus/grpc-dgram/webrtc`), the TS twin
+- **WebRTC DataChannel adapter** (`@lesomnus/grpc-dgram/transport/webrtc`), the TS twin
   of the Go `transport/pion` adapter: the protocol mode is derived from the
   channel's own configuration — an ordered channel with no retransmit or
   lifetime cap runs reliable, anything else unreliable. Client `Transport`
   and a mixed-mode server `Gateway` (a reliable control channel and
   unreliable telemetry channels on one peer connection serve side by side,
   each peer in its channel's mode).
-- **Node UDP adapter** (`@lesomnus/grpc-dgram/node-udp`, Node only), the TS
+- **Node UDP adapter** (`@lesomnus/grpc-dgram/transport/node-udp`, Node only), the TS
   twin of the Go `transport/udp` adapter — `UdpTransport`/`UdpGateway` with
   `dialUdp`/`listenUdp` helpers. A TS client over this adapter interoperates
   with a Go `drpc.Server` on the wire; this is exercised by a cross-language
   conformance test (`test/conformance.test.ts`) that drives a real Go server.
-- **Connect-ES transport** (`@lesomnus/grpc-dgram/connect`, optional peer dep
+- **Connect-ES transport** (`@lesomnus/grpc-dgram/transport/connect`, optional peer dep
   on `@connectrpc/connect`): use the standard `createClient(Service, transport)`
   ergonomics while the traffic runs over drpc. `createDrpcTransport(conn)`
   turns a drpc `Conn` into a Connect `Transport` — the conformance suite drives
@@ -44,7 +44,7 @@ there is nothing to keep in sync and a TS client interoperates with a Go
 server addressing the same methods:
 
 ```ts
-import { fromService } from '@lesomnus/grpc-dgram/protobuf-es'
+import { fromService } from '@lesomnus/grpc-dgram/transport/protobuf-es'
 import { create } from '@bufbuild/protobuf'
 import { EchoService, EchoRequestSchema } from './echo_pb' // protoc-gen-es output
 
@@ -59,7 +59,7 @@ ergonomics and swap only the transport:
 
 ```ts
 import { createClient } from '@connectrpc/connect'
-import { createDrpcTransport } from '@lesomnus/grpc-dgram/connect'
+import { createDrpcTransport } from '@lesomnus/grpc-dgram/transport/connect'
 import { EchoService } from './echo_pb'
 
 const client = createClient(EchoService, createDrpcTransport(conn))
@@ -86,7 +86,7 @@ Client over an `RTCDataChannel`:
 
 ```ts
 import { Conn } from '@lesomnus/grpc-dgram'
-import { DataChannelTransport } from '@lesomnus/grpc-dgram/webrtc'
+import { DataChannelTransport } from '@lesomnus/grpc-dgram/transport/webrtc'
 
 const dc = pc.createDataChannel('rpc') // ordered, no caps → reliable mode, no timers
 const conn = new Conn(new DataChannelTransport(dc)) // pump attaches itself
@@ -104,7 +104,7 @@ Server behind a gateway (any number of peers, mixed reliability):
 
 ```ts
 import { Server } from '@lesomnus/grpc-dgram'
-import { DataChannelGateway } from '@lesomnus/grpc-dgram/webrtc'
+import { DataChannelGateway } from '@lesomnus/grpc-dgram/transport/webrtc'
 
 const gw = new DataChannelGateway()
 const server = new Server(gw)

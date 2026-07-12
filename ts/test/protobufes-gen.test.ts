@@ -10,7 +10,7 @@
 import { create } from '@bufbuild/protobuf'
 import { describe, expect, it } from 'vitest'
 import { Conn } from '../src/conn'
-import { fromService } from '../src/protobufes'
+import { fromService } from '../src/transport/protobuf-es'
 import { Server } from '../src/server'
 import { isOpen, type Frame } from '../src/wire'
 import { EchoBatchResponseSchema, EchoRequestSchema, EchoResponseSchema, EchoService } from './gen/echo/echo_pb.js'

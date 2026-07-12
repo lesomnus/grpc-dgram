@@ -17,9 +17,9 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Conn } from '../src/conn'
-import { createDrpcTransport } from '../src/connect'
-import { dialUdp } from '../src/node-udp'
-import { fromService } from '../src/protobufes'
+import { createDrpcTransport } from '../src/transport/connect'
+import { dialUdp } from '../src/transport/node-udp'
+import { fromService } from '../src/transport/protobuf-es'
 import { EchoRequestSchema, EchoResponseSchema, EchoService } from './gen/echo/echo_pb.js'
 
 const repoRoot = resolve(process.cwd(), '..')

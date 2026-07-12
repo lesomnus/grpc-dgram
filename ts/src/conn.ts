@@ -13,7 +13,7 @@ import type { Metadata } from './metadata'
 import { RxVerdict, RxWindow, TxSeq } from './seq'
 import { abortCause, Code, isMessageTooLarge, StatusError, statusError, toStatusError } from './status'
 import { resolveTiming, type Mode, type Timing } from './timing'
-import { hasConnAttacher, hasTransportInfo, type FrameContext, type FrameHandler } from './transport'
+import { hasConnAttacher, hasTransportInfo, type FrameContext, type FrameHandler } from './seam'
 import { abortListener, FrameQueue, Latch, nonzeroEpoch, noop, nowMs, Sweeper, unrefTimer } from './util'
 import { FlagClose, FlagOpen, FlagPing, frame, frameStatus, isData, isHeaderFrame, isPing, isReset, isTerminal, resetFor, type Frame } from './wire'
 

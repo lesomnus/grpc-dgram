@@ -1,4 +1,4 @@
-// The Connect-ES transport (src/connect.ts): a standard Connect client
+// The Connect-ES transport (src/transport/connect.ts): a standard Connect client
 // (createClient) drives all four RPC types over a drpc Conn talking to a drpc
 // Server, with header/trailer metadata and ConnectError mapping.
 
@@ -6,8 +6,8 @@ import { create } from '@bufbuild/protobuf'
 import { Code as ConnectCode, ConnectError, createClient } from '@connectrpc/connect'
 import { describe, expect, it } from 'vitest'
 import { Conn } from '../src/conn'
-import { createDrpcTransport } from '../src/connect'
-import { fromService } from '../src/protobufes'
+import { createDrpcTransport } from '../src/transport/connect'
+import { fromService } from '../src/transport/protobuf-es'
 import { Server } from '../src/server'
 import { Code, statusError } from '../src/status'
 import { EchoBatchResponseSchema, EchoRequestSchema, EchoResponseSchema, EchoService } from './gen/echo/echo_pb.js'
