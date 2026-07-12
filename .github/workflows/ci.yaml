@@ -11,6 +11,8 @@ on:
       - "go.work"
       - "buf.yaml"
       - "buf.gen.yaml"
+      - "ts/**"
+      - "conformance/**"
   push:
     paths: *paths
 
@@ -120,3 +122,39 @@ jobs:
             "new-${GITHUB_SHA}.txt" \
             | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # The TypeScript port (ts/). Runs typecheck, the vitest suite, and the build.
+  # Go is set up because the cross-language conformance test
+  # (ts/test/conformance.test.ts) builds and drives conformance/udpserver — it
+  # skips itself when `go` is absent, but CI wants it exercised.
+  ts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ts/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm check
+
+      - name: Test (incl. Go↔TS conformance)
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
