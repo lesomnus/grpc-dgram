@@ -25,6 +25,11 @@ server and vice versa.
   and a mixed-mode server `Gateway` (a reliable control channel and
   unreliable telemetry channels on one peer connection serve side by side,
   each peer in its channel's mode).
+- **Node UDP adapter** (`@lesomnus/grpc-dgram/node-udp`, Node only), the TS
+  twin of the Go `transport/udp` adapter — `UdpTransport`/`UdpGateway` with
+  `dialUdp`/`listenUdp` helpers. A TS client over this adapter interoperates
+  with a Go `drpc.Server` on the wire; this is exercised by a cross-language
+  conformance test (`test/conformance.test.ts`) that drives a real Go server.
 
 ## Usage
 

@@ -27,10 +27,12 @@ the Go reference. Layout under `ts/src/`:
 | `conn.ts` | `Conn` + `ClientStream`, client unreliable-mode machinery | `conn.go`, `stream.go`, `unreliable.go` |
 | `server.ts` | `Server` + server stream, per-peer state, sweep, caps | `server.go`, `stream.go`, `unreliable_server.go` |
 | `webrtc.ts` | `DataChannelTransport` (client) + `DataChannelGateway` (server, mixed-mode) | `transport/pion/*.go` |
+| `node-udp.ts` | `UdpTransport`/`UdpGateway` + `dialUdp`/`listenUdp` (Node `dgram`) | `transport/udp/*.go` |
+| `protobufes.ts` | `fromService`/`fromMethod` — derive descriptors from generated protobuf-es | grpc-go codegen (G2) |
 
 Verified at this commit:
 
-- `pnpm test` → **90 passing** (6 files). Mirrors the Go suites:
+- `pnpm test` → **106 passing** (9 files). Mirrors the Go suites:
   `wire.test.ts` (the §5 golden byte vectors, **byte-identical to Go** — the
   cross-implementation contract), `e2e.test.ts` (four RPC types, EOF, metadata,
   deadlines, cancel, reliable-mode fail-loud, lifecycle), `timeout.test.ts`
@@ -39,7 +41,9 @@ Verified at this commit:
   (§6.5 walkthroughs), `limits.test.ts` (§15 caps, §4.2 drop policies, §6.3
   DATA_LOSS, §9.4 watermark, per-peer mode), `datachannel.test.ts` (adapter
   against a mock RTCDataChannel pair, incl. the reliable-datachannel echo — the
-  project's final-goal demo shape).
+  project's final-goal demo shape), `protobufes*.test.ts` (the binding, verified
+  against real `protoc-gen-es` output), and **`conformance.test.ts`** (a TS
+  client driving a **real Go `drpc.Server`** over UDP — see below).
 - `pnpm check` (`tsc --noEmit`, strict) → clean.
 - `pnpm build` (tsdown) → clean; emits `dist/index.mjs` + `dist/webrtc.mjs`
   with `.d.mts`. `dist/` is gitignored.
@@ -88,10 +92,17 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
 ## Remaining M6 work (after the audit)
 
 1. **Re-run the adversarial audit** and fix confirmed findings (see above).
-2. **Go ↔ TS conformance CI.** The strongest guarantee: stand a Go `drpc.Server`
-   behind a real transport (or a pipe), drive it from the TS `Conn`, and assert
-   all four RPC types + loss recovery. The golden-vector tests already pin the
-   encoding statically; this pins the *behavior* across implementations.
+2. **Go ↔ TS conformance** — **done** (`test/conformance.test.ts`). A TS `Conn`
+   using the generated `Echo` descriptors drives a real Go `drpc.Server`
+   (`conformance/udpserver`, serving `internal/echo` over `transport/udp`) via
+   the new Node UDP adapter, and asserts all four RPC types plus metadata and a
+   Go-encoded proto `Timestamp`, matching the Go handler's semantics
+   (`CircularShift`, ascending sequence). This pins the *behavior* across
+   implementations, where the golden vectors pin the encoding. The test
+   `skipIf(!go)`, so `pnpm test` still runs without a Go toolchain. **Remaining:
+   CI wiring** (install Go + run it in the pipeline) and **loss-recovery
+   conformance** — loopback UDP does not drop, so the §10 retransmission path
+   is not yet exercised cross-language (needs a lossy proxy between the two).
 3. **`examples/`** — a runnable browser↔Go WebRTC datachannel echo (the
    final-goal demo, cross-language this time).
 4. **Packaging** — decide the published name/scope (currently
