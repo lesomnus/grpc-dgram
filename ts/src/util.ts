@@ -66,6 +66,8 @@ export class FrameQueue {
   private buf: Frame[] = []
   private readWaiters: (() => void)[] = []
   private spaceWaiters: (() => void)[] = []
+  // Tail of the FIFO chain that serializes putBlocking callers (see there).
+  private putTail: Promise<void> = Promise.resolve()
 
   constructor(readonly cap: number) {}
 
@@ -105,28 +107,45 @@ export class FrameQueue {
   // for a finished call is moot) and by the rx signal (adapter teardown); it
   // returns false only for the signal bound — the frame is lost while the
   // call is still live, which on a reliable channel must fail loud.
+  //
+  // Putters are serialized in call order (the `putTail` chain), so a later
+  // putter can never steal a freed slot from an earlier parked one: the
+  // buffered channel this stands in for is a true FIFO. A conforming reliable
+  // adapter delivers one frame per stream at a time (§4.2), so the chain is
+  // uncontended — a single already-resolved await, effectively free — but the
+  // guarantee holds even if an adapter delivers concurrently.
   async putBlocking(f: Frame, done: Latch, signal?: AbortSignal): Promise<boolean> {
-    for (;;) {
-      // A ready buffer always wins: a dead rx signal must not race delivery
-      // (an adapter flushing its queue after transport death still delivers
-      // every frame that fits).
-      if (this.tryPut(f)) return true
-      if (done.tripped) return true
-      if (signal?.aborted) return false
-      let dispose = noop
-      const waits: Promise<unknown>[] = [this.space(), done.wait()]
-      if (signal !== undefined) {
-        waits.push(
-          new Promise<void>((res) => {
-            dispose = abortListener(signal, res)
-          }),
-        )
+    const prev = this.putTail
+    let release = noop
+    this.putTail = new Promise<void>((r) => {
+      release = r
+    })
+    try {
+      await prev // wait my turn: everything queued before me finishes first
+      for (;;) {
+        // A ready buffer always wins: a dead rx signal must not race delivery
+        // (an adapter flushing its queue after transport death still delivers
+        // every frame that fits).
+        if (this.tryPut(f)) return true
+        if (done.tripped) return true
+        if (signal?.aborted) return false
+        let dispose = noop
+        const waits: Promise<unknown>[] = [this.space(), done.wait()]
+        if (signal !== undefined) {
+          waits.push(
+            new Promise<void>((res) => {
+              dispose = abortListener(signal, res)
+            }),
+          )
+        }
+        try {
+          await Promise.race(waits)
+        } finally {
+          dispose()
+        }
       }
-      try {
-        await Promise.race(waits)
-      } finally {
-        dispose()
-      }
+    } finally {
+      release()
     }
   }
 

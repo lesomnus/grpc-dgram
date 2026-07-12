@@ -5,11 +5,10 @@ before continuing the port.
 
 ## TL;DR
 
-The TypeScript port of drpc v1.0 (`../PROTOCOL.md`) is **functionally
-complete and green**, but has **not yet been adversarially validated** the way
-the Go implementation was — that validation pass was launched and then **killed
-by a token limit** (details below). Treat the port as "works, all tests pass,
-not yet audited."
+The TypeScript port of drpc v1.0 (`../PROTOCOL.md`) is **functionally complete,
+green, and adversarially audited** (4 findings found and fixed — see below).
+Cross-language interop with the Go server is verified at runtime over UDP. What
+remains is packaging polish and optional Go-parity stretch items.
 
 ## Done
 
@@ -32,7 +31,9 @@ the Go reference. Layout under `ts/src/`:
 
 Verified at this commit:
 
-- `pnpm test` → **106 passing** (9 files). Mirrors the Go suites:
+- `pnpm test` → **116 passing** (12 files). Mirrors the Go suites, plus the
+  audit regression pins (`node-udp.test.ts`, `server-cap.test.ts`,
+  `util.test.ts`):
   `wire.test.ts` (the §5 golden byte vectors, **byte-identical to Go** — the
   cross-implementation contract), `e2e.test.ts` (four RPC types, EOF, metadata,
   deadlines, cancel, reliable-mode fail-loud, lifecycle), `timeout.test.ts`
@@ -48,33 +49,47 @@ Verified at this commit:
 - `pnpm build` (tsdown) → clean; emits `dist/index.mjs` + `dist/webrtc.mjs`
   with `.d.mts`. `dist/` is gitignored.
 
-## Failed / interrupted (token limit)
+## Adversarial audit — done (4 findings fixed)
 
-A **three-way adversarial audit** (spec ↔ `ts/src` ↔ Go reference) was launched
-as a background workflow — 10 focused reviewers (wire, seq, conn-rx, conn-tx,
-conn-sweep, server-demux, server-stream, server-sweep, async-translation,
-test-adequacy) feeding an adversarial multi-lens verify stage, the same shape
-that found and fixed dozens of bugs in the Go implementation.
+A three-way audit (spec ↔ `ts/src` ↔ Go reference) ran across the highest-risk
+translations: server map restructuring, the async/no-mutex claim, wire decode +
+seq wrap, and the adapters. (An earlier attempt was killed by a token limit;
+this one completed.) Four findings, all fixed with teeth-verified regression
+tests:
 
-It was **killed mid-Review phase when the Fable 5 token limit was hit**
-(`status: killed`, "You've reached your Fable 5 limit"). **No findings were
-produced** — the port has therefore had *no* adversarial review yet. This is
-the **#1 follow-up**: re-run the audit on a model with budget. Highest-risk
-areas to point it at, because they are the least mechanical translations:
+- **`node-udp.ts` — connected-socket ICMP unreachable tore the endpoint down**
+  (major). A connected UDP socket delivers ECONNREFUSED/EHOSTUNREACH/ENETUNREACH
+  as an `'error'` event (not the send callback), and the socket stays usable —
+  but the handler called `close()` unconditionally, so the first ICMP unreachable
+  from a restarting server permanently closed the socket and failed the call
+  `UNAVAILABLE`, breaking the restart-ride-out §4.5 contract Go's `transport/udp`
+  honors. Fixed to ignore `transient()` errors, matching Go. (`test/node-udp.test.ts`)
+- **`server.ts` — §15 cap under-count after disconnect + same-key reuse** (major,
+  low exposure). `finish()` decremented `this.slots.get(peer).liveCalls`; if the
+  slot was deleted by `disconnectPeer` and the key reused before the call
+  unwound, it decremented the *new* slot's counter, under-enforcing
+  `MaxLiveCalls`. Fixed to decrement the slot the call was created on
+  (`st.slot`), mirroring Go's `livePeer` map surviving `DisconnectPeer`. Not
+  reachable through the shipped fresh-key adapters, but the new `node-udp`
+  gateway uses stable keys. (`test/server-cap.test.ts`)
+- **`util.ts` — `FrameQueue.putBlocking` not FIFO-safe** (low, latent). With ≥2
+  putters parked on one queue, freeing a slot woke all and let the first to run
+  `tryPut` win, so a later frame could jump an earlier one (reliable-mode
+  reorder). Not reachable via a conforming sequential-delivery adapter, but the
+  primitive stands in for a Go channel (a true FIFO), so hardened with a
+  call-order chain. (`test/util.test.ts`)
+- **`wire.ts` — metadata map entry order** (minor, harmless). Emitted in JS
+  insertion order; both sides decode fine and the golden vectors omit metadata,
+  but sorting keys makes the encoding deterministic and matches Go's
+  `Deterministic` marshal, so it now sorts.
 
-- **`server.ts` map restructuring.** Go's flat maps keyed by `(peer,epoch,sid)`
-  became nested `slot → epoch → PeerState` with server-wide counters
-  (`pendingResetTotal`, `resetAtTotal`, `replyBudgetTotal`) standing in for
-  Go's flat-map `len()` cap checks. Verify every insert/delete keeps those
-  counters exact and that slot/container GC can't strand or double-count.
-- **The async translation claim.** The port drops Go's mutexes on the argument
-  that "state transitions are synchronous between `await` points." The reliable-
-  mode blocking puts (`FrameQueue.putBlocking`) and the synchronous test pipes
-  (transmit → peer handle → back into this endpoint within one microtask chain)
-  are where that claim is most load-bearing. Audit for interleavings Go's locks
-  would have excluded.
-- **`wire.ts` decode on hostile input** (truncation, huge varints, malformed
-  metadata) and **`seq.ts` 32-bit wrap** vs Go `uint32`.
+Everything else the audit attacked was verified clean: all other counter
+paths and GC, the demux→open no-await double-create window, re-entrant
+transmit, `wire.ts` hostile-input decode (truncation/overlong varint/wrong
+wire-type all throw or skip safely), negative/boundary Duration, explicit
+presence, `seq.ts` 32-bit wrap and window verdicts (byte-identical to Go),
+adapter teardown paths, §4.4 synchronous size refusal, webrtc backpressure,
+and unhandled-rejection/leak review.
 
 ## Deliberately NOT ported (not gaps)
 

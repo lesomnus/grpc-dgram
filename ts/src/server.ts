@@ -467,6 +467,7 @@ export class Server {
     const rxCfg = this.methodRx.get(reg.desc.path) ?? this.rxCfg
     const st = new ServerStream(this, ctx.peer, f.epoch, f.sid, reg, codec, rxCfg, rel)
     st.ps = ps
+    st.slot = slot
 
     // The client-asserted budget bounds the handler ctx, clamped by the
     // server cap when configured (PROTOCOL.md §10.2). A non-positive budget
@@ -616,7 +617,9 @@ export class Server {
 
   private finish(st: ServerStream<unknown, unknown>, term: Frame | undefined): void {
     const now = nowMs()
-    const slot = this.slots.get(st.peer)
+    // Decrement the slot this call was created on (st.slot), not the one the
+    // peer key currently maps to — see ServerStream.slot.
+    const slot = st.slot
     const ps = st.ps
     if (ps !== undefined) {
       ps.calls.delete(st.sid)
@@ -1010,6 +1013,13 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   readonly context: ServerContext
 
   /** @internal */ ps: PeerState | undefined
+  // The PeerSlot this call was created on. finish() decrements ITS liveCalls,
+  // not whatever slot the peer key currently maps to: a disconnectPeer can
+  // delete the slot and a reused key can install a fresh one before this call
+  // unwinds, and decrementing the new slot (never incremented for this call)
+  // would under-count and under-enforce the §15 per-peer cap. Go is immune
+  // because its flat livePeer map survives DisconnectPeer (server.go).
+  /** @internal */ slot: PeerSlot | undefined
   /** @internal */ deadlineAt: number | undefined
   /** @internal */ deadlineTimer: ReturnType<typeof setTimeout> | undefined
   /** @internal */ metadata: Metadata | undefined

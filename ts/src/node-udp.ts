@@ -85,7 +85,16 @@ export class UdpTransport implements FrameHandler, TransportInfo, ConnAttacher {
       // just drains the datagram's frames in order.
       void unpack(frames, conn, {})
     })
-    this.socket.on('error', (err) => this.close(err))
+    this.socket.on('error', (err) => {
+      // On a *connected* socket an ICMP unreachable (ECONNREFUSED etc.) is
+      // delivered here, not to the send callback — and the socket stays
+      // usable. That is datagram loss, not transport death: ride it out so a
+      // momentarily absent peer (a restarting server) is survived, exactly as
+      // Go's serve loop does (transport/udp/udp.go). Only a genuinely fatal
+      // error tears the endpoint down (§4.5).
+      if (transient(err)) return
+      this.close(err)
+    })
     this.socket.on('close', () => this.conn?.close())
   }
 

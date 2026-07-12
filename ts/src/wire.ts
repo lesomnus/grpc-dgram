@@ -263,9 +263,14 @@ function decodeDuration(data: Uint8Array): number {
 
 function encodeMetadata(md: Metadata): Uint8Array {
   const w = new Writer()
-  for (const [key, values] of Object.entries(md)) {
+  // Emit map entries sorted by key: protobuf map ordering is semantically
+  // insignificant, but a stable order makes the encoding deterministic and
+  // aligns it with Go's proto.Marshal Deterministic mode (which sorts map
+  // keys), so re-encodings are byte-comparable. Value order within an entry
+  // is preserved (it IS significant).
+  for (const key of Object.keys(md).sort()) {
     const entry = new Writer()
-    for (const v of values) entry.string(1, v)
+    for (const v of md[key]!) entry.string(1, v)
     const kv = new Writer()
     kv.string(1, key)
     kv.bytes(2, entry.finish())
