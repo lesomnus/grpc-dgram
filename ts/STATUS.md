@@ -92,6 +92,16 @@ presence, `seq.ts` 32-bit wrap and window verdicts (byte-identical to Go),
 adapter teardown paths, §4.4 synchronous size refusal, webrtc backpressure,
 and unhandled-rejection/leak review.
 
+The Connect-ES transport got its own review (streaming contract, error/metadata
+mapping, cancellation/leak). One finding, fixed: `connect.ts` fed raw drpc
+metadata straight into the WHATWG `Headers` API, which throws a `TypeError` on
+a value with a newline/control char or a non-latin1 codepoint (emoji) or a
+non-token key — so a spec-legal server response (§11 imposes no character
+limit) crashed the call with a raw `TypeError` instead of returning the message
+or a `ConnectError`, at all five conversion sites. Fixed with a total,
+never-throwing `safeAppend` that drops only the entries HTTP headers cannot
+represent; the message and status always surface. (`test/connect.test.ts`)
+
 ## Deliberately NOT ported (not gaps)
 
 Do not "fix" these — they are intentional, matching the Go feature set or TS

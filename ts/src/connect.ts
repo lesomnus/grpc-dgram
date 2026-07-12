@@ -38,16 +38,34 @@ function headersToMetadata(h: HeadersInit | undefined): Metadata | undefined {
   return md
 }
 
+// safeAppend adds one metadata entry to Headers, skipping any key/value the
+// WHATWG Headers API rejects. drpc metadata is arbitrary strings (proto §11 —
+// a value may hold a newline, control char, or non-latin1 codepoint like an
+// emoji), but Headers.append throws a TypeError on those. Dropping the entry
+// keeps the conversion total: a spec-legal server response must surface its
+// message and status, never crash the call with a raw TypeError. Only entries
+// HTTP headers cannot represent are lost.
+function safeAppend(headers: Headers, key: string, value: string): void {
+  try {
+    headers.append(key, value)
+  } catch {
+    // unrepresentable as an HTTP header — drop rather than fail the call
+  }
+}
+
+function appendMetadata(headers: Headers, md: Metadata | undefined): void {
+  if (md === undefined) return
+  for (const [key, values] of Object.entries(md)) {
+    for (const v of values) safeAppend(headers, key, v)
+  }
+}
+
 // metadataToHeaders converts drpc Metadata into Connect Headers, appending each
 // value so multi-value entries are preserved on the wire (Headers re-combines
 // them on read).
 function metadataToHeaders(md: Metadata | undefined): Headers {
   const headers = new Headers()
-  if (md !== undefined) {
-    for (const [key, values] of Object.entries(md)) {
-      for (const v of values) headers.append(key, v)
-    }
-  }
+  appendMetadata(headers, md)
   return headers
 }
 
@@ -56,17 +74,13 @@ function metadataToHeaders(md: Metadata | undefined): Headers {
 // straight over; header + trailer metadata are attached to ConnectError.metadata.
 function toConnectError(err: unknown, header?: Metadata, trailer?: Metadata): ConnectError {
   const meta = metadataToHeaders(header)
-  if (trailer !== undefined) {
-    for (const [key, values] of Object.entries(trailer)) {
-      for (const v of values) meta.append(key, v)
-    }
-  }
+  appendMetadata(meta, trailer)
   if (err instanceof StatusError) {
     return new ConnectError(err.desc, err.code as unknown as ConnectCode, meta, undefined, err)
   }
   const ce = ConnectError.from(err)
-  // Preserve any metadata we gathered.
-  meta.forEach((v, k) => ce.metadata.append(k, v))
+  // Preserve any metadata we gathered (meta already holds only valid entries).
+  meta.forEach((v, k) => safeAppend(ce.metadata, k, v))
   return ce
 }
 
@@ -173,12 +187,7 @@ export function createDrpcTransport(conn: Conn): Transport {
         // The stream ended cleanly: publish the trailer for the post-iteration
         // onTrailer read (Connect reads response.trailer only after the message
         // iterable is exhausted).
-        const t = s.trailer()
-        if (t !== undefined) {
-          for (const [key, values] of Object.entries(t)) {
-            for (const v of values) trailer.append(key, v)
-          }
-        }
+        appendMetadata(trailer, s.trailer())
       })()
 
       return {

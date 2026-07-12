@@ -102,6 +102,31 @@ describe('Connect client over drpc', () => {
     expect(trailer?.get('x-timing')).toBe('trailer')
   })
 
+  it('server metadata that is not a legal HTTP header does not crash the call', async () => {
+    // drpc metadata is arbitrary strings (§11): a newline, an emoji, or an
+    // invalid header name would make Headers.append throw a TypeError. The
+    // transport must still deliver the message and keep the representable
+    // metadata (audit regression).
+    let server!: Server
+    let conn!: Conn
+    conn = new Conn({ handle: async (f) => void (await server.handle(f, { peer: 'p' })) }, { reliable: true })
+    server = new Server({ handle: async (f) => void (await conn.handle(f, {})) }, { reliable: true })
+    server.register(Echo.once, (_req, ctx) => {
+      ctx.setHeader({ 'x-good': ['ok'], 'x-newline': ['a\nb'], 'x-emoji': ['\u{1F600}'] })
+      ctx.setTrailer({ 'x-trailer': ['fine'], 'bad name': ['v'] })
+      return create(EchoResponseSchema, { message: 'echo:hi' })
+    })
+    const client = createClient(EchoService, createDrpcTransport(conn))
+    let header: Headers | undefined
+    let trailer: Headers | undefined
+    const res = await client.once({ message: 'hi' }, { onHeader: (h) => (header = h), onTrailer: (t) => (trailer = t) })
+    expect(res.message).toBe('echo:hi') // the call succeeded, message delivered
+    expect(header?.get('x-good')).toBe('ok') // representable metadata survives
+    expect(header?.has('x-newline')).toBe(false) // unrepresentable dropped, not thrown
+    expect(header?.has('x-emoji')).toBe(false)
+    expect(trailer?.get('x-trailer')).toBe('fine')
+  })
+
   it('a method the server never registered surfaces as UNIMPLEMENTED', async () => {
     // A bare server that registers only `many`, so `once` is unknown (§13).
     let server!: Server
