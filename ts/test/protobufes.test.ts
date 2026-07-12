@@ -1,4 +1,4 @@
-// The protobuf-es binding (src/transport/protobuf-es.ts): a real protobuf-es v2 message
+// The protobuf-es binding (src/transport/protobuf-es/index.ts): a real protobuf-es v2 message
 // round-trips over the transport through a descriptor DERIVED from a
 // protobuf-es method descriptor — no hand-written path, streaming kind, or
 // codec. Uses the well-known StringValue wrapper as a stand-in for a generated

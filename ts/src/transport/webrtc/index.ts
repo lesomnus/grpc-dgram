@@ -25,13 +25,13 @@
 // Frames are still delivered strictly in order, one at a time, awaiting the
 // core — the §4.2 no-silent-drop contract holds; memory is the cost.
 
-import type { Conn } from '../conn'
-import type { Server } from '../server'
-import { MessageTooLargeError } from '../status'
-import type { FrameContext, FrameHandler } from '../seam'
-import { unpack } from '../seam'
-import { abortListener, Latch, noop, unrefTimer } from '../util'
-import { decodeEnvelop, encodeEnvelop, type Frame } from '../wire'
+import type { Conn } from '../../conn'
+import type { Server } from '../../server'
+import { MessageTooLargeError } from '../../status'
+import type { FrameContext, FrameHandler } from '../../seam'
+import { unpack } from '../../seam'
+import { abortListener, Latch, noop, unrefTimer } from '../../util'
+import { decodeEnvelop, encodeEnvelop, type Frame } from '../../wire'
 
 // DefaultMaxMessageSizeUnreliable keeps an envelop inside one SCTP packet on
 // the typical 1500-byte path MTU: a partially-reliable message that SCTP

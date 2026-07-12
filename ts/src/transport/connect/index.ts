@@ -2,7 +2,7 @@
 // ergonomics (`createClient(Service, transport)`) while the wire traffic runs
 // over drpc (datagram RPC) to a drpc server — Go or TS. The bridge is thin
 // because Connect's Transport receives protobuf-es method descriptors, exactly
-// what `fromMethod` (src/transport/protobuf-es.ts) turns into a drpc MethodDesc, and the
+// what `fromMethod` (src/transport/protobuf-es/index.ts) turns into a drpc MethodDesc, and the
 // drpc Conn already implements all four RPC shapes.
 //
 // Entry: `@lesomnus/grpc-dgram/transport/connect`. `@connectrpc/connect` and
@@ -18,11 +18,11 @@
 
 import { create, type DescMessage, type DescMethodStreaming, type DescMethodUnary, type MessageInitShape, type MessageShape } from '@bufbuild/protobuf'
 import { Code as ConnectCode, ConnectError, type ContextValues, type StreamResponse, type Transport, type UnaryResponse } from '@connectrpc/connect'
-import type { ClientStream, Conn } from '../conn'
-import type { CallOptions } from '../desc'
-import type { Metadata } from '../metadata'
-import { fromMethod } from './protobuf-es'
-import { StatusError } from '../status'
+import type { ClientStream, Conn } from '../../conn'
+import type { CallOptions } from '../../desc'
+import type { Metadata } from '../../metadata'
+import { fromMethod } from '../protobuf-es'
+import { StatusError } from '../../status'
 
 // headersToMetadata converts Connect's Fetch Headers into drpc Metadata. The
 // Headers API combines same-name values with ", " (except set-cookie), so a

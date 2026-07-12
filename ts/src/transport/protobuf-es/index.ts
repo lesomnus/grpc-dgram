@@ -16,7 +16,7 @@
 
 import { fromBinary, toBinary, type DescMessage, type DescMethod, type MessageShape } from '@bufbuild/protobuf'
 import type { GenService, GenServiceMethods } from '@bufbuild/protobuf/codegenv2'
-import type { BidiDesc, ClientStreamingDesc, MethodDesc, PayloadCodec, ServerStreamingDesc, UnaryDesc } from '../desc'
+import type { BidiDesc, ClientStreamingDesc, MethodDesc, PayloadCodec, ServerStreamingDesc, UnaryDesc } from '../../desc'
 
 // codecFor turns a protobuf-es message descriptor into a drpc PayloadCodec.
 // The wire codec name stays '' (proto, §12) — protobuf-es marshals the same

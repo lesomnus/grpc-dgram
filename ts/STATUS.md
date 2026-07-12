@@ -13,9 +13,10 @@ remains is packaging polish and optional Go-parity stretch items.
 ## Done
 
 Client + server core and the WebRTC DataChannel adapter, wire-compatible with
-the Go reference. The zero-dep core lives in `ts/src/`; the third-party /
-platform adapters live in `ts/src/transport/` (exported as
-`@lesomnus/grpc-dgram/transport/*`), mirroring Go's `transport/` layout.
+the Go reference. The zero-dep core lives in `ts/src/`; each third-party /
+platform adapter is its **own directory** under `ts/src/transport/` — an
+`index.ts` plus a `README.md` — exported as `@lesomnus/grpc-dgram/transport/*`,
+mirroring Go's `transport/{udp,pion,gorilla}/` layout (dir + README each).
 
 | File | Role | Go twin |
 |---|---|---|
@@ -27,10 +28,10 @@ platform adapters live in `ts/src/transport/` (exported as
 | `util.ts` | `Latch`, `FrameQueue` (drop-policy + reliable blocking put), `Sweeper` | Go channels/goroutines |
 | `conn.ts` | `Conn` + `ClientStream`, client unreliable-mode machinery | `conn.go`, `stream.go`, `unreliable.go` |
 | `server.ts` | `Server` + server stream, per-peer state, sweep, caps | `server.go`, `stream.go`, `unreliable_server.go` |
-| `transport/webrtc.ts` | `DataChannelTransport` (client) + `DataChannelGateway` (server, mixed-mode) | `transport/pion/*.go` |
-| `transport/node-udp.ts` | `UdpTransport`/`UdpGateway` + `dialUdp`/`listenUdp` (Node `dgram`) | `transport/udp/*.go` |
-| `transport/protobuf-es.ts` | `fromService`/`fromMethod` — derive descriptors from generated protobuf-es | grpc-go codegen (G2) |
-| `transport/connect.ts` | `createDrpcTransport` — a Connect-ES `Transport` over a drpc `Conn` | — (Connect interop) |
+| `transport/webrtc/` | `DataChannelTransport` (client) + `DataChannelGateway` (server, mixed-mode) | `transport/pion/*.go` |
+| `transport/node-udp/` | `UdpTransport`/`UdpGateway` + `dialUdp`/`listenUdp` (Node `dgram`) | `transport/udp/*.go` |
+| `transport/protobuf-es/` | `fromService`/`fromMethod` — derive descriptors from generated protobuf-es | grpc-go codegen (G2) |
+| `transport/connect/` | `createDrpcTransport` — a Connect-ES `Transport` over a drpc `Conn` | — (Connect interop) |
 
 Verified at this commit:
 

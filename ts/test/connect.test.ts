@@ -1,4 +1,4 @@
-// The Connect-ES transport (src/transport/connect.ts): a standard Connect client
+// The Connect-ES transport (src/transport/connect/index.ts): a standard Connect client
 // (createClient) drives all four RPC types over a drpc Conn talking to a drpc
 // Server, with header/trailer metadata and ConnectError mapping.
 

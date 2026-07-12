@@ -16,12 +16,12 @@
 // protocol rides out.
 
 import { createSocket, type RemoteInfo, type Socket } from 'node:dgram'
-import type { Conn } from '../conn'
-import { MessageTooLargeError } from '../status'
-import type { Server } from '../server'
-import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '../seam'
-import { unpack } from '../seam'
-import { decodeEnvelop, encodeEnvelop, type Frame } from '../wire'
+import type { Conn } from '../../conn'
+import { MessageTooLargeError } from '../../status'
+import type { Server } from '../../server'
+import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '../../seam'
+import { unpack } from '../../seam'
+import { decodeEnvelop, encodeEnvelop, type Frame } from '../../wire'
 
 // DefaultMaxMessageSize keeps a datagram under the typical 1500-byte path MTU
 // with room for IP/UDP headers and a tunnel or two.

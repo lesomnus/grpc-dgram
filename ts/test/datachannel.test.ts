@@ -1,4 +1,4 @@
-// The WebRTC DataChannel adapter (src/transport/webrtc.ts) against a mock channel pair
+// The WebRTC DataChannel adapter (src/transport/webrtc/index.ts) against a mock channel pair
 // implementing the standard RTCDataChannel surface — reliability
 // autodetection, §4.4 size refusal, open/backpressure gating, and the §4.5
 // teardown duty. The reliable echo e2e at the top is the TS twin of the Go
