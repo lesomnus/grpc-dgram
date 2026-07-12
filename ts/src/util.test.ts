@@ -3,8 +3,8 @@
 // from an earlier parked one, reordering reliable-mode delivery (§14).
 
 import { describe, expect, it } from 'vitest'
-import { FrameQueue, Latch } from '../src/util'
-import { frame, type Frame } from '../src/wire'
+import { FrameQueue, Latch } from './util'
+import { frame, type Frame } from './wire'
 
 const F = (seq: number): Frame => frame({ seq })
 

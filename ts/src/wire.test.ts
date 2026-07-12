@@ -3,7 +3,7 @@
 // produce and accept encodings identical to the Go implementation.
 
 import { describe, expect, it } from 'vitest'
-import { decodeEnvelop, decodeFrame, encodeEnvelop, encodeFrame, FlagClose, FlagOpen, frame } from '../src/wire'
+import { decodeEnvelop, decodeFrame, encodeEnvelop, encodeFrame, FlagClose, FlagOpen, frame } from './wire'
 
 const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, '0')).join('')
 const unhex = (s: string) => new Uint8Array([...(s.match(/../g) ?? [])].map((x) => parseInt(x, 16)))

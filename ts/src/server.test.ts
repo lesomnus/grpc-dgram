@@ -3,10 +3,10 @@
 // live-call counter, under-enforcing the §15 per-peer MaxLiveCalls cap.
 
 import { describe, expect, it } from 'vitest'
-import { Server } from '../src/server'
-import { Code } from '../src/status'
-import { FlagOpen, isTerminal, type Frame } from '../src/wire'
-import { echo, registerEcho, tick } from './helpers'
+import { Server } from './server'
+import { Code } from './status'
+import { FlagOpen, isTerminal, type Frame } from './wire'
+import { echo, registerEcho, tick } from './testing'
 
 function openLive(epoch: number, sid: number): Frame {
   return { epoch, sid, seq: 1, flags: FlagOpen, method: echo.live.path, codec: '', desc: '', peerEpoch: 0 }

@@ -5,12 +5,12 @@
 import { create } from '@bufbuild/protobuf'
 import { Code as ConnectCode, ConnectError, createClient } from '@connectrpc/connect'
 import { describe, expect, it } from 'vitest'
-import { Conn } from '../src/conn'
-import { createDrpcTransport } from '../src/transport/connect'
-import { fromService } from '../src/transport/protobuf-es'
-import { Server } from '../src/server'
-import { Code, statusError } from '../src/status'
-import { EchoBatchResponseSchema, EchoRequestSchema, EchoResponseSchema, EchoService } from './gen/echo/echo_pb.js'
+import { Conn } from '../../conn'
+import { createDrpcTransport } from './index'
+import { fromService } from '../protobuf-es'
+import { Server } from '../../server'
+import { Code, statusError } from '../../status'
+import { EchoBatchResponseSchema, EchoRequestSchema, EchoResponseSchema, EchoService } from '../../testing/gen/echo/echo_pb.js'
 
 const Echo = fromService(EchoService)
 

@@ -9,7 +9,7 @@ import { Code, type StatusError } from '../src/status'
 import type { FrameHandler } from '../src/seam'
 import type { Timing } from '../src/timing'
 import { isReset, type Frame } from '../src/wire'
-import { echo, registerEcho, tick, wireClone } from './helpers'
+import { echo, registerEcho, tick, wireClone } from '../src/testing'
 
 const fast: Timing = { callMs: 300, livenessMs: 450, retransmitMs: 50, tombstoneMs: 1000, holdMs: 50 }
 

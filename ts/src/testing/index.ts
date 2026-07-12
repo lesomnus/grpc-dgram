@@ -2,11 +2,11 @@
 // transports that round-trip every frame through the real wire codec (the
 // same way the Go e2e pipes marshal real Envelops).
 
-import { Conn, type ConnOptions } from '../src/conn'
-import { bidiMethod, clientStreamingMethod, serverStreamingMethod, unaryMethod, type PayloadCodec } from '../src/desc'
-import { Server, type ServerOptions } from '../src/server'
-import type { FrameContext, FrameHandler } from '../src/seam'
-import { decodeFrame, encodeFrame, type Frame } from '../src/wire'
+import { Conn, type ConnOptions } from '../conn'
+import { bidiMethod, clientStreamingMethod, serverStreamingMethod, unaryMethod, type PayloadCodec } from '../desc'
+import { Server, type ServerOptions } from '../server'
+import type { FrameContext, FrameHandler } from '../seam'
+import { decodeFrame, encodeFrame, type Frame } from '../wire'
 
 export interface TestReq {
   text: string

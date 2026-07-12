@@ -159,9 +159,16 @@ The Node/pion-style read-loop blocking does not exist in a browser.
 
 ## Tests
 
-`pnpm test` — 90 tests mirroring the Go suites: the §5 golden wire vectors
+`pnpm test` — 127 tests mirroring the Go suites: the §5 golden wire vectors
 byte-for-byte, e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,
 probes, liveness), the §6.5 restart walkthroughs, §15 caps and §4.2 drop
-policies, and the DataChannel adapter against a mock channel pair (including
-the reliable-datachannel echo, the project's final-goal demo shape).
+policies, each adapter (WebRTC/UDP/protobuf-es/Connect) next to its source, and
+a cross-language conformance test driving a real Go `drpc.Server`.
+
+**Layout.** Unit and per-adapter tests are **co-located** next to their source
+(`src/wire.test.ts`, `src/transport/webrtc/index.test.ts`, …); cross-cutting
+integration tests (e2e, timeout, restart, limits, conformance) stay in
+`test/`. Shared test infrastructure — the echo fixtures and the generated
+`protoc-gen-es` code — lives in `src/testing/` (not an entry, not published).
+None of it reaches `dist/` (tsdown builds only the `exports` entries).

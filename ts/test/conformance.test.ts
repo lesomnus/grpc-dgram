@@ -20,7 +20,7 @@ import { Conn } from '../src/conn'
 import { createDrpcTransport } from '../src/transport/connect'
 import { dialUdp } from '../src/transport/node-udp'
 import { fromService } from '../src/transport/protobuf-es'
-import { EchoRequestSchema, EchoResponseSchema, EchoService } from './gen/echo/echo_pb.js'
+import { EchoRequestSchema, EchoResponseSchema, EchoService } from '../src/testing/gen/echo/echo_pb.js'
 
 const repoRoot = resolve(process.cwd(), '..')
 const Echo = fromService(EchoService)

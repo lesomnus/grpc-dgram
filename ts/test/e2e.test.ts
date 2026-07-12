@@ -7,7 +7,7 @@ import { EndOfStreamError } from '../src/conn'
 import { unaryMethod } from '../src/desc'
 import { Code, StatusError, statusError } from '../src/status'
 import { FlagOpen, frame } from '../src/wire'
-import { echo, jsonCodec, makeNet, tick, type TestRes } from './helpers'
+import { echo, jsonCodec, makeNet, tick, type TestRes } from '../src/testing'
 
 describe('unary', () => {
   it('round-trips', async () => {

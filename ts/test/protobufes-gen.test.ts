@@ -13,7 +13,7 @@ import { Conn } from '../src/conn'
 import { fromService } from '../src/transport/protobuf-es'
 import { Server } from '../src/server'
 import { isOpen, type Frame } from '../src/wire'
-import { EchoBatchResponseSchema, EchoRequestSchema, EchoResponseSchema, EchoService } from './gen/echo/echo_pb.js'
+import { EchoBatchResponseSchema, EchoRequestSchema, EchoResponseSchema, EchoService } from '../src/testing/gen/echo/echo_pb.js'
 
 // Derive every method from the generated service — nothing hand-written.
 const Echo = fromService(EchoService)

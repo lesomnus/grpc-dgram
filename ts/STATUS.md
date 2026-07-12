@@ -35,9 +35,13 @@ mirroring Go's `transport/{udp,pion,gorilla}/` layout (dir + README each).
 
 Verified at this commit:
 
-- `pnpm test` → **126 passing** (13 files). Mirrors the Go suites, plus the
-  audit regression pins (`node-udp.test.ts`, `server-cap.test.ts`,
-  `util.test.ts`):
+- `pnpm test` → **127 passing** (13 files). Unit and per-adapter tests are
+  co-located next to their source (`src/wire.test.ts`,
+  `src/transport/connect/index.test.ts`, …); cross-cutting integration tests
+  (e2e, timeout, restart, limits, conformance, protobufes-gen) stay in `test/`;
+  shared fixtures + generated code live in `src/testing/` (not an entry, never
+  in `dist/`). Mirrors the Go suites, plus the audit regression pins
+  (`transport/node-udp/index.test.ts`, `server.test.ts`, `util.test.ts`):
   `wire.test.ts` (the §5 golden byte vectors, **byte-identical to Go** — the
   cross-implementation contract), `e2e.test.ts` (four RPC types, EOF, metadata,
   deadlines, cancel, reliable-mode fail-loud, lifecycle), `timeout.test.ts`

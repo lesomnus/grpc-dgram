@@ -7,7 +7,7 @@ import { Server } from '../src/server'
 import { Code, type StatusError } from '../src/status'
 import type { Timing } from '../src/timing'
 import { FlagOpen, isClose, isData, isHeaderFrame, isOpen, isPing, isTerminal, type Frame } from '../src/wire'
-import { echo, makeNet, registerEcho, tick } from './helpers'
+import { echo, makeNet, registerEcho, tick } from '../src/testing'
 
 // probe = 150ms, tick = 25ms, T_call = 300ms, T_live = 450ms, RTI = 50ms.
 const fast: Timing = { callMs: 300, livenessMs: 450, retransmitMs: 50, tombstoneMs: 1000, holdMs: 50 }

@@ -5,11 +5,11 @@
 // pion adapter's final-goal demo.
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Conn } from '../src/conn'
-import { Server } from '../src/server'
-import { Code, type StatusError } from '../src/status'
-import { channelReliable, DataChannelGateway, DataChannelTransport, type DataChannelLike } from '../src/transport/webrtc'
-import { echo, registerEcho, tick } from './helpers'
+import { Conn } from '../../conn'
+import { Server } from '../../server'
+import { Code, type StatusError } from '../../status'
+import { channelReliable, DataChannelGateway, DataChannelTransport, type DataChannelLike } from './index'
+import { echo, registerEcho, tick } from '../../testing'
 
 class MockDC implements DataChannelLike {
   readyState = 'connecting'

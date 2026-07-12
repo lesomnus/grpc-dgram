@@ -8,10 +8,10 @@
 import { create, type DescMethod, type DescService } from '@bufbuild/protobuf'
 import { StringValueSchema, type StringValue } from '@bufbuild/protobuf/wkt'
 import { describe, expect, it } from 'vitest'
-import { Conn } from '../src/conn'
-import { fromMethod } from '../src/transport/protobuf-es'
-import { Server } from '../src/server'
-import { isOpen, type Frame } from '../src/wire'
+import { Conn } from '../../conn'
+import { fromMethod } from './index'
+import { Server } from '../../server'
+import { isOpen, type Frame } from '../../wire'
 
 // A fake method descriptor with the shape protoc-gen-es emits (service
 // typeName + proto method name + kind + input/output message schemas). The
