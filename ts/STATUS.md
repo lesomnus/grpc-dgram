@@ -28,10 +28,11 @@ the Go reference. Layout under `ts/src/`:
 | `webrtc.ts` | `DataChannelTransport` (client) + `DataChannelGateway` (server, mixed-mode) | `transport/pion/*.go` |
 | `node-udp.ts` | `UdpTransport`/`UdpGateway` + `dialUdp`/`listenUdp` (Node `dgram`) | `transport/udp/*.go` |
 | `protobufes.ts` | `fromService`/`fromMethod` — derive descriptors from generated protobuf-es | grpc-go codegen (G2) |
+| `connect.ts` | `createDrpcTransport` — a Connect-ES `Transport` over a drpc `Conn` | — (Connect interop) |
 
 Verified at this commit:
 
-- `pnpm test` → **116 passing** (12 files). Mirrors the Go suites, plus the
+- `pnpm test` → **126 passing** (13 files). Mirrors the Go suites, plus the
   audit regression pins (`node-udp.test.ts`, `server-cap.test.ts`,
   `util.test.ts`):
   `wire.test.ts` (the §5 golden byte vectors, **byte-identical to Go** — the
@@ -104,18 +105,19 @@ cannot pause delivery, so reliable-mode backpressure (§4.2) bounds ordering and
 loss but **not** adapter rx memory — inbound messages queue while a slow
 consumer drains. The Node/pion read-loop blocking has no browser equivalent.
 
-## Remaining M6 work (after the audit)
+## Remaining M6 work
 
-1. **Re-run the adversarial audit** and fix confirmed findings (see above).
+1. **Adversarial audit** — **done** (see the section above; 4 findings fixed).
 2. **Go ↔ TS conformance** — **done** (`test/conformance.test.ts`). A TS `Conn`
-   using the generated `Echo` descriptors drives a real Go `drpc.Server`
+   using the generated `Echo` descriptors — and, additionally, a **standard
+   Connect client** via `createDrpcTransport` — drives a real Go `drpc.Server`
    (`conformance/udpserver`, serving `internal/echo` over `transport/udp`) via
-   the new Node UDP adapter, and asserts all four RPC types plus metadata and a
+   the Node UDP adapter, and asserts all four RPC types plus metadata and a
    Go-encoded proto `Timestamp`, matching the Go handler's semantics
    (`CircularShift`, ascending sequence). This pins the *behavior* across
    implementations, where the golden vectors pin the encoding. The test
-   `skipIf(!go)`, so `pnpm test` still runs without a Go toolchain. **Remaining:
-   CI wiring** (install Go + run it in the pipeline) and **loss-recovery
+   `skipIf(!go)`, so `pnpm test` still runs without a Go toolchain, and CI is
+   wired (the `ts` job sets up Go and runs it). **Remaining: loss-recovery
    conformance** — loopback UDP does not drop, so the §10 retransmission path
    is not yet exercised cross-language (needs a lossy proxy between the two).
 3. **`examples/`** — a runnable browser↔Go WebRTC datachannel echo (the

@@ -6,6 +6,7 @@ export default defineConfig({
     webrtc: 'src/webrtc.ts',
     protobufes: 'src/protobufes.ts',
     'node-udp': 'src/node-udp.ts',
+    connect: 'src/connect.ts',
   },
   dts: true,
 })

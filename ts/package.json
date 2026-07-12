@@ -9,6 +9,7 @@
     "./webrtc": "./dist/webrtc.mjs",
     "./protobuf-es": "./dist/protobufes.mjs",
     "./node-udp": "./dist/node-udp.mjs",
+    "./connect": "./dist/connect.mjs",
     "./package.json": "./package.json"
   },
   "files": [
@@ -22,16 +23,21 @@
     "gen": "buf generate ../proto --template buf.gen.yaml"
   },
   "peerDependencies": {
-    "@bufbuild/protobuf": "^2"
+    "@bufbuild/protobuf": "^2",
+    "@connectrpc/connect": "^2"
   },
   "peerDependenciesMeta": {
     "@bufbuild/protobuf": {
+      "optional": true
+    },
+    "@connectrpc/connect": {
       "optional": true
     }
   },
   "devDependencies": {
     "@bufbuild/protobuf": "^2.12.1",
     "@bufbuild/protoc-gen-es": "^2.12.1",
+    "@connectrpc/connect": "^2.1.2",
     "@types/node": "^26.1.1",
     "tsdown": "^0.22.5",
     "typescript": "^7.0.2",

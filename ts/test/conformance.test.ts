@@ -10,12 +10,14 @@
 // pin the encoding, this pins the conversation.
 
 import { create } from '@bufbuild/protobuf'
+import { createClient } from '@connectrpc/connect'
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Conn } from '../src/conn'
+import { createDrpcTransport } from '../src/connect'
 import { dialUdp } from '../src/node-udp'
 import { fromService } from '../src/protobufes'
 import { EchoRequestSchema, EchoResponseSchema, EchoService } from './gen/echo/echo_pb.js'
@@ -147,5 +149,42 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
     expect(res.dateCreated!.seconds > 0n).toBe(true)
     // reference the response schema so the import is load-bearing
     expect(EchoResponseSchema.typeName).toBe('echo.EchoResponse')
+  })
+
+  // The same Go server, now driven by a STANDARD Connect client over the drpc
+  // transport — proving createClient(Service, transport) interoperates with a
+  // real Go drpc.Server end to end.
+  describe('via a Connect client (createDrpcTransport)', () => {
+    it('unary Once', async () => {
+      const client = createClient(EchoService, createDrpcTransport(conn))
+      const res = await client.once({ message: 'hello', circularShift: 2 })
+      expect(res.message).toBe('llohe')
+    })
+
+    it('server-streaming Many', async () => {
+      const client = createClient(EchoService, createDrpcTransport(conn))
+      const got: Array<{ m: string; s: number }> = []
+      for await (const res of client.many({ message: 'abc', repeat: 3, circularShift: 1 })) {
+        got.push({ m: res.message, s: res.sequence })
+      }
+      expect(got).toEqual([
+        { m: 'bca', s: 0 },
+        { m: 'cab', s: 1 },
+        { m: 'abc', s: 2 },
+      ])
+    })
+
+    it('client-streaming Buff and bidi Live', async () => {
+      const client = createClient(EchoService, createDrpcTransport(conn))
+      async function* reqs(msgs: string[]) {
+        for (const m of msgs) yield { message: m, repeat: 1, circularShift: 1 }
+      }
+      const batch = await client.buff(reqs(['ab', 'xy']))
+      expect(batch.items.map((i) => i.message)).toEqual(['ba', 'yx'])
+
+      const echoed: string[] = []
+      for await (const res of client.live(reqs(['hi', 'yo']))) echoed.push(res.message)
+      expect(echoed).toEqual(['ih', 'oy'])
+    })
   })
 })

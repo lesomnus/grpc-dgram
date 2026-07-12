@@ -815,6 +815,15 @@ export class ClientStream<Req, Res> {
     return this.trailerMd
   }
 
+  // latchedHeader returns the server header MD latched so far WITHOUT blocking
+  // (unlike header(), which awaits the first header-bearing frame). The Connect
+  // adapter reads it after peeking the first response frame — by then any
+  // header on an early frame has latched, and a no-header stream reads
+  // undefined instead of blocking until the call ends.
+  latchedHeader(): Metadata | undefined {
+    return this.rxHeader
+  }
+
   // cancel aborts the call locally and tells the server to stop
   // (PROTOCOL.md §10.3 abort path). No-op after the call ended.
   cancel(): void {

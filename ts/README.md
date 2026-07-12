@@ -30,6 +30,11 @@ server and vice versa.
   `dialUdp`/`listenUdp` helpers. A TS client over this adapter interoperates
   with a Go `drpc.Server` on the wire; this is exercised by a cross-language
   conformance test (`test/conformance.test.ts`) that drives a real Go server.
+- **Connect-ES transport** (`@lesomnus/grpc-dgram/connect`, optional peer dep
+  on `@connectrpc/connect`): use the standard `createClient(Service, transport)`
+  ergonomics while the traffic runs over drpc. `createDrpcTransport(conn)`
+  turns a drpc `Conn` into a Connect `Transport` — the conformance suite drives
+  a **real Go `drpc.Server` through a Connect client** end to end.
 
 ## Usage
 
@@ -47,6 +52,19 @@ const Echo = fromService(EchoService) // { once, many, count, live }, fully type
 
 await conn.invoke(Echo.once, create(EchoRequestSchema, { text: 'hi' }))
 server.register(Echo.once, (req) => create(EchoResponseSchema, { text: req.text }))
+```
+
+**With a Connect client.** If you already use Connect-ES, keep its client
+ergonomics and swap only the transport:
+
+```ts
+import { createClient } from '@connectrpc/connect'
+import { createDrpcTransport } from '@lesomnus/grpc-dgram/connect'
+import { EchoService } from './echo_pb'
+
+const client = createClient(EchoService, createDrpcTransport(conn))
+await client.once({ message: 'hi' })                 // unary
+for await (const m of client.many({ message: 'x' })) // server streaming
 ```
 
 **Without codegen.** Describe methods explicitly with any byte serializer
