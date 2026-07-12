@@ -8,6 +8,9 @@ importers:
 
   .:
     devDependencies:
+      '@bufbuild/protobuf':
+        specifier: ^2.12.1
+        version: 2.12.1
       tsdown:
         specifier: ^0.22.5
         version: 0.22.5(typescript@7.0.2)
@@ -19,6 +22,9 @@ importers:
         version: 4.1.10(vite@8.1.4)
 
 packages:
+
+  '@bufbuild/protobuf@2.12.1':
+    resolution: {integrity: sha512-BvAMfS6LrgZiryOAZ4pBYucu4wG/Ei/9o9DZ9akbREnMLbPJiom2i8b9C8IsKErQoiKqVhrerzt3kOT/RrzLHg==}
 
   '@emnapi/core@1.11.1':
     resolution: {integrity: sha512-RSvbQmHzdKzNsLYa/wHrbc3KN4sYLKAdPZxqiM2HATqv/SBk2/ENSHpvXGaLOMcsAyz0poEGqkmmKYG3OWiJEQ==}
@@ -816,6 +822,8 @@ packages:
     resolution: {integrity: sha512-eMNzX5eYnkqo6zNYf2H8WHcMPHfIf7ijmw0X8NYZ1ANXAU5Y9rwTB9MgfCuvLxlR7fV/96v3gWa8y/YUGFLxjw==}
 
 snapshots:
+
+  '@bufbuild/protobuf@2.12.1': {}
 
   '@emnapi/core@1.11.1':
     dependencies:

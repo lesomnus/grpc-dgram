@@ -7,6 +7,7 @@
   "exports": {
     ".": "./dist/index.mjs",
     "./webrtc": "./dist/webrtc.mjs",
+    "./protobuf-es": "./dist/protobufes.mjs",
     "./package.json": "./package.json"
   },
   "files": [
@@ -18,7 +19,16 @@
     "check": "tsc --noEmit",
     "test": "vitest run"
   },
+  "peerDependencies": {
+    "@bufbuild/protobuf": "^2"
+  },
+  "peerDependenciesMeta": {
+    "@bufbuild/protobuf": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@bufbuild/protobuf": "^2.12.1",
     "tsdown": "^0.22.5",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"

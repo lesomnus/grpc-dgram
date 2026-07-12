@@ -9,6 +9,10 @@ server and vice versa.
 - **Zero runtime dependencies.** The three wire messages (`Frame`, `Envelop`,
   `Metadata`) are hand-encoded; user payloads go through pluggable
   per-method marshallers (protobuf-es, JSON, anything that produces bytes).
+  A **protobuf-es binding** (`@lesomnus/grpc-dgram/protobuf-es`, optional peer
+  dep) derives the whole method descriptor — path, streaming kind, codec —
+  from a generated `protoc-gen-es` service, so RPC types are never re-declared
+  by hand. The core itself stays dependency-free.
 - **Both endpoints.** `Conn` (client) and `Server`, with the full unreliable-
   mode machinery: seq windows and dedup, epoch/`peer_epoch` incarnation
   isolation, control-frame retransmission, tombstones + aged watermark,
@@ -24,7 +28,24 @@ server and vice versa.
 
 ## Usage
 
-Describe methods once (shared by client and server):
+**With protobuf-es (recommended).** Point the binding at a generated service —
+paths, streaming kinds, and codecs are all derived from the `.proto`, so
+there is nothing to keep in sync and a TS client interoperates with a Go
+server addressing the same methods:
+
+```ts
+import { fromService } from '@lesomnus/grpc-dgram/protobuf-es'
+import { create } from '@bufbuild/protobuf'
+import { EchoService, EchoRequestSchema } from './echo_pb' // protoc-gen-es output
+
+const Echo = fromService(EchoService) // { once, many, count, live }, fully typed
+
+await conn.invoke(Echo.once, create(EchoRequestSchema, { text: 'hi' }))
+server.register(Echo.once, (req) => create(EchoResponseSchema, { text: req.text }))
+```
+
+**Without codegen.** Describe methods explicitly with any byte serializer
+(the core is codec-agnostic — this is what the test suite uses):
 
 ```ts
 import { unaryMethod, bidiMethod, type PayloadCodec } from '@lesomnus/grpc-dgram'
@@ -33,8 +54,6 @@ const json = <T>(): PayloadCodec<T> => ({
   marshal: (v) => new TextEncoder().encode(JSON.stringify(v)),
   unmarshal: (b) => JSON.parse(new TextDecoder().decode(b)),
 })
-// protobuf-es works the same way:
-//   { marshal: (v) => toBinary(Schema, v), unmarshal: (b) => fromBinary(Schema, b) }
 
 const Once = unaryMethod<Req, Res>('/echo.Echo/Once', { request: json(), response: json() })
 const Live = bidiMethod<Req, Res>('/echo.Echo/Live', { request: json(), response: json() })

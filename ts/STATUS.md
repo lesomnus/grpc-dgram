@@ -95,8 +95,12 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
 3. **`examples/`** — a runnable browser↔Go WebRTC datachannel echo (the
    final-goal demo, cross-language this time).
 4. **Packaging** — decide the published name/scope (currently
-   `@lesomnus/grpc-dgram`, `private: true`), a real `version`, and whether to
-   ship a protobuf-es codec helper so users don't hand-roll `PayloadCodec`s.
+   `@lesomnus/grpc-dgram`, `private: true`) and a real `version`. *(The
+   protobuf-es binding — `@lesomnus/grpc-dgram/protobuf-es`, `fromService` /
+   `fromMethod`, `@bufbuild/protobuf` optional peer dep — is **done**: it
+   derives path + streaming kind + codec from a generated `protoc-gen-es`
+   service, so RPC types aren't re-declared. Core stays zero-dep; verified the
+   core bundles carry no `@bufbuild/protobuf` reference.)*
 5. Optional parity with Go stretch items if/when they land there: interceptors,
    stats handler, `Coalescer` batching.
 
