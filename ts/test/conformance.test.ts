@@ -17,6 +17,8 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Conn } from '../src/conn'
+import { unaryMethod } from '../src/desc'
+import { Code } from '../src/status'
 import { createDrpcTransport } from '../src/transport/connect'
 import { dialUdp } from '../src/transport/node-udp'
 import { fromService } from '../src/transport/protobuf-es'
@@ -149,6 +151,44 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
     expect(res.dateCreated!.seconds > 0n).toBe(true)
     // reference the response schema so the import is load-bearing
     expect(EchoResponseSchema.typeName).toBe('echo.EchoResponse')
+  })
+
+  // Boundary cases the happy-path shapes above never exercise — the wire
+  // contract points that can only be confirmed where the two implementations
+  // meet (the encoding is already pinned byte-for-byte by the §5 golden
+  // vectors; these pin the live interpretation).
+
+  it('status codes cross the boundary: a Go-returned non-OK status decodes exactly (§7)', async () => {
+    // req.status injects an arbitrary status the Go handler returns via
+    // req.Error() — exercising the CLOSE code+desc channel, which every
+    // happy-path call (all OK) leaves untested cross-language.
+    const err = await conn
+      .invoke(Echo.once, create(EchoRequestSchema, { message: 'x', status: { code: Code.NOT_FOUND, message: 'not here' } }))
+      .catch((e) => e)
+    expect(err.code).toBe(Code.NOT_FOUND)
+    expect(err.desc).toBe('not here')
+  })
+
+  it('an unregistered method draws UNIMPLEMENTED from the Go server (§9.4, §13)', async () => {
+    // Method dispatch + the rejection-terminal path, neither hit by the
+    // registered shapes. A raw codec suffices — Go rejects on method
+    // resolution before decoding the payload.
+    const raw = { marshal: (v: Uint8Array) => v, unmarshal: (b: Uint8Array) => b }
+    const Nope = unaryMethod<Uint8Array, Uint8Array>('/echo.EchoService/DoesNotExist', { request: raw, response: raw })
+    const err = await conn.invoke(Nope, new Uint8Array()).catch((e) => e)
+    expect(err.code).toBe(Code.UNIMPLEMENTED)
+  })
+
+  it('edge payloads round-trip through the Go proto codec (§5 presence, §12)', async () => {
+    // 0-byte string (payload present but empty), multi-byte UTF-8, and a
+    // larger-but-in-datagram message — all with circular_shift 0 so the value
+    // is echoed verbatim, proving payload encoding agrees both directions.
+    const echoOf = async (message: string) =>
+      (await conn.invoke(Echo.once, create(EchoRequestSchema, { message, circularShift: 0 }))).message
+    expect(await echoOf('')).toBe('')
+    expect(await echoOf('안녕 🌍 世界')).toBe('안녕 🌍 世界')
+    const big = 'x'.repeat(500)
+    expect(await echoOf(big)).toBe(big)
   })
 
   // The same Go server, now driven by a STANDARD Connect client over the drpc

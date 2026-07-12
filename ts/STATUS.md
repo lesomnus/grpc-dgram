@@ -129,14 +129,25 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
    using the generated `Echo` descriptors — and, additionally, a **standard
    Connect client** via `createDrpcTransport` — drives a real Go `drpc.Server`
    (`conformance/udpserver`, serving `internal/echo` over `transport/udp`) via
-   the Node UDP adapter, and asserts all four RPC types plus metadata and a
-   Go-encoded proto `Timestamp`, matching the Go handler's semantics
-   (`CircularShift`, ascending sequence). This pins the *behavior* across
-   implementations, where the golden vectors pin the encoding. The test
-   `skipIf(!go)`, so `pnpm test` still runs without a Go toolchain, and CI is
-   wired (the `ts` job sets up Go and runs it). **Remaining: loss-recovery
-   conformance** — loopback UDP does not drop, so the §10 retransmission path
-   is not yet exercised cross-language (needs a lossy proxy between the two).
+   the Node UDP adapter. It asserts the wire/behavior contract points that can
+   only be confirmed where the two implementations meet: all four RPC shapes +
+   payload values (`CircularShift`, ascending sequence), header/trailer
+   metadata, a Go-encoded proto `Timestamp`, **a Go-returned non-OK status
+   (code + desc) decoded exactly**, **unknown-method → `UNIMPLEMENTED`**, and
+   **edge payloads (0-byte / UTF-8 / large) round-tripping the proto codec** —
+   plus the same shapes through a Connect client. This pins the *behavior*
+   across implementations, where the golden vectors pin the *encoding*.
+   `skipIf(!go)`, and CI runs it (the `ts` job sets up Go).
+   **Deliberately not pursued: loss-recovery / reliable-transport interop.**
+   Loopback UDP is effectively lossless and ordered, so exercising the §10
+   retransmission path would mean injecting loss in code — a reliable channel
+   plus code-level frame manipulation, which is exactly what each language's
+   own suite already does (fake timers, lossy filters, injected frames). A
+   cross-language loss test would add negligible interop-specific coverage over
+   the happy-path (the same already-golden frames flow; recovery *logic* is
+   per-side) for a large infrastructure cost (a lossy proxy + a TS WebSocket
+   transport to pair with Go `gorilla` for the reliable/strict path). Not worth
+   it; the boundary is covered by the cases above.
 3. **`examples/`** — a runnable browser↔Go WebRTC datachannel echo (the
    final-goal demo, cross-language this time).
 4. **Packaging** — decide the published name/scope (currently
