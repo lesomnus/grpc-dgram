@@ -1,5 +1,5 @@
 {
-	"name": "lesomnus.grpc-dgram",
+	"name": "lesomnus/grpc-dgram",
 	"dockerComposeFile": "docker-compose.yaml",
 	"service": "dev",
 	"workspaceFolder": "/workspace",

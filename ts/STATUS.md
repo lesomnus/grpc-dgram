@@ -35,7 +35,7 @@ mirroring Go's `transport/{udp,pion,gorilla}/` layout (dir + README each).
 
 Verified at this commit:
 
-- `pnpm test` → **127 passing** (13 files). Unit and per-adapter tests are
+- `pnpm test` → **130 passing** (13 files). Unit and per-adapter tests are
   co-located next to their source (`src/wire.test.ts`,
   `src/transport/connect/index.test.ts`, …); cross-cutting integration tests
   (e2e, timeout, restart, limits, conformance, protobufes-gen) stay in `test/`;
@@ -48,14 +48,16 @@ Verified at this commit:
   (the §10 system under deterministic fake-timer loss — blackhole, lost
   terminal/ack/half-close, probe, liveness, at-most-once), `restart.test.ts`
   (§6.5 walkthroughs), `limits.test.ts` (§15 caps, §4.2 drop policies, §6.3
-  DATA_LOSS, §9.4 watermark, per-peer mode), `datachannel.test.ts` (adapter
-  against a mock RTCDataChannel pair, incl. the reliable-datachannel echo — the
-  project's final-goal demo shape), `protobufes*.test.ts` (the binding, verified
+  DATA_LOSS, §9.4 watermark, per-peer mode),
+  `src/transport/webrtc/index.test.ts` (adapter against a mock RTCDataChannel
+  pair, incl. the reliable-datachannel echo — the project's final-goal demo
+  shape), `protobufes*.test.ts` (the binding, verified
   against real `protoc-gen-es` output), and **`conformance.test.ts`** (a TS
   client driving a **real Go `drpc.Server`** over UDP — see below).
 - `pnpm check` (`tsc --noEmit`, strict) → clean.
-- `pnpm build` (tsdown) → clean; emits `dist/index.mjs` + `dist/webrtc.mjs`
-  with `.d.mts`. `dist/` is gitignored.
+- `pnpm build` (tsdown) → clean; emits `dist/index.mjs` plus one
+  `dist/transport/*.mjs` per adapter entry, with `.d.mts`. `dist/` is
+  gitignored.
 
 ## Adversarial audit — done (4 findings fixed)
 
@@ -65,13 +67,15 @@ seq wrap, and the adapters. (An earlier attempt was killed by a token limit;
 this one completed.) Four findings, all fixed with teeth-verified regression
 tests:
 
-- **`node-udp.ts` — connected-socket ICMP unreachable tore the endpoint down**
-  (major). A connected UDP socket delivers ECONNREFUSED/EHOSTUNREACH/ENETUNREACH
-  as an `'error'` event (not the send callback), and the socket stays usable —
+- **`transport/node-udp/index.ts` — connected-socket ICMP unreachable tore the
+  endpoint down** (major). A connected UDP socket delivers
+  ECONNREFUSED/EHOSTUNREACH/ENETUNREACH as an `'error'` event (not the send
+  callback), and the socket stays usable —
   but the handler called `close()` unconditionally, so the first ICMP unreachable
   from a restarting server permanently closed the socket and failed the call
   `UNAVAILABLE`, breaking the restart-ride-out §4.5 contract Go's `transport/udp`
-  honors. Fixed to ignore `transient()` errors, matching Go. (`test/node-udp.test.ts`)
+  honors. Fixed to ignore `transient()` errors, matching Go.
+  (`src/transport/node-udp/index.test.ts`)
 - **`server.ts` — §15 cap under-count after disconnect + same-key reuse** (major,
   low exposure). `finish()` decremented `this.slots.get(peer).liveCalls`; if the
   slot was deleted by `disconnectPeer` and the key reused before the call
@@ -79,13 +83,13 @@ tests:
   `MaxLiveCalls`. Fixed to decrement the slot the call was created on
   (`st.slot`), mirroring Go's `livePeer` map surviving `DisconnectPeer`. Not
   reachable through the shipped fresh-key adapters, but the new `node-udp`
-  gateway uses stable keys. (`test/server-cap.test.ts`)
+  gateway uses stable keys. (`src/server.test.ts`)
 - **`util.ts` — `FrameQueue.putBlocking` not FIFO-safe** (low, latent). With ≥2
   putters parked on one queue, freeing a slot woke all and let the first to run
   `tryPut` win, so a later frame could jump an earlier one (reliable-mode
   reorder). Not reachable via a conforming sequential-delivery adapter, but the
   primitive stands in for a Go channel (a true FIFO), so hardened with a
-  call-order chain. (`test/util.test.ts`)
+  call-order chain. (`src/util.test.ts`)
 - **`wire.ts` — metadata map entry order** (minor, harmless). Emitted in JS
   insertion order; both sides decode fine and the golden vectors omit metadata,
   but sorting keys makes the encoding deterministic and matches Go's
@@ -100,14 +104,15 @@ adapter teardown paths, §4.4 synchronous size refusal, webrtc backpressure,
 and unhandled-rejection/leak review.
 
 The Connect-ES transport got its own review (streaming contract, error/metadata
-mapping, cancellation/leak). One finding, fixed: `connect.ts` fed raw drpc
-metadata straight into the WHATWG `Headers` API, which throws a `TypeError` on
+mapping, cancellation/leak). One finding, fixed: `transport/connect/index.ts`
+fed raw drpc metadata straight into the WHATWG `Headers` API, which throws a `TypeError` on
 a value with a newline/control char or a non-latin1 codepoint (emoji) or a
 non-token key — so a spec-legal server response (§11 imposes no character
 limit) crashed the call with a raw `TypeError` instead of returning the message
 or a `ConnectError`, at all five conversion sites. Fixed with a total,
 never-throwing `safeAppend` that drops only the entries HTTP headers cannot
-represent; the message and status always surface. (`test/connect.test.ts`)
+represent; the message and status always surface.
+(`src/transport/connect/index.test.ts`)
 
 ## Deliberately NOT ported (not gaps)
 
@@ -117,7 +122,7 @@ too, M6); **`Envelop` batching / `Coalescer`** (planned M6 in Go; every envelop
 carries one frame, as the shipped Go adapters do); handler signatures are
 TS-native functions (not grpc-go codegen); `context.Context` → `AbortSignal` +
 `CallOptions`; `metadata.MD` → `Record<string,string[]>`. One genuine
-environmental difference, documented in `webrtc.ts`: a browser `RTCDataChannel`
+environmental difference, documented in `transport/webrtc/index.ts`: a browser `RTCDataChannel`
 cannot pause delivery, so reliable-mode backpressure (§4.2) bounds ordering and
 loss but **not** adapter rx memory — inbound messages queue while a slow
 consumer drains. The Node/pion read-loop blocking has no browser equivalent.
@@ -169,7 +174,7 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
 ```
 cd ts
 pnpm install
-pnpm test     # vitest, 90 tests
+pnpm test     # vitest, 130 tests
 pnpm check    # tsc --noEmit (strict)
 pnpm build    # tsdown → dist/
 ```

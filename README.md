@@ -21,9 +21,10 @@ generated impls <── drpc.Server <──(per frame)──── adapter (unpa
 - Package: `github.com/lesomnus/grpc-dgram` (import name `drpc`)
 - Status: **core + protocol complete and characterized** (unary / server- /
   client- / bidi-streaming, metadata, interceptors, codecs, timeouts,
-  liveness), **transport adapters shipped** (UDP, WebSocket, pion/webrtc).
-  Wire protocol: [`PROTOCOL.md`](./PROTOCOL.md); milestones:
-  [`ROADMAP.md`](./ROADMAP.md).
+  liveness), **transport adapters shipped** (UDP, WebSocket, pion/webrtc), and
+  a **TypeScript port** of the same wire protocol ([`ts/`](./ts) — browser and
+  Node, verified against a real Go server).
+  Wire protocol: [`PROTOCOL.md`](./PROTOCOL.md).
 
 ---
 
@@ -52,7 +53,8 @@ subsequence** instead of stalling.
 | Per-stream buffering & drop policy (`DropNewest` / `DropOldest`) | ✅ per method / per role |
 | Resource caps (tombstones, live calls, reset maps) | ✅ bounded under a junk flood |
 | Transport adapters: UDP, WebSocket, pion/webrtc | ✅ [`transport/udp`](./transport/udp), [`transport/gorilla`](./transport/gorilla), [`transport/pion`](./transport/pion) |
-| Stats handler, browser JS/TS port | ⬜ planned |
+| Browser / Node TypeScript port (client + server, same wire) | ✅ [`ts/`](./ts) — WebRTC DataChannel, Node UDP, protobuf-es & Connect-ES bindings |
+| Stats handler (gap / drop counters), `Envelop` batching | ⬜ planned |
 
 ## Install
 
@@ -194,8 +196,8 @@ reorder, and duplication. Every item below is pinned by an executable test
 
 The standard gRPC surface (value+status on all four RPC types, header/trailer
 on success and error, `Header()` blocking correctly, interceptor chaining,
-metadata round-trip, `Unimplemented` for unknown methods) matches gRPC; see
-the divergences below.
+metadata round-trip, `Unimplemented` for unknown methods) matches gRPC; the
+divergences are in [Limitations & caveats](#limitations--caveats).
 
 ## Limitations & caveats
 
@@ -243,18 +245,23 @@ streams that tolerate loss.
 
 **Isn't:** HTTP/2-based gRPC; a general-purpose reliability layer over an
 unreliable channel; wire-compatible with standard gRPC; a faithful
-reproduction of every gRPC lifecycle detail (see divergences above).
+reproduction of every gRPC lifecycle detail (see
+[Limitations & caveats](#limitations--caveats)).
 
 ## Development
 
 ```sh
-go test -race ./...     # fast & deterministic — timing tests use testing/synctest
+go test -race ./...     # core + transport/udp — fast & deterministic (testing/synctest)
+# transport/gorilla and transport/pion are separate modules (their own go.mod),
+# so ./... does not reach them; CI iterates over every go.mod the same way:
+for d in transport/gorilla transport/pion; do (cd $d && go test -race ./...); done
 buf generate            # regenerate protobuf bindings after editing proto/
 go test -run '^$' -fuzz FuzzServerHandle -fuzztime 20s .   # fuzz the frame entry points
+(cd ts && pnpm install && pnpm test)   # TypeScript port, incl. the Go↔TS conformance test
 ```
 
 - Wire protocol & design rationale: [`PROTOCOL.md`](./PROTOCOL.md)
-- Milestones & status: [`ROADMAP.md`](./ROADMAP.md)
+- TypeScript port (client + server, same wire): [`ts/`](./ts)
 - Behavioral evidence for every guarantee/limitation above:
   [`characterization_test.go`](./characterization_test.go),
   [`timeout_test.go`](./timeout_test.go),

@@ -225,8 +225,9 @@ func TestChar_InjectionMatrix(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // At-most-once boundary: replay within TTL, RESET after the aged watermark.
-// (The successful-recovery and stale-OPEN cases are in TestEventualTermination;
-// here we pin the DUPLICATE-OPEN-on-a-live-call behavior: it never forks.)
+// (The successful-recovery case is in TestEventualTermination; here we pin the
+// DUPLICATE-OPEN-on-a-live-call behavior — it never forks — and the reply the
+// aged watermark owes a stale OPEN.)
 // ---------------------------------------------------------------------------
 
 func TestChar_DuplicateOpenOnLiveCallDoesNotFork(t *testing.T) {
@@ -242,6 +243,36 @@ func TestChar_DuplicateOpenOnLiveCallDoesNotFork(t *testing.T) {
 	// Exactly one execution; at least one terminal emitted.
 	x.Equal(t, 1, int(execs.Load()))
 	x.True(t, is.recv(t) != nil, "a terminal must be emitted")
+}
+
+// The other half of the boundary: past TTL_tomb the tombstone is gone and the
+// aged watermark has caught up with the sid, so the same OPEN is provably
+// stale. §9.4 says the server must then answer a RESET — not just decline to
+// re-execute — so a client whose OPEN was black-holed for longer than
+// TTL_tomb fails fast instead of retransmitting into silence until its
+// deadline. (Admission itself is checked twice — in Handle and again under
+// the registration lock — so only the reply pins this rule.)
+func TestChar_StaleOpenPastWatermarkDrawsReset(t *testing.T) {
+	var execs atomic.Int32
+	is := newInjectServerMode(t, false, drpc.WithTiming(fastTiming), countExecs(&execs))
+
+	const clientEpoch, sid = uint32(0xC0FFEE), uint32(1)
+	open := openFrame(clientEpoch, sid, 1, echo.EchoService_Once_FullMethodName)
+	is.handle(proto.CloneOf(open))
+	term := is.recv(t)
+	x.True(t, term != nil && isTerminal(term), "the call must complete")
+	x.Equal(t, 1, int(execs.Load()))
+
+	// Outlive the tombstone; the sweep's checkpoint ring ages hwm past the sid.
+	time.Sleep(fastTiming.Tombstone + 300*time.Millisecond)
+
+	is.handle(proto.CloneOf(open))
+	r := is.recv(t)
+	x.True(t, r != nil, "a stale OPEN must draw a RESET, not silence")
+	x.Equal(t, drpc.FlagReset, r.GetFlags())
+	x.Equal(t, clientEpoch, r.GetEpoch()) // echoes the offender's epoch (§9.3)
+	x.Equal(t, sid, r.GetSid())
+	x.Equal(t, 1, int(execs.Load()), "never re-executed")
 }
 
 // ---------------------------------------------------------------------------

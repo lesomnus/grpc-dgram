@@ -159,7 +159,7 @@ The Node/pion-style read-loop blocking does not exist in a browser.
 
 ## Tests
 
-`pnpm test` — 127 tests mirroring the Go suites: the §5 golden wire vectors
+`pnpm test` — 130 tests mirroring the Go suites: the §5 golden wire vectors
 byte-for-byte, e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,
 probes, liveness), the §6.5 restart walkthroughs, §15 caps and §4.2 drop
