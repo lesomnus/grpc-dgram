@@ -1,7 +1,7 @@
 # @lesomnus/grpc-dgram
 
 TypeScript port of [grpc-dgram](../): gRPC-style RPC over unreliable datagram
-channels, implementing the **drpc wire protocol v1.0** (`../PROTOCOL.md`).
+channels, implementing the **drpc wire protocol v1.1** (`../PROTOCOL.md`).
 Wire-compatible with the Go implementation — the §5 golden byte vectors are
 shared between the two test suites — so a TS client interoperates with a Go
 server and vice versa.
@@ -17,7 +17,20 @@ server and vice versa.
   mode machinery: seq windows and dedup, epoch/`peer_epoch` incarnation
   isolation, control-frame retransmission, tombstones + aged watermark,
   PING/probe liveness, and the §15 resource caps. On a reliable transport all
-  timers are off and sequencing is strict fail-loud (§10.6).
+  timers are off, sequencing is strict fail-loud (§10.6), and **per-stream
+  flow control** (§4.2.1) keeps one slow consumer from stalling the other
+  calls on the channel — the browser case where a blocked receive path would
+  otherwise wedge the whole event loop.
+- **v1.1 surface.** Binary metadata (`-bin` keys carry arbitrary octets;
+  base64 at the TS API, raw bytes on the wire), rich status details on the
+  terminal frame, per-message compression (`gzip` via the platform's
+  `CompressionStream`, never expanding a payload), per-call recv/send size
+  caps, and the shape/modifier flag split (§7.1) — an unimplemented flag bit
+  fails the call instead of silently corrupting or gapping it.
+- **WebSocket adapter** (`@lesomnus/grpc-dgram/transport/websocket`), the TS
+  twin of the Go `transport/gorilla` adapter: reliable mode, one Envelop per
+  message, and the §4.5 teardown duty carried by `onclose`/`onerror` plus a
+  keepalive — browser-safe (WhatWG `WebSocket`, `binaryType='arraybuffer'`).
 - **WebRTC DataChannel adapter** (`@lesomnus/grpc-dgram/transport/webrtc`), the TS twin
   of the Go `transport/pion` adapter: the protocol mode is derived from the
   channel's own configuration — an ordered channel with no retransmit or
@@ -140,7 +153,7 @@ else maps to `UNKNOWN`).
 |---|---|
 | `context.Context` cancellation/deadline | `CallOptions.signal` (`AbortSignal`) + `timeoutMs`; handler `ctx.signal` |
 | `*status.Status` errors | `StatusError { code, desc }` |
-| `metadata.MD` | `Metadata = Record<string, string[]>` |
+| `metadata.MD` | `Metadata = Record<string, string[]>`; a `-bin` key holds base64 (raw octets on the wire) |
 | `grpc.ClientConnInterface` / generated stubs | `conn.invoke(desc, req)` / `conn.newStream(desc)` |
 | `RegisterService` + codegen | `server.register(desc, handler)` per method |
 | `TransportInfo` / `ConnAttacher` discovery | same, structural (`reliable()`, `attachConn()`) |
@@ -148,23 +161,28 @@ else maps to `UNKNOWN`).
 | `NewPeerContext` / `NewReliableContext` | `FrameContext { peer, reliable, signal }` argument to `handle` |
 | mutexes + atomics | none needed: state transitions are synchronous between `await` points |
 
-Deliberately not ported (yet): client/server interceptors, the stats surface
-(planned in Go as well), and `Envelop` batching (`Coalescer` — planned M6 in
-Go; every envelop carries one frame, as the shipped Go adapters do).
+Deliberately not ported (yet): client/server interceptors, the observability
+surface (Go's `stats.Handler` + `ProtocolStats`), and `Envelop` batching
+(`Coalescer` — deferred to M8 in Go; every envelop carries one frame, as the
+shipped Go adapters do).
 
 Receive-path note for browsers: an `RTCDataChannel` cannot pause delivery, so
-reliable-mode backpressure (§4.2) bounds *ordering and loss*, not adapter
-memory — inbound messages queue in the adapter while a slow consumer drains.
-The Node/pion-style read-loop blocking does not exist in a browser.
+adapter-level buffering is unavoidable — but since v1.1 the *protocol* paces
+the sender instead of the receiver (§4.2.1 flow control), so a slow consumer
+no longer needs the receive path to block at all, and never stalls the other
+calls sharing the channel.
 
 ## Tests
 
-`pnpm test` — 130 tests mirroring the Go suites: the §5 golden wire vectors
-byte-for-byte, e2e for all four RPC types, the §10 timeout system under
+`pnpm test` — 252 tests mirroring the Go suites: the §5 golden wire vectors
+byte-for-byte (including the v1.1 vectors generated from the Go
+implementation), e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,
 probes, liveness), the §6.5 restart walkthroughs, §15 caps and §4.2 drop
-policies, each adapter (WebRTC/UDP/protobuf-es/Connect) next to its source, and
-a cross-language conformance test driving a real Go `drpc.Server`.
+policies, §4.2.1 flow control (advertisement, parking, grants, `T_stall`,
+overrun), compression, size caps and binary metadata, each adapter
+(WebRTC/WebSocket/UDP/protobuf-es/Connect) next to its source, and a
+cross-language conformance test driving a real Go `drpc.Server`.
 
 **Layout.** Unit and per-adapter tests are **co-located** next to their source
 (`src/wire.test.ts`, `src/transport/webrtc/index.test.ts`, …); cross-cutting

@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Server } from '../src/server'
 import { Code, type StatusError } from '../src/status'
 import type { Timing } from '../src/timing'
-import { FlagOpen, isClose, isData, isHeaderFrame, isOpen, isPing, isTerminal, type Frame } from '../src/wire'
+import { FlagOpen, frame, isClose, isData, isHeaderFrame, isOpen, isPing, isTerminal, type Frame } from '../src/wire'
 import { echo, makeNet, registerEcho, tick } from '../src/testing'
 
 // probe = 150ms, tick = 25ms, T_call = 300ms, T_live = 450ms, RTI = 50ms.
@@ -61,7 +61,7 @@ describe('unary deadline (§10.2, §10.7)', () => {
     // Craft an OPEN|CLOSE with an already-expired budget.
     const open = { ...net.sentC2S, length: 0 } // noop; build manually below
     void open
-    const f: Frame = {
+    const f = frame({
       epoch: 7,
       sid: 1,
       seq: 1,
@@ -72,7 +72,7 @@ describe('unary deadline (§10.2, §10.7)', () => {
       peerEpoch: 0,
       timeoutMs: -5,
       payload: new TextEncoder().encode(JSON.stringify({ text: 'x' })),
-    }
+    })
     await net.server.handle(f, { peer: net.peer })
     await tick()
     expect(sawAborted).toBe(true)
@@ -301,7 +301,7 @@ describe('multi-frame envelops (§4.1)', () => {
     const sent: Frame[] = []
     const server = new Server({ handle: (f: Frame) => void sent.push(f) }, { reliable: false, timing: fast })
     registerEcho(server)
-    const open: Frame = {
+    const open = frame({
       epoch: 5,
       sid: 21,
       seq: 1,
@@ -310,8 +310,8 @@ describe('multi-frame envelops (§4.1)', () => {
       codec: '',
       desc: '',
       peerEpoch: 0,
-    }
-    const data: Frame = {
+    })
+    const data = frame({
       epoch: 5,
       sid: 21,
       seq: 2,
@@ -321,7 +321,7 @@ describe('multi-frame envelops (§4.1)', () => {
       desc: '',
       peerEpoch: 0,
       payload: new TextEncoder().encode(JSON.stringify({ text: 'abc' })),
-    }
+    })
     await server.handle(open, { peer: 'p' })
     await server.handle(data, { peer: 'p' })
     await vi.advanceTimersByTimeAsync(20)

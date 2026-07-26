@@ -7,6 +7,7 @@
   "exports": {
     ".": "./dist/index.mjs",
     "./transport/webrtc": "./dist/transport/webrtc.mjs",
+    "./transport/websocket": "./dist/transport/websocket.mjs",
     "./transport/node-udp": "./dist/transport/node-udp.mjs",
     "./transport/protobuf-es": "./dist/transport/protobuf-es.mjs",
     "./transport/connect": "./dist/transport/connect.mjs",

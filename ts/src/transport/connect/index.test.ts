@@ -102,18 +102,20 @@ describe('Connect client over drpc', () => {
     expect(trailer?.get('x-timing')).toBe('trailer')
   })
 
-  it('server metadata that is not a legal HTTP header does not crash the call', async () => {
-    // drpc metadata is arbitrary strings (§11): a newline, an emoji, or an
-    // invalid header name would make Headers.append throw a TypeError. The
-    // transport must still deliver the message and keep the representable
-    // metadata (audit regression).
+  it('binary metadata reaches the Connect client without crashing the call', async () => {
+    // Since wire v1.1 a handler cannot even set metadata gRPC would reject
+    // (§11 validation), so the old hazard — arbitrary strings meeting
+    // Headers.append — can now only arrive as BINARY metadata, whose base64
+    // is header-safe, or from a non-conforming peer. Both must deliver the
+    // message and keep whatever is representable (audit regression).
     let server!: Server
     let conn!: Conn
     conn = new Conn({ handle: async (f) => void (await server.handle(f, { peer: 'p' })) }, { reliable: true })
     server = new Server({ handle: async (f) => void (await conn.handle(f, {})) }, { reliable: true })
     server.register(Echo.once, (_req, ctx) => {
-      ctx.setHeader({ 'x-good': ['ok'], 'x-newline': ['a\nb'], 'x-emoji': ['\u{1F600}'] })
-      ctx.setTrailer({ 'x-trailer': ['fine'], 'bad name': ['v'] })
+      // 'AAH/' is base64 for 0x00 0x01 0xff — octets no text header could hold.
+      ctx.setHeader({ 'x-good': ['ok'], 'x-raw-bin': ['AAH/'] })
+      ctx.setTrailer({ 'x-trailer': ['fine'] })
       return create(EchoResponseSchema, { message: 'echo:hi' })
     })
     const client = createClient(EchoService, createDrpcTransport(conn))
@@ -121,10 +123,25 @@ describe('Connect client over drpc', () => {
     let trailer: Headers | undefined
     const res = await client.once({ message: 'hi' }, { onHeader: (h) => (header = h), onTrailer: (t) => (trailer = t) })
     expect(res.message).toBe('echo:hi') // the call succeeded, message delivered
-    expect(header?.get('x-good')).toBe('ok') // representable metadata survives
-    expect(header?.has('x-newline')).toBe(false) // unrepresentable dropped, not thrown
-    expect(header?.has('x-emoji')).toBe(false)
+    expect(header?.get('x-good')).toBe('ok')
+    expect(header?.get('x-raw-bin')).toBe('AAH/') // binary rides as base64
     expect(trailer?.get('x-trailer')).toBe('fine')
+  })
+
+  it('metadata gRPC would reject fails the call at the server, not the codec', async () => {
+    // §11: the validation gate is the API boundary. A newline in a text value
+    // is INTERNAL there — it never reaches the wire, and never reaches
+    // Headers.append as a TypeError.
+    let server!: Server
+    let conn!: Conn
+    conn = new Conn({ handle: async (f) => void (await server.handle(f, { peer: 'p' })) }, { reliable: true })
+    server = new Server({ handle: async (f) => void (await conn.handle(f, {})) }, { reliable: true })
+    server.register(Echo.once, (_req, ctx) => {
+      ctx.setHeader({ 'x-newline': ['a\nb'] })
+      return create(EchoResponseSchema, { message: 'unreachable' })
+    })
+    const client = createClient(EchoService, createDrpcTransport(conn))
+    await expect(client.once({ message: 'hi' })).rejects.toThrow(/non-printable/)
   })
 
   it('a method the server never registered surfaces as UNIMPLEMENTED', async () => {

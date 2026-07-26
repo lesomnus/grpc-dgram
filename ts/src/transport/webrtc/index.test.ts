@@ -10,6 +10,7 @@ import { Server } from '../../server'
 import { Code, type StatusError } from '../../status'
 import { channelReliable, DataChannelGateway, DataChannelTransport, type DataChannelLike } from './index'
 import { echo, registerEcho, tick } from '../../testing'
+import { frame } from '../../wire'
 
 class MockDC implements DataChannelLike {
   readyState = 'connecting'
@@ -185,7 +186,7 @@ describe('backpressure (§4.2)', () => {
     const transport = new DataChannelTransport(a, { maxBufferedAmount: 4096 })
     expect(a.bufferedAmountLowThreshold).toBe(2048)
     let sent = false
-    const p = transport.handle({ epoch: 1, sid: 1, seq: 1, flags: 8, method: '', codec: '', desc: '', peerEpoch: 0 }).then(() => (sent = true))
+    const p = transport.handle(frame({ epoch: 1, sid: 1, seq: 1, flags: 8 })).then(() => (sent = true))
     await tick()
     expect(sent).toBe(false) // waiting at the mark
     a.bufferedAmount = 0

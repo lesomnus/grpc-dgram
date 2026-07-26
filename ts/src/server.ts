@@ -14,20 +14,69 @@
 import type { CallOptions, MethodDesc, NamedCodec, PayloadCodec } from './desc'
 import { isUnary } from './desc'
 import { resolveLimits, resolveRxConfig, type Limits, type ResolvedLimits, type ResolvedRxConfig, type RxBufferConfig } from './limits'
-import { metadataJoin, type Metadata } from './metadata'
+import { metadataJoin, validateMetadata, type Metadata } from './metadata'
 import { RxVerdict, RxWindow, TxSeq } from './seq'
 import { abortCause, Code, isMessageTooLarge, StatusError, statusError, toStatusError } from './status'
-import { resolveTiming, type Mode, type Timing } from './timing'
+import { resolveTiming, type Mode } from './timing'
 import { hasTransportInfo, type FrameContext, type FrameHandler } from './seam'
-import { FrameQueue, Latch, nonzeroEpoch, noop, nowMs, Sweeper, unrefTimer } from './util'
-import { FlagClose, FlagPing, FlagReset, frame, frameStatus, isClose, isData, isHalfClose, isOpen, isPing, isReset, isTerminal, resetFor, setFrameError, type Frame } from './wire'
+// FlowTiming / DetailedStatusError are declared in conn.ts (Timing and
+// status.ts are shared and were left untouched); both imports are type-only,
+// so the server pulls in no client code.
+import type { DetailedStatusError, FlowTiming } from './conn'
+import {
+  checkRecvSize,
+  checkSendSize,
+  compressPayload,
+  DEFAULT_MAX_RECV_MSG_SIZE,
+  DEFAULT_MAX_SEND_MSG_SIZE,
+  DEFAULT_STALL_MS,
+  decompressPayload,
+  FlowReceiver,
+  FlowSender,
+  FrameQueue,
+  Latch,
+  nonzeroEpoch,
+  noop,
+  nowMs,
+  rawPayload,
+  reliableRxSize,
+  sizeOr,
+  Sweeper,
+  unrefTimer,
+  type Compressor,
+  type WirePayload,
+} from './util'
+import {
+  FlagClose,
+  FlagCompressed,
+  FlagPing,
+  FlagReset,
+  FlagWindow,
+  frame,
+  frameStatus,
+  hasUnknownFlags,
+  isClose,
+  isCompressed,
+  isData,
+  isHalfClose,
+  isOpen,
+  isPing,
+  isReset,
+  isTerminal,
+  legalShape,
+  resetFor,
+  setFrameError,
+  shapeOf,
+  type Any,
+  type Frame,
+} from './wire'
 
 export interface ServerOptions {
   // Overrides transport discovery (PROTOCOL.md §4.3); a mixed-mode gateway
   // instead annotates each frame's context (FrameContext.reliable).
   reliable?: boolean
-  // Protocol timers (unreliable mode only, §10.1).
-  timing?: Timing
+  // Protocol timers (unreliable mode only, §10.1 — except stallMs, §4.2.1).
+  timing?: FlowTiming
   // Clamps client-asserted timeouts (§10.2). Off unless set.
   maxHandlerTimeoutMs?: number
   // Endpoint-wide per-stream rx buffer (§4.2).
@@ -38,6 +87,54 @@ export interface ServerOptions {
   limits?: Limits
   // Named wire codecs this server accepts beyond '' = proto (§12).
   codecs?: Record<string, NamedCodec>
+  // Message compressors this server accepts, by name (§12.1) — the twin of
+  // ConnOptions.compressors. An OPEN naming anything absent here draws
+  // T{UNIMPLEMENTED}, exactly like an unknown codec: a server serves what it
+  // registered, never what a peer asks for, the way a grpc-go server serves
+  // exactly the compressors its binary imported. To speak the interop
+  // baseline, hand it the platform's:
+  //
+  //   new Server(tx, { compressors: { gzip: getCompressor('gzip')! } })
+  compressors?: Record<string, Compressor>
+  // Caps one received message AFTER decompression (default 4 MiB) and one
+  // sent message AFTER compression (default effectively unlimited), failing
+  // with RESOURCE_EXHAUSTED exactly as gRPC does (grpc.MaxRecvMsgSize /
+  // MaxSendMsgSize parity). 0 rejects everything — reading it as "unlimited"
+  // would turn a deliberate lockdown into an open door.
+  maxRecvMsgSize?: number
+  maxSendMsgSize?: number
+}
+
+// EMPTY stands in for an absent payload: a frame without one decodes as the
+// zero-length message, never as garbage.
+const EMPTY = new Uint8Array(0)
+
+// detailsOf reads the rich google.rpc.Status details a handler attached to
+// its error (§5): a StatusError carrying `details` — the DetailedStatusError
+// shape the client reads back with statusDetails() — rides the terminal
+// frame. Anything else is ignored, and each entry is shape-checked, so a
+// stray property can never crash the frame encoder.
+function detailsOf(err: unknown): Any[] | undefined {
+  if (!(err instanceof StatusError)) return undefined
+  const d = (err as DetailedStatusError).details
+  if (!Array.isArray(d) || d.length === 0) return undefined
+  const out: Any[] = []
+  for (const e of d as unknown[]) {
+    if (e === null || typeof e !== 'object') continue
+    const a = e as { typeUrl?: unknown; value?: unknown }
+    if (typeof a.typeUrl === 'string' && a.value instanceof Uint8Array) out.push({ typeUrl: a.typeUrl, value: a.value })
+  }
+  return out.length > 0 ? out : undefined
+}
+
+const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+
+// windowOf reads a frame's flow-control field defensively: a hand-built
+// partial frame (or one from a JS caller) may carry no `window` at all, and a
+// NaN credit would park a sender forever.
+function windowOf(f: Frame): number {
+  const w = f.window
+  return typeof w === 'number' && Number.isFinite(w) && w > 0 ? Math.floor(w) : 0
 }
 
 // ---------------------------------------------------------------------------
@@ -55,10 +152,17 @@ export interface ServerContext {
   readonly method: string
   // Call deadline (epoch ms) when the client propagated a budget (§10.2).
   readonly deadline: number | undefined
+  // Joins metadata into the pending header (§11). It rejects — StatusError
+  // {INTERNAL} — once the header is already on the wire, and for metadata
+  // that is not legal on the wire (grpc-go's Validate rules).
   setHeader(md: Metadata): void
-  // Flushes the header immediately as an H frame on streaming calls; a unary
-  // call has a single response frame, so this behaves as setHeader (§11).
+  // Flushes the header immediately as an H frame — on unary calls too, so a
+  // client's header() returns before the response exists, as it does on gRPC
+  // (§8, §11). Flushing twice rejects with INTERNAL; the core's own creation
+  // ack is not a flush.
   sendHeader(md?: Metadata): Promise<void>
+  // Records trailer metadata, which rides the terminal frame (§11). Invalid
+  // metadata is dropped, as grpc-go does.
   setTrailer(md: Metadata): void
 }
 
@@ -265,6 +369,12 @@ export class Server {
   private readonly methodRx: Map<string, ResolvedRxConfig>
   private readonly limits: ResolvedLimits
   private readonly codecs: Map<string, NamedCodec>
+  private readonly compressors: Map<string, Compressor>
+  // Endpoint-wide per-call size caps (§16, gRPC parity) and the flow-control
+  // park bound (§4.2.1).
+  private readonly maxRecv: number
+  private readonly maxSend: number
+  private readonly stallMs: number
 
   private readonly services = new Map<string, Registration>()
   // serving flips on the first handle; the registry is immutable after that
@@ -301,6 +411,10 @@ export class Server {
     this.methodRx = new Map(Object.entries(opts.methodRxBuffer ?? {}).map(([k, v]) => [k, resolveRxConfig(v)]))
     this.limits = resolveLimits(opts.limits)
     this.codecs = new Map(Object.entries(opts.codecs ?? {}))
+    this.compressors = new Map(Object.entries(opts.compressors ?? {}))
+    this.maxRecv = sizeOr(opts.maxRecvMsgSize, DEFAULT_MAX_RECV_MSG_SIZE)
+    this.maxSend = sizeOr(opts.maxSendMsgSize, DEFAULT_MAX_SEND_MSG_SIZE)
+    this.stallMs = opts.timing?.stallMs ?? DEFAULT_STALL_MS
   }
 
   register<Req, Res>(desc: MethodDesc<Req, Res> & { clientStreams: false; serverStreams: false }, handler: UnaryHandler<Req, Res>): void
@@ -368,6 +482,15 @@ export class Server {
     const st = ps?.calls.get(sid)
     if (st !== undefined) {
       await st.handleRx(f, ctx)
+      return
+    }
+
+    if (shapeOf(f) === FlagWindow) {
+      // See Conn.handle: a grant for a call this side has already finished is
+      // dropped in silence, never answered with a RESET (§4.2.1, §9.3) — a
+      // grant legitimately races the call's end, and answering it would turn
+      // every well-behaved stream into a RESET exchange. It is also not a
+      // tombstone hit: a WINDOW carries no seq and validates nothing.
       return
     }
 
@@ -451,6 +574,21 @@ export class Server {
       }
       codec = named.resolve(reg.desc)
     }
+    // The compressor, like the codec, is named on the OPEN and governs the
+    // whole call in both directions (PROTOCOL.md §12.1). Truthiness, not
+    // `!== ''`: a frame handed in by JS (or by a hand-built partial literal)
+    // must read as "no compressor", never as one named "undefined" — the same
+    // discipline encodeFrame applies (wire.ts).
+    let comp: Compressor | undefined
+    if (f.compressor) {
+      // Registered compressors only — the server never enables one implicitly
+      // for a peer that asks, the way grpc-go's server serves exactly what the
+      // binary registered (§12.1).
+      comp = this.compressors.get(f.compressor)
+      if (comp === undefined) {
+        return this.rejectOpen(ctx, f, Code.UNIMPLEMENTED, `unsupported compressor: ${f.compressor}`)
+      }
+    }
 
     const now = nowMs()
     const slot = this.ensureSlot(ctx.peer)
@@ -464,10 +602,19 @@ export class Server {
       return this.rejectOpen(ctx, f, Code.RESOURCE_EXHAUSTED, 'too many concurrent calls')
     }
 
-    const rxCfg = this.methodRx.get(reg.desc.path) ?? this.rxCfg
-    const st = new ServerStream(this, ctx.peer, f.epoch, f.sid, reg, codec, rxCfg, rel)
+    // The reliable-mode floor (§4.2.1) is applied here, not in resolveRxConfig:
+    // it depends on the mode of the channel THIS call arrived on, which a
+    // per-peer mixed-mode server resolves per frame (§4.3).
+    const cfg = this.methodRx.get(reg.desc.path) ?? this.rxCfg
+    const rxCfg: ResolvedRxConfig = { size: reliableRxSize(cfg.size, rel), policy: cfg.policy }
+    const st = new ServerStream(this, ctx.peer, f.epoch, f.sid, reg, codec, rxCfg, rel, comp, this.maxRecv, this.maxSend, this.stallMs)
     st.ps = ps
     st.slot = slot
+    if (rel) {
+      // The OPEN advertises the client's receive window (§4.2.1); it precedes
+      // every server frame, so the server never needs the assumed window.
+      st.flowTx.observe(windowOf(f))
+    }
 
     // The client-asserted budget bounds the handler ctx, clamped by the
     // server cap when configured (PROTOCOL.md §10.2). A non-positive budget
@@ -554,7 +701,9 @@ export class Server {
       let err: StatusError | undefined
       let resp: unknown
       try {
-        const req = st.reqCodec.unmarshal(open.payload ?? new Uint8Array())
+        // The request rides the OPEN; it is decompressed and size-capped like
+        // any received message (§12.1).
+        const req = await st.decodeMessage(open)
         resp = await (st.reg.handler as UnaryHandler<unknown, unknown>)(req, st.context)
       } catch (e) {
         err = toStatusError(e)
@@ -564,17 +713,17 @@ export class Server {
         try {
           st.setResponse(resp)
         } catch (e) {
-          err = statusError(Code.INTERNAL, `marshal response: ${e instanceof Error ? e.message : String(e)}`)
+          err = statusError(Code.INTERNAL, `marshal response: ${errText(e)}`)
         }
       }
-      const t = st.terminalFrame(err)
+      const t = await st.terminalFrame(err)
 
       // The terminal is sent even when the handler ctx ended: the client (or
       // its tombstone) decides what to do with it — unless the peer disowned
       // the call (RESET) or vanished (liveness), where nothing listens (§9.3).
       if (st.suppressTerm) return
       term = t
-      void st.transmit(t).catch(noop)
+      void st.transmitTerminal(t).catch(noop)
     } finally {
       this.finish(st, term)
       this.taskDone()
@@ -605,10 +754,10 @@ export class Server {
       }
       if (err === undefined && st.signal.aborted) err = abortCause(st.signal)
 
-      const t = st.terminalFrame(err)
+      const t = await st.terminalFrame(err)
       if (st.suppressTerm) return
       term = t
-      void st.transmit(t).catch(noop)
+      void st.transmitTerminal(t).catch(noop)
     } finally {
       this.finish(st, term)
       this.taskDone()
@@ -635,6 +784,9 @@ export class Server {
       }
     }
     if (slot !== undefined && slot.liveCalls > 0) slot.liveCalls--
+    // Unpark anything still waiting for flow-control credit before the cancel
+    // it would otherwise only observe through the abort (§4.2.1).
+    st.flowTx.release()
     st.cancel(statusError(Code.CANCELLED, 'call finished'))
     if (st.deadlineTimer !== undefined) {
       clearTimeout(st.deadlineTimer)
@@ -1028,10 +1180,16 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   // expiry) — no terminal is sent, the tombstone is key-only.
   /** @internal */ suppressTerm = false
 
+  // Per-stream flow control (reliable mode, §4.2.1): flowTx is credit for
+  // what this side sends, flowRx accounts what the handler consumed.
+  /** @internal */ readonly flowTx = new FlowSender()
+  private readonly flowRx = new FlowReceiver()
+
   // tx state.
   private readonly txSeq = new TxSeq()
   /** @internal */ txHeader: Metadata | undefined // set via setHeader/sendHeader
   private hdrSent = false // header MD already rode some frame
+  private hdrFlushed = false // the HANDLER flushed a header (sendHeader), §11
   private hdrFrame: Frame | undefined // stored creation ack for byte-identical replay (§8)
   /** @internal */ trailerMd: Metadata | undefined
   private resp: Uint8Array | undefined // captured client-streaming response payload
@@ -1068,6 +1226,12 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
     // selects strict sequencing and gates the probe/tombstone machinery of
     // the peer-mixed server.
     /** @internal */ readonly reliable: boolean,
+    // The call's message compressor, named on the OPEN; undefined = none
+    // (§12.1). Like the codec it governs both directions.
+    private readonly comp: Compressor | undefined,
+    private readonly maxRecv: number,
+    private readonly maxSend: number,
+    private readonly stallMs: number,
   ) {
     this.reqCodec = codec.request
     this.resCodec = codec.response
@@ -1075,6 +1239,11 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
     this.rxq = new FrameQueue(rxCfg.size)
     this.rxWin.l = 1 // the accepted OPEN
     this.rxWin.strict = reliable
+    if (reliable) {
+      // Advertise this side's buffer as the client's initial send window; it
+      // rides the creation ack H (§4.2.1).
+      this.flowRx.enable(rxCfg.size)
+    }
     const n = nowMs()
     this.lastRx = n
     this.lastTx = n
@@ -1093,6 +1262,15 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
       setHeader: (md) => this.setHeader(md),
       sendHeader: (md) => this.sendHeader(md),
       setTrailer: (md) => {
+        if (Object.keys(md).length === 0) return
+        try {
+          validateMetadata(md)
+        } catch {
+          // Invalid metadata is dropped, as grpc-go does (the signature has
+          // no error to return) — validating here is what keeps it from
+          // failing the terminal frame's encode (§11).
+          return
+        }
         this.trailerMd = metadataJoin(this.trailerMd, md)
       },
     }
@@ -1120,6 +1298,21 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   // by the rx signal (PROTOCOL.md §4.2).
   /** @internal */
   async handleRx(f: Frame, ctx: FrameContext): Promise<void> {
+    if (hasUnknownFlags(f) || !legalShape(shapeOf(f))) {
+      // See the client twin: a modifier bit from a newer peer changes
+      // something about this frame that we cannot honor, and an illegal shape
+      // combination is not a frame we can route — delivering either would be
+      // a silent corruption, dropping it a silent gap (§7.1, §8).
+      this.cancel(statusError(Code.INTERNAL, `drpc: frame carries unsupported flags 0x${f.flags.toString(16)}`))
+      return
+    }
+    if (shapeOf(f) === FlagWindow) {
+      // Stateless flow-control grant: no seq, no delivery, and only where
+      // flow control exists at all — a stray or injected WINDOW must never
+      // park an unreliable-mode sender (§4.2.1, §7, §15).
+      if (this.reliable) this.flowTx.grant(windowOf(f))
+      return
+    }
     if (isOpen(f)) {
       if (f.seq !== 1) {
         // Off-shape: an OPEN's seq MUST be 1 (PROTOCOL.md §8).
@@ -1133,10 +1326,11 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
         return
       }
       // Duplicate OPEN (its seq 1 is always a dedup). For streaming calls it
-      // re-elicits the creation ack (PROTOCOL.md §8 ack recovery); unary is
-      // deadline-bounded and sends no ack.
+      // re-elicits the creation ack (PROTOCOL.md §8 ack recovery); unary owes
+      // one only if its handler flushed a header, which the client's Header()
+      // is now blocked on (§8, §11).
       this.noteValidatedRx()
-      if (!isUnary(this.reg.desc)) this.replayH()
+      if (!isUnary(this.reg.desc) || this.hdrFrame !== undefined) this.replayH()
       return
     }
 
@@ -1170,7 +1364,16 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
         return
       }
       if (this.reliable) {
-        if (!(await this.rxq.putBlocking(f, this.endLatch, ctx.signal))) {
+        if (this.flowRx.active) {
+          // A conforming peer never exceeds the window it was granted, so a
+          // full buffer here is a contract violation — and blocking on it
+          // would be the deadlock flow control exists to remove: the grant
+          // that would unpark the peer travels the very read loop this would
+          // stall (§4.2, §4.2.1).
+          if (!this.rxq.tryPut(f)) {
+            this.cancel(statusError(Code.INTERNAL, 'drpc: peer exceeded the advertised flow-control window'))
+          }
+        } else if (!(await this.rxq.putBlocking(f, this.endLatch, ctx.signal))) {
           // See the client twin: teardown ate the frame — fail loud rather
           // than leave a silent gap on a reliable channel (§14).
           this.rxDropped++
@@ -1195,7 +1398,13 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   async recv(): Promise<Req | undefined> {
     for (;;) {
       const f = this.rxq.tryTake()
-      if (f !== undefined) return this.reqCodec.unmarshal(f.payload ?? new Uint8Array()) as Req
+      if (f !== undefined) {
+        // A failed delivery ends the call; granting then would only draw a
+        // RESET for a sid the peer has already forgotten (§4.2.1).
+        const msg = (await this.decodeMessage(f)) as Req
+        this.grantWindow(1)
+        return msg
+      }
       if (this.rxEOF.tripped) return undefined
       if (this.ctrl.signal.aborted) throw abortCause(this.ctrl.signal)
       await Promise.race([this.rxq.readable(), this.rxEOF.wait(), this.endLatch.wait()])
@@ -1232,21 +1441,44 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   }
 
   // attachHeader piggybacks the pending header MD once (PROTOCOL.md §11).
-  private attachHeader(f: Frame): void {
-    if (this.txHeader !== undefined && !this.hdrSent) {
+  // force makes the field present even when the handler set no metadata: an
+  // explicit sendHeader must unblock the client's header(), while a creation
+  // ack must not pin the header to empty (§8).
+  private attachHeader(f: Frame, force: boolean): void {
+    if (this.hdrSent) return
+    if (this.txHeader !== undefined) {
       f.header = this.txHeader
+      this.hdrSent = true
+      return
+    }
+    if (force) {
+      f.header = {}
       this.hdrSent = true
     }
   }
 
   // sendH emits the creation-ack header frame (PROTOCOL.md §8). The header
-  // field is present only if the handler already set one. The first H is
-  // stored for byte-identical replay.
+  // field is present only if the handler already set one — the core's own ack
+  // is not a flush (§11). The first H is stored for byte-identical replay,
+  // and in reliable mode it advertises this side's receive window (§4.2.1).
   /** @internal */
   sendH(): void {
     const f = this.nextFrame()
-    this.attachHeader(f)
+    if (this.reliable) f.window = this.rxCfg.size
+    this.attachHeader(f, false)
     if (this.hdrFrame === undefined) this.hdrFrame = f
+    void this.transmit(f).catch(noop)
+  }
+
+  // grantWindow reports messages the handler consumed and sends the resulting
+  // credit (§4.2.1). Called only for buffered data frames — a terminal
+  // payload never occupied a buffer slot. A WINDOW frame is stateless: it
+  // carries no seq and burns none.
+  private grantWindow(n: number): void {
+    if (this.ctrl.signal.aborted) return // the call is over; a grant would draw a RESET
+    const g = this.flowRx.consumed(n)
+    if (g === 0) return
+    const f = frame({ epoch: this.server.epoch, sid: this.sid, peerEpoch: this.clientEpoch, flags: FlagWindow, window: g })
     void this.transmit(f).catch(noop)
   }
 
@@ -1262,7 +1494,8 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
     let f = this.hdrFrame
     if (f === undefined) {
       f = this.nextFrame()
-      this.attachHeader(f)
+      if (this.reliable) f.window = this.rxCfg.size
+      this.attachHeader(f, false)
     }
     void this.transmit(f).catch(noop)
   }
@@ -1278,40 +1511,90 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
     return frame({ epoch, sid: this.sid, flags: FlagPing, peerEpoch: this.clientEpoch })
   }
 
+  // setHeader joins metadata into the pending header. It throws once the
+  // header is already on the wire — joining more would silently lose it
+  // (§11 first-wins), which is grpc-go's ErrIllegalHeaderWrite.
   /** @internal */
   setHeader(md: Metadata): void {
+    if (Object.keys(md).length === 0) return
+    validateMetadata(md) // StatusError{INTERNAL}: the call fails locally (§11)
+    if (this.hdrFlushed || this.hdrSent) throw illegalHeaderWrite()
     this.txHeader = metadataJoin(this.txHeader, md)
   }
 
-  // sendHeader flushes the header immediately as an H frame on streaming
-  // calls (PROTOCOL.md §11); a unary call's header rides its terminal frame.
+  // sendHeader flushes the header metadata as an H frame at once — including
+  // on unary calls, so a client's header() returns before the response
+  // exists, as it does on gRPC (PROTOCOL.md §8, §11). Calling it twice is an
+  // error, as in grpc-go; the core's own creation ack is not a flush.
   /** @internal */
   async sendHeader(md?: Metadata): Promise<void> {
+    if (md !== undefined) validateMetadata(md)
+    if (this.hdrFlushed || this.hdrSent) {
+      // Flushed twice, or after the header already rode a data frame:
+      // refusing is what keeps the metadata from being silently dropped.
+      throw illegalHeaderWrite()
+    }
+    this.hdrFlushed = true
     if (md !== undefined) this.txHeader = metadataJoin(this.txHeader, md)
-    if (isUnary(this.reg.desc)) return
     const f = this.nextFrame()
-    this.attachHeader(f)
+    this.attachHeader(f, true)
+    if (this.hdrFrame === undefined) {
+      // Keep it for byte-identical replay: on a unary call this H is the only
+      // thing a client's header() is waiting for (§8 ack recovery).
+      this.hdrFrame = f
+    }
     try {
       await this.transmitOrThrow(f)
     } catch (e) {
       this.undoRefused(f, e)
-      throw e
+      throw toStatusError(e)
     }
   }
 
   async send(msg: Res): Promise<void> {
-    const payload = this.resCodec.marshal(msg)
+    const raw = this.resCodec.marshal(msg)
     if (!this.reg.desc.serverStreams) {
       throw statusError(Code.INTERNAL, 'send on a non-server-streaming call')
     }
-    const f = this.nextFrame()
-    f.payload = payload
-    this.attachHeader(f)
+
+    // Flow control (§4.2.1): park until the client has room, instead of
+    // letting its full buffer stall every call on the channel. The park is
+    // bounded by the call ending and by T_stall — nothing else could break it
+    // in reliable mode.
+    if (!this.flowTx.tryAcquire()) {
+      switch (await this.flowTx.acquire(this.endLatch, this.stallMs)) {
+        case 'ok':
+          break
+        case 'stalled':
+          throw statusError(Code.UNAVAILABLE, `drpc: flow-control stall: the peer granted no credit for ${this.stallMs}ms`)
+        default:
+          // The call ended underneath the sender: report the status that
+          // ended it, as grpc-go does.
+          throw abortCause(this.ctrl.signal)
+      }
+    }
+
+    // Compress BEFORE the frame exists. Compression is asynchronous here (the
+    // platform's CompressionStream is a stream), and an await between a seq
+    // allocation and the transmit would let a racing send put ITS frame on
+    // the wire first — a gap the client's strict window would fail the call
+    // on. Everything from nextFrame() to transmitOrThrow() is synchronous.
+    let enc: WirePayload
+    try {
+      enc = await this.encodePayload(raw)
+    } catch (e) {
+      this.flowTx.undo() // the message never reached the wire (§4.2.1)
+      throw e
+    }
 
     if (this.ctrl.signal.aborted) {
       // grpc-go parity: report the status describing why the stream ended.
       throw abortCause(this.ctrl.signal)
     }
+    const f = this.nextFrame()
+    f.payload = enc.bytes
+    if (enc.compressed) f.flags |= FlagCompressed
+    this.attachHeader(f, false)
     try {
       await this.transmitOrThrow(f)
     } catch (e) {
@@ -1332,10 +1615,41 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   private undoRefused(f: Frame, err: unknown): void {
     if (!isMessageTooLarge(err)) return
     this.txSeq.undo(f.seq)
+    // The message never reached the wire, so its credit was never spent:
+    // without the refund a handler that ignores the error leaks its whole
+    // window and parks forever (§4.2.1, §4.4).
+    if (isData(f)) this.flowTx.undo()
   }
 
-  // setResponse captures the client-streaming response; it rides the
-  // terminal frame (PROTOCOL.md §8).
+  // ------------------------------------------------------------------
+  // payload codec: compression + size caps (PROTOCOL.md §12.1)
+  // ------------------------------------------------------------------
+
+  // encodePayload prepares one outgoing message: compressed when the call has
+  // a compressor and it actually shrinks the bytes (never on an empty
+  // payload, §5, §7), then capped on the bytes that reach the wire — i.e.
+  // after compression, as grpc-go caps them (§12.1, §16).
+  private async encodePayload(payload: Uint8Array): Promise<WirePayload> {
+    const enc = this.comp === undefined ? rawPayload(payload) : await compressPayload(this.comp, payload)
+    checkSendSize(enc.bytes.length, this.maxSend)
+    return enc
+  }
+
+  // decodeMessage returns the message a received frame carries: decompressed
+  // if marked — bounded by the receive cap, so a decompression bomb cannot
+  // allocate without limit — then capped on the DECOMPRESSED message and
+  // unmarshaled with the call's codec (§12.1, §16).
+  /** @internal */
+  async decodeMessage(f: Frame): Promise<unknown> {
+    const raw = f.payload ?? EMPTY
+    const payload = isCompressed(f) ? await decompressPayload(this.comp, raw, this.maxRecv) : raw
+    checkRecvSize(payload.length, this.maxRecv)
+    return this.reqCodec.unmarshal(payload)
+  }
+
+  // setResponse captures the unary / client-streaming response; it rides the
+  // terminal frame (PROTOCOL.md §8). Compression and the send cap are applied
+  // when that frame is built.
   /** @internal */
   setResponse(resp: unknown): void {
     if (this.respSet) throw statusError(Code.INTERNAL, 'response already set')
@@ -1346,7 +1660,22 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   // terminalFrame builds T after the handler returned (PROTOCOL.md §8).
   // T re-carries the header MD once set so it survives first-frame loss.
   /** @internal */
-  terminalFrame(err: StatusError | undefined): Frame {
+  async terminalFrame(err: StatusError | undefined): Promise<Frame> {
+    // The response payload is encoded BEFORE the frame exists, for the reason
+    // send() spells out: compression is asynchronous, and a seq allocated
+    // across that await could be overtaken by a still-running send.
+    let enc: WirePayload | undefined
+    let st = err
+    if (st === undefined && this.respSet) {
+      try {
+        enc = await this.encodePayload(this.resp ?? EMPTY)
+      } catch (e) {
+        // Oversize or uncompressible: the response cannot be delivered, so
+        // the call ends with that status instead of a truncated message.
+        st = toStatusError(e)
+      }
+    }
+
     const f = this.nextFrame()
     f.flags = FlagClose
     if (this.txHeader !== undefined) {
@@ -1354,12 +1683,65 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
       this.hdrSent = true
     }
     if (this.trailerMd !== undefined) f.trailer = this.trailerMd
-    if (err !== undefined) {
-      setFrameError(f, err)
+    if (st !== undefined) {
+      setFrameError(f, st)
+      // Rich google.rpc.Status details travel too (§5). They are a passenger:
+      // a terminal the channel cannot carry is re-sent without them
+      // (transmitTerminal).
+      f.details = detailsOf(st)
       return f
     }
-    if (this.respSet) f.payload = this.resp
+    if (enc !== undefined) {
+      f.payload = enc.bytes
+      if (enc.compressed) f.flags |= FlagCompressed
+    }
     f.code = Code.OK
     return f
   }
+
+  // transmitTerminal sends the call's terminal frame, shrinking it until the
+  // channel accepts it. Every termination path depends on this frame arriving
+  // (§10.7), so its passengers are shed in order of expendability: first the
+  // status details (§5), then the response payload — which cannot be
+  // delivered anyway, so the call ends with RESOURCE_EXHAUSTED rather than
+  // with silence. The frame is mutated in place and keeps its seq: a refused
+  // frame never reached the wire, so no sequence number is burned (§4.4) and
+  // what the tombstone stores for replay is exactly what was sent (§9.2).
+  /** @internal */
+  async transmitTerminal(f: Frame): Promise<void> {
+    let err = await this.tryTransmit(f)
+    if (err === undefined) return
+    if (f.details !== undefined && f.details.length > 0) {
+      f.details = undefined
+      const e2 = await this.tryTransmit(f)
+      if (e2 === undefined) return
+      err = e2
+    }
+    if (f.payload === undefined && f.code === Code.RESOURCE_EXHAUSTED) {
+      return // already minimal; the channel simply cannot carry it
+    }
+    f.payload = undefined
+    f.flags &= ~FlagCompressed
+    f.details = undefined
+    setFrameError(f, statusError(Code.RESOURCE_EXHAUSTED, `drpc: the terminal frame does not fit the transport: ${errText(err)}`))
+    await this.tryTransmit(f)
+  }
+
+  // tryTransmit sends f and returns the adapter's size refusal, if that is
+  // what it was. Any other failure is the adapter's own business (§4.2) and
+  // is swallowed: retrying a smaller frame would not help.
+  private async tryTransmit(f: Frame): Promise<unknown> {
+    try {
+      await this.transmitOrThrow(f)
+      return undefined
+    } catch (e) {
+      return isMessageTooLarge(e) ? e : undefined
+    }
+  }
+}
+
+// illegalHeaderWrite mirrors grpc-go's transport.ErrIllegalHeaderWrite: the
+// header is already on the wire, so anything more would be silently lost.
+function illegalHeaderWrite(): StatusError {
+  return statusError(Code.INTERNAL, 'drpc: sendHeader called multiple times')
 }

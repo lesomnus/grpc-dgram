@@ -8,7 +8,7 @@ import { DropPolicy } from '../src/limits'
 import { Server, type ServerOptions } from '../src/server'
 import { Code, type StatusError } from '../src/status'
 import type { Timing } from '../src/timing'
-import { FlagClose, FlagOpen, FlagPing, isOpen, isReset, isTerminal, type Frame } from '../src/wire'
+import { FlagClose, FlagOpen, FlagPing, FlagWindow, frame, isOpen, isReset, isTerminal, type Frame } from '../src/wire'
 import { echo, jsonCodec, makeNet, registerEcho, tick, wireClone } from '../src/testing'
 
 const fast: Timing = { callMs: 300, livenessMs: 450, retransmitMs: 50, tombstoneMs: 1000, holdMs: 50 }
@@ -32,21 +32,11 @@ function injectServer(opts: ServerOptions = {}) {
 const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v))
 
 function openOnce(epoch: number, sid: number, text: string): Frame {
-  return {
-    epoch,
-    sid,
-    seq: 1,
-    flags: FlagOpen | FlagClose,
-    method: echo.once.path,
-    codec: '',
-    desc: '',
-    peerEpoch: 0,
-    payload: enc({ text }),
-  }
+  return frame({ epoch, sid, seq: 1, flags: FlagOpen | FlagClose, method: echo.once.path, payload: enc({ text }) })
 }
 
 function openLive(epoch: number, sid: number): Frame {
-  return { epoch, sid, seq: 1, flags: FlagOpen, method: echo.live.path, codec: '', desc: '', peerEpoch: 0 }
+  return frame({ epoch, sid, seq: 1, flags: FlagOpen, method: echo.live.path })
 }
 
 describe('MaxLiveCalls (§15)', () => {
@@ -144,13 +134,13 @@ describe('aggregate reply budget (§15)', () => {
     // 10 stream probes for unknown sids: each would draw an immediate RESET,
     // but the budget allows 2 per RTI.
     for (let sid = 100; sid < 110; sid++) {
-      const probe: Frame = { epoch: 3, sid, seq: 0, flags: FlagPing, method: '', codec: '', desc: '', peerEpoch: 0 }
+      const probe = frame({ epoch: 3, sid, seq: 0, flags: FlagPing, method: '', codec: '', desc: '', peerEpoch: 0 })
       await inj.server.handle(probe, { peer: 'p' })
     }
     expect(inj.sent.filter((f) => isReset(f)).length).toBe(2)
     // The next RTI window turns over and replies flow again.
     await vi.advanceTimersByTimeAsync(60)
-    const probe: Frame = { epoch: 3, sid: 200, seq: 0, flags: FlagPing, method: '', codec: '', desc: '', peerEpoch: 0 }
+    const probe = frame({ epoch: 3, sid: 200, seq: 0, flags: FlagPing, method: '', codec: '', desc: '', peerEpoch: 0 })
     await inj.server.handle(probe, { peer: 'p' })
     expect(inj.sent.filter((f) => isReset(f)).length).toBe(3)
     await inj.server.stop()
@@ -171,10 +161,10 @@ describe('drop policies (§4.2)', () => {
 
     const srvEpoch = 7
     for (let seq = 1; seq <= 4; seq++) {
-      const f: Frame = { epoch: srvEpoch, sid, seq, flags: 0, method: '', codec: '', desc: '', peerEpoch: cEpoch, payload: enc({ text: `m${seq}` }) }
+      const f = frame({ epoch: srvEpoch, sid, seq, flags: 0, method: '', codec: '', desc: '', peerEpoch: cEpoch, payload: enc({ text: `m${seq}` }) })
       await conn.handle(f, {})
     }
-    const term: Frame = { epoch: srvEpoch, sid, seq: 5, flags: FlagClose, method: '', codec: '', desc: '', peerEpoch: cEpoch }
+    const term = frame({ epoch: srvEpoch, sid, seq: 5, flags: FlagClose, method: '', codec: '', desc: '', peerEpoch: cEpoch })
     term.code = Code.OK
     await conn.handle(term, {})
 
@@ -205,17 +195,7 @@ describe('window-overrun fail-loud (§6.3)', () => {
     await stream.send({ text: 'x', n: 0 })
     const open = sent.find((f) => isOpen(f))!
 
-    const mk = (seq: number): Frame => ({
-      epoch: 7,
-      sid: open.sid,
-      seq,
-      flags: 0,
-      method: '',
-      codec: '',
-      desc: '',
-      peerEpoch: open.epoch,
-      payload: enc({ text: `m${seq}` }),
-    })
+    const mk = (seq: number): Frame => frame({ epoch: 7, sid: open.sid, seq, peerEpoch: open.epoch, payload: enc({ text: `m${seq}` }) })
     await conn.handle(mk(1), {}) // accepted; L = 1
     expect(await stream.recv()).toEqual({ text: 'm1' }) // drain the buffered frame
     await conn.handle(mk(6000), {}) // beyond window (Δ > 4096): run of 1
@@ -236,18 +216,25 @@ describe('window-overrun fail-loud (§6.3)', () => {
     const stream = conn.newStream(echo.many, {})
     await stream.send({ text: 'x', n: 0 })
     const open = sent.find((f) => isOpen(f))!
-    const poison: Frame = { epoch: 7, sid: open.sid, seq: 4_000_000_000, flags: 0, method: '', codec: '', desc: '', peerEpoch: open.epoch, payload: enc({ text: 'p' }) }
+    const poison = frame({ epoch: 7, sid: open.sid, seq: 4_000_000_000, flags: 0, method: '', codec: '', desc: '', peerEpoch: open.epoch, payload: enc({ text: 'p' }) })
     await conn.handle(poison, {})
     // The stream still accepts the legitimate sequence afterwards.
-    const good: Frame = { epoch: 7, sid: open.sid, seq: 1, flags: 0, method: '', codec: '', desc: '', peerEpoch: open.epoch, payload: enc({ text: 'ok' }) }
+    const good = frame({ epoch: 7, sid: open.sid, seq: 1, flags: 0, method: '', codec: '', desc: '', peerEpoch: open.epoch, payload: enc({ text: 'ok' }) })
     await conn.handle(good, {})
     expect(await stream.recv()).toEqual({ text: 'ok' })
     conn.close()
   })
 })
 
-describe('reliable-mode rx overflow blocks instead of dropping (§4.2)', () => {
-  it('delivery stalls until the consumer drains; nothing is lost or reordered', async () => {
+describe('reliable-mode delivery never drops (§4.2, §4.2.1)', () => {
+  it('a stalled consumer paces its sender instead of blocking delivery; the exact sequence survives', async () => {
+    // Wire v1.1: the configured buffer of 2 is raised to the flow-control
+    // floor W_init, and the sender is paced by the advertised window instead
+    // of by a blocking Handle — so delivery does NOT stall here, which is the
+    // whole point of §4.2.1 (a blocked read loop would stall every other call
+    // on the channel too). Dropping is still forbidden: the messages queue and
+    // the handler sees them in order once it resumes. The park boundary itself
+    // is pinned in flow.test.ts.
     let release!: () => void
     const gate = new Promise<void>((res) => (release = res))
     const got: string[] = []
@@ -262,12 +249,10 @@ describe('reliable-mode rx overflow blocks instead of dropping (§4.2)', () => {
     const stream = net.conn.newStream(echo.live, {})
     await stream.send({ text: 'a' })
     await stream.send({ text: 'b' })
-    // The buffer (2) is full: the third send blocks inside server.handle —
-    // TCP/SCTP-style backpressure through the synchronous pipe.
     let thirdDone = false
     const third = stream.send({ text: 'c' }).then(() => (thirdDone = true))
     await tick()
-    expect(thirdDone).toBe(false)
+    expect(thirdDone).toBe(true) // inside the window: nothing blocks
     release()
     await third
     stream.closeSend()
@@ -281,7 +266,7 @@ describe('reliable-mode rx overflow blocks instead of dropping (§4.2)', () => {
 describe('unknown-sid handling and T_hold (§9.3)', () => {
   it('a data frame whose OPEN is merely late draws no RESET once the OPEN lands', async () => {
     const inj = injectServer()
-    const data: Frame = { epoch: 3, sid: 12, seq: 2, flags: 0, method: '', codec: '', desc: '', peerEpoch: 0, payload: enc({ text: 'early' }) }
+    const data = frame({ epoch: 3, sid: 12, seq: 2, flags: 0, method: '', codec: '', desc: '', peerEpoch: 0, payload: enc({ text: 'early' }) })
     await inj.server.handle(data, { peer: 'p' }) // schedules a delayed RESET (T_hold)
     await inj.server.handle(openLive(3, 12), { peer: 'p' }) // the OPEN arrives after all
     await vi.advanceTimersByTimeAsync(300) // well past T_hold
@@ -291,7 +276,7 @@ describe('unknown-sid handling and T_hold (§9.3)', () => {
 
   it('an unknown-sid frame with no OPEN draws the delayed RESET after T_hold', async () => {
     const inj = injectServer()
-    const data: Frame = { epoch: 3, sid: 13, seq: 2, flags: 0, method: '', codec: '', desc: '', peerEpoch: 0, payload: enc({ text: 'stray' }) }
+    const data = frame({ epoch: 3, sid: 13, seq: 2, flags: 0, method: '', codec: '', desc: '', peerEpoch: 0, payload: enc({ text: 'stray' }) })
     await inj.server.handle(data, { peer: 'p' })
     expect(inj.sent.filter((f) => isReset(f))).toEqual([]) // not yet: the grace period
     await vi.advanceTimersByTimeAsync(120) // > T_hold(50) + tick
@@ -306,7 +291,7 @@ describe('unknown-sid handling and T_hold (§9.3)', () => {
 describe('rejection replay (§9.4)', () => {
   it('duplicate unknown-method OPENs elicit the tombstoned T{UNIMPLEMENTED}, not fresh work', async () => {
     const inj = injectServer()
-    const bogus: Frame = { epoch: 3, sid: 9, seq: 1, flags: FlagOpen | FlagClose, method: '/x/Nope', codec: '', desc: '', peerEpoch: 0, payload: enc({ text: 'x' }) }
+    const bogus = frame({ epoch: 3, sid: 9, seq: 1, flags: FlagOpen | FlagClose, method: '/x/Nope', codec: '', desc: '', peerEpoch: 0, payload: enc({ text: 'x' }) })
     await inj.server.handle(bogus, { peer: 'p' })
     const first = inj.sent.filter((f) => isTerminal(f) && f.code === Code.UNIMPLEMENTED)
     expect(first).toHaveLength(1)
@@ -373,9 +358,9 @@ describe('off-shape frames (§7, §8)', () => {
     const open = sent.find((f) => isOpen(f))!
     // A data frame at a unary client: off-shape; dropped, but the terminal
     // that follows (same seq space) still lands.
-    const rogue: Frame = { epoch: 7, sid: open.sid, seq: 1, flags: 0, method: '', codec: '', desc: '', peerEpoch: open.epoch, payload: enc({ text: 'rogue' }) }
+    const rogue = frame({ epoch: 7, sid: open.sid, seq: 1, flags: 0, method: '', codec: '', desc: '', peerEpoch: open.epoch, payload: enc({ text: 'rogue' }) })
     await conn.handle(rogue, {})
-    const term: Frame = { epoch: 7, sid: open.sid, seq: 2, flags: FlagClose, method: '', codec: '', desc: '', peerEpoch: open.epoch, payload: enc({ text: 'real' }) }
+    const term = frame({ epoch: 7, sid: open.sid, seq: 2, flags: FlagClose, method: '', codec: '', desc: '', peerEpoch: open.epoch, payload: enc({ text: 'real' }) })
     term.code = Code.OK
     await conn.handle(term, {})
     expect(await p).toEqual({ text: 'real' })
@@ -384,31 +369,67 @@ describe('off-shape frames (§7, §8)', () => {
 
   it('an OPEN with seq != 1 does not create a call', async () => {
     const inj = injectServer()
-    const bad: Frame = { ...openLive(3, 30), seq: 2 }
+    const bad = frame({ ...openLive(3, 30), seq: 2 })
     await inj.server.handle(bad, { peer: 'p' })
     await tick()
     expect(inj.counts.live).toBe(0)
     await inj.server.stop()
   })
+
+  it('an illegal shape fails the call at the server: never routed, never dropped (§7.1)', async () => {
+    const inj = injectServer()
+    await inj.server.handle(openLive(3, 50), { peer: 'p' })
+    await tick()
+    // WINDOW|CLOSE is not a shape any receiver can route (§7.1). Delivering it
+    // would be a silent corruption and dropping it a silent gap, so the call
+    // fails loudly instead.
+    await inj.server.handle(frame({ epoch: 3, sid: 50, seq: 2, flags: FlagWindow | FlagClose, payload: enc({ text: 'x' }) }), { peer: 'p' })
+    await tick()
+    const term = inj.sent.find((f) => isTerminal(f) && f.sid === 50)
+    expect(term).toBeDefined()
+    expect(term!.code).toBe(Code.INTERNAL)
+    await inj.server.stop()
+  })
+
+  it('an unknown flag bit fails the call at the client, and aborts (§7.1)', async () => {
+    const sent: Frame[] = []
+    const conn = new Conn({ handle: (f: Frame) => void sent.push(wireClone(f)) }, { reliable: false, timing: fast })
+    const stream = conn.newStream(echo.many, {})
+    await stream.send({ text: 'x', n: 1 })
+    const open = sent.find((f) => isOpen(f))!
+
+    // Bit 0x40 is outside KNOWN_FLAGS: a newer peer changed something about
+    // this frame that this build cannot honor.
+    const p = stream.recv().catch((e) => e as StatusError)
+    await conn.handle(frame({ epoch: 7, sid: open.sid, seq: 1, flags: 0x40, peerEpoch: open.epoch, payload: enc({ text: 'm' }) }), {})
+    const err = (await p) as StatusError
+    expect(err.code).toBe(Code.INTERNAL)
+    expect(err.desc).toContain('unsupported flags')
+    // ...and the abort tells the server to stop (§10.3).
+    expect(sent.some((f) => isTerminal(f) && f.code === Code.INTERNAL)).toBe(true)
+    conn.close()
+  })
 })
 
 describe('metadata plumbing (§11)', () => {
   it('later header metadata never overwrites the latched first (first-wins)', async () => {
-    const net = makeNet({ reliable: true })
-    net.server.register(echo.live, async (stream, ctx) => {
-      await ctx.sendHeader({ h: ['first'] })
-      // A second explicit header flush: the frame carries it, but the client
-      // latched the first (§7, §11).
-      await ctx.sendHeader({ h: ['second'] })
-      await stream.send({ text: 'x' })
-    })
-    const stream = net.conn.newStream(echo.live, {})
-    await tick()
+    // A handler can no longer flush twice — wire v1.1 makes the second
+    // sendHeader grpc-go's ErrIllegalHeaderWrite (pinned in compat.test.ts) —
+    // so the two header-bearing frames are crafted directly here: whatever a
+    // server puts on a later frame, the client keeps what it latched first
+    // (§7, §11).
+    const sent: Frame[] = []
+    const conn = new Conn({ handle: (f: Frame) => void sent.push(wireClone(f)) }, { reliable: true })
+    const stream = conn.newStream(echo.many, {})
+    await stream.send({ text: 'x', n: 0 })
+    const open = sent.find((f) => isOpen(f))!
+    const srv = { epoch: 7, sid: open.sid, peerEpoch: open.epoch }
+
+    await conn.handle(frame({ ...srv, seq: 1, header: { h: ['first'] } }), {}) // the ack H
+    await conn.handle(frame({ ...srv, seq: 2, header: { h: ['second'] }, payload: enc({ text: 'm' }) }), {})
     expect(await stream.header()).toEqual({ h: ['first'] })
-    // Drain to completion.
-    while ((await stream.recv()) !== undefined) {
-      /* drain */
-    }
+    expect(await stream.recv()).toEqual({ text: 'm' })
+    conn.close()
   })
 })
 
@@ -416,7 +437,7 @@ describe('codec is call-scoped (§12)', () => {
   it('a codec name on a later frame addresses nothing', async () => {
     const inj = injectServer()
     await inj.server.handle(openLive(3, 40), { peer: 'p' })
-    const data: Frame = { epoch: 3, sid: 40, seq: 2, flags: 0, method: '', codec: 'nope', desc: '', peerEpoch: 0, payload: enc({ text: 'abc' }) }
+    const data = frame({ epoch: 3, sid: 40, seq: 2, flags: 0, method: '', codec: 'nope', desc: '', peerEpoch: 0, payload: enc({ text: 'abc' }) })
     await inj.server.handle(data, { peer: 'p' })
     await tick()
     // The call keeps its proto codec and echoes.

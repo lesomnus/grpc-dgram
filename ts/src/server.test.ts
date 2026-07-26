@@ -5,11 +5,11 @@
 import { describe, expect, it } from 'vitest'
 import { Server } from './server'
 import { Code } from './status'
-import { FlagOpen, isTerminal, type Frame } from './wire'
+import { FlagOpen, isTerminal, type Frame, frame } from './wire'
 import { echo, registerEcho, tick } from './testing'
 
 function openLive(epoch: number, sid: number): Frame {
-  return { epoch, sid, seq: 1, flags: FlagOpen, method: echo.live.path, codec: '', desc: '', peerEpoch: 0 }
+  return frame({ epoch, sid, seq: 1, flags: FlagOpen, method: echo.live.path })
 }
 
 describe('§15 MaxLiveCalls across a disconnect + same-key reuse', () => {

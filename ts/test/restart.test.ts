@@ -8,7 +8,7 @@ import { Server } from '../src/server'
 import { Code, type StatusError } from '../src/status'
 import type { FrameHandler } from '../src/seam'
 import type { Timing } from '../src/timing'
-import { isReset, type Frame } from '../src/wire'
+import { frame, isReset, type Frame } from '../src/wire'
 import { echo, registerEcho, tick, wireClone } from '../src/testing'
 
 const fast: Timing = { callMs: 300, livenessMs: 450, retransmitMs: 50, tombstoneMs: 1000, holdMs: 50 }
@@ -196,7 +196,7 @@ describe('server restart (§6.5)', () => {
 
     // A stale RESET whose epoch names some other incarnation must not kill
     // the live call.
-    const staleReset: Frame = { epoch: 0xdeadbeef, sid: 1, seq: 0, flags: 4, method: '', codec: '', desc: '', peerEpoch: 0 }
+    const staleReset = frame({ epoch: 0xdeadbeef, sid: 1, seq: 0, flags: 4, method: '', codec: '', desc: '', peerEpoch: 0 })
     expect(isReset(staleReset)).toBe(true)
     await net.conn.handle(staleReset, {})
     await stream.send({ text: 'b' })

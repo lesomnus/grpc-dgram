@@ -1,14 +1,23 @@
 # TS port — status & handoff
 
-Snapshot as of the `ts port: drpc v1.0 core …` commit (M6, TS port). Read this
-before continuing the port.
+Read this before continuing the port.
 
 ## TL;DR
 
-The TypeScript port of drpc v1.0 (`../PROTOCOL.md`) is **functionally complete,
-green, and adversarially audited** (4 findings found and fixed — see below).
-Cross-language interop with the Go server is verified at runtime over UDP. What
-remains is packaging polish and optional Go-parity stretch items.
+The TypeScript port of drpc **v1.1** (`../PROTOCOL.md`) is **functionally
+complete, green, and adversarially audited**. Cross-language interop with the
+Go server is verified at runtime over UDP — including the v1.1 surface, where
+a Go/TS split would be silent: binary metadata, status details and the
+flow-control advertisements are asserted against exact bytes, not mirrored
+shapes. What remains is packaging polish and optional Go-parity stretch items.
+
+**v1.1 round (2026-07-25)** — mirrored from the Go core: metadata values are
+bytes on the wire (`-bin` keys hold base64 in the TS API), `Frame.window` /
+`WINDOW` per-stream flow control, `Frame.compressor` / `COMPRESSED`
+per-message compression via `CompressionStream`, `Frame.details` status
+details, the shape/modifier flag split (§7.1), per-call size caps, and the
+unary `sendHeader` flush. New adapter: **WebSocket** (`transport/websocket`),
+the twin of Go's `transport/gorilla`.
 
 ## Done
 
@@ -29,13 +38,14 @@ mirroring Go's `transport/{udp,pion,gorilla}/` layout (dir + README each).
 | `conn.ts` | `Conn` + `ClientStream`, client unreliable-mode machinery | `conn.go`, `stream.go`, `unreliable.go` |
 | `server.ts` | `Server` + server stream, per-peer state, sweep, caps | `server.go`, `stream.go`, `unreliable_server.go` |
 | `transport/webrtc/` | `DataChannelTransport` (client) + `DataChannelGateway` (server, mixed-mode) | `transport/pion/*.go` |
+| `transport/websocket/` | `WebSocketTransport` (client) + gateway/`servePeer` (server), reliable | `transport/gorilla/*.go` |
 | `transport/node-udp/` | `UdpTransport`/`UdpGateway` + `dialUdp`/`listenUdp` (Node `dgram`) | `transport/udp/*.go` |
 | `transport/protobuf-es/` | `fromService`/`fromMethod` — derive descriptors from generated protobuf-es | grpc-go codegen (G2) |
 | `transport/connect/` | `createDrpcTransport` — a Connect-ES `Transport` over a drpc `Conn` | — (Connect interop) |
 
 Verified at this commit:
 
-- `pnpm test` → **130 passing** (13 files). Unit and per-adapter tests are
+- `pnpm test` → **252 passing** (17 files). Unit and per-adapter tests are
   co-located next to their source (`src/wire.test.ts`,
   `src/transport/connect/index.test.ts`, …); cross-cutting integration tests
   (e2e, timeout, restart, limits, conformance, protobufes-gen) stay in `test/`;
@@ -127,7 +137,7 @@ cannot pause delivery, so reliable-mode backpressure (§4.2) bounds ordering and
 loss but **not** adapter rx memory — inbound messages queue while a slow
 consumer drains. The Node/pion read-loop blocking has no browser equivalent.
 
-## Remaining M6 work
+## Remaining work
 
 1. **Adversarial audit** — **done** (see the section above; 4 findings fixed).
 2. **Go ↔ TS conformance** — **done** (`test/conformance.test.ts`). A TS `Conn`
@@ -153,8 +163,9 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
    per-side) for a large infrastructure cost (a lossy proxy + a TS WebSocket
    transport to pair with Go `gorilla` for the reliable/strict path). Not worth
    it; the boundary is covered by the cases above.
-3. **`examples/`** — a runnable browser↔Go WebRTC datachannel echo (the
-   final-goal demo, cross-language this time).
+3. ~~**`examples/`**~~ — **done**: `../examples/browser-webrtc` runs the
+   browser↔Go WebRTC DataChannel echo against this port's `dist/`
+   (`../examples/` also has a UDP sensor stream and a WebSocket echo).
 4. **Packaging** — decide the published name/scope (currently
    `@lesomnus/grpc-dgram`, `private: true`) and a real `version`. *(The
    protobuf-es binding — `@lesomnus/grpc-dgram/transport/protobuf-es`, `fromService` /
@@ -174,7 +185,7 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
 ```
 cd ts
 pnpm install
-pnpm test     # vitest, 130 tests
+pnpm test     # vitest, 252 tests
 pnpm check    # tsc --noEmit (strict)
 pnpm build    # tsdown → dist/
 ```
