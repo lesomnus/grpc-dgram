@@ -7,6 +7,7 @@ import (
 
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/stats"
 )
 
 // This file holds the gRPC-compatibility surface that is not part of the wire
@@ -112,6 +113,26 @@ func WithAuthority(a string) ConnOption {
 	return compatOption{authority: &a}
 }
 
+// WithStatsHandler installs a google.golang.org/grpc/stats.Handler, so
+// existing gRPC instrumentation works unchanged. May be given more than once.
+func WithStatsHandler(h stats.Handler) interface {
+	ConnOption
+	ServerOption
+} {
+	return compatOption{stats: h}
+}
+
+// WithProtocolStats installs an observer for the datagram-specific events
+// gRPC has no concept of — skipped messages, rx drops, RESETs,
+// retransmissions, probes, liveness expiry, tombstone replays, flow-control
+// stalls (PROTOCOL.md §14). May be given more than once.
+func WithProtocolStats(h ProtocolStats) interface {
+	ConnOption
+	ServerOption
+} {
+	return compatOption{pstats: h}
+}
+
 // sizeOr resolves an optional size limit: an explicitly configured value —
 // including 0, which grpc-go reads as "reject everything" — wins over the
 // default.
@@ -128,6 +149,8 @@ type compatOption struct {
 	creds        credentials.PerRPCCredentials
 	assumeSecure *bool
 	authority    *string
+	stats        stats.Handler
+	pstats       ProtocolStats
 }
 
 func (o compatOption) apply(c *connOption) {
@@ -146,6 +169,12 @@ func (o compatOption) apply(c *connOption) {
 	if o.authority != nil {
 		c.authority = *o.authority
 	}
+	if o.stats != nil {
+		c.stats = append(c.stats, o.stats)
+	}
+	if o.pstats != nil {
+		c.pstats = append(c.pstats, o.pstats)
+	}
 }
 
 func (o compatOption) applyServer(s *serverOption) {
@@ -154,5 +183,11 @@ func (o compatOption) applyServer(s *serverOption) {
 	}
 	if o.maxSend != nil {
 		s.maxSend = o.maxSend
+	}
+	if o.stats != nil {
+		s.stats = append(s.stats, o.stats)
+	}
+	if o.pstats != nil {
+		s.pstats = append(s.pstats, o.pstats)
 	}
 }

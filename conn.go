@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 )
 
@@ -32,10 +33,14 @@ type Conn struct {
 	creds        []credentials.PerRPCCredentials
 	assumeSecure bool
 	authority    string
+	stats        []stats.Handler
+	pstats       []ProtocolStats
 
 	// peer names the remote end when the transport knows it (grpc.Peer,
-	// PROTOCOL.md §6.4).
-	peer *peer.Peer
+	// PROTOCOL.md §6.4); connCtx carries the stats handler's per-connection
+	// tags.
+	peer    *peer.Peer
+	connCtx context.Context
 
 	mu        sync.Mutex
 	ss        map[uint32]*clientStream
@@ -79,6 +84,8 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 		creds:        opt.creds,
 		assumeSecure: opt.assumeSecure,
 		authority:    opt.authority,
+		stats:        opt.stats,
+		pstats:       opt.pstats,
 
 		call_opts: []grpc.CallOption{},
 	}
@@ -111,6 +118,8 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 		}
 	}
 
+	v.connBegin()
+
 	// Last, with the Conn fully usable: the transport may start delivering
 	// frames from inside AttachConn.
 	if a, ok := tx.(ConnAttacher); ok {
@@ -130,6 +139,7 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 		if f.GetEpoch() != c.epoch {
 			return nil
 		}
+		c.protoEvent(ProtocolEvent{Kind: EventResetReceived, Sid: sid})
 		if s := c.lookup(sid); s != nil {
 			s.finishReset()
 			return nil
@@ -221,9 +231,18 @@ func (c *Conn) Close(err error) {
 	c.mu.Unlock()
 	c.failAll(st)
 	c.sw.stop()
+	c.connEnd()
 	if cl, ok := c.tx.(io.Closer); ok {
 		cl.Close()
 	}
+}
+
+// protoEvent reports one endpoint-scope drpc protocol event (stats.go).
+func (c *Conn) protoEvent(ev ProtocolEvent) {
+	if len(c.pstats) == 0 {
+		return
+	}
+	statsSink(c.pstats).emit(ev)
 }
 
 func (c *Conn) lookup(sid uint32) *clientStream {
@@ -270,6 +289,10 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 				err = status.Error(codes.Internal, "unary call ended without a response")
 			}
 		}
+
+		// End is the RPC's last stats event, after the response was delivered
+		// (gRPC parity).
+		defer s.reportStatsEnd()
 
 		// grpc-go populates Header/Trailer call options on finish regardless
 		// of the status.
@@ -363,6 +386,7 @@ func (c *Conn) newStream(ctx context.Context, method string, ci *callInfo, clien
 	c.mu.Unlock()
 
 	c.kickSweep()
+	s.begin()
 	return s, nil
 }
 
@@ -383,6 +407,8 @@ type connOption struct {
 	creds        []credentials.PerRPCCredentials
 	assumeSecure bool
 	authority    string
+	stats        []stats.Handler
+	pstats       []ProtocolStats
 }
 
 type ConnOption interface {

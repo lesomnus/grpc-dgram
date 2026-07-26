@@ -78,13 +78,23 @@ func (w *sweeper) stop() {
 
 // noteValidatedRx runs for every validated server frame of this stream:
 // accepted or dedup-dropped (PROTOCOL.md §9.1). It refreshes the idle clocks
-// and clears the OPEN retransmission obligation — any server frame for the
-// sid is the "first server frame" of §10.3.
+// and clears the OPEN retransmission obligation.
+//
+// Which frames end that obligation differs by call type (§10.3). For a
+// streaming call any server frame does: the creation ack proves the call
+// exists, and the stream has its own recovery afterwards. A unary call has no
+// other recovery — its OPEN retransmission is what recovers a lost terminal
+// through the server's tombstone — so only the terminal stops it. Otherwise a
+// handler that flushes a header would silently halve every client's loss
+// tolerance.
 func (s *clientStream) noteValidatedRx(f *Frame) {
 	n := nowNano()
 	s.lastRx.Store(n)
 	s.conn.lastRx.Store(n)
 
+	if !s.clientStreams && !s.serverStreams && !f.isTerminal() {
+		return
+	}
 	s.txMu.Lock()
 	s.retxOpen = nil
 	s.txMu.Unlock()
@@ -214,6 +224,7 @@ func (c *Conn) sendReset(ctx context.Context, f *Frame) error {
 		c.mu.Unlock()
 		c.kickSweep()
 	}
+	c.protoEvent(ProtocolEvent{Kind: EventResetSent, Sid: f.GetSid()})
 	return c.tx.Handle(ctx, resetFor(f))
 }
 
@@ -299,6 +310,7 @@ func (c *Conn) sweep(now time.Time) {
 	// Peer liveness (PROTOCOL.md §10.4): one peer per Conn.
 	if live {
 		if n-c.lastRx.Load() >= int64(t.Liveness) {
+			c.protoEvent(ProtocolEvent{Kind: EventLivenessExpired})
 			c.failAll(status.Error(codes.Unavailable, "peer lost"))
 			return
 		}
@@ -308,6 +320,7 @@ func (c *Conn) sweep(now time.Time) {
 			ping := &Frame{}
 			ping.SetEpoch(c.epoch)
 			ping.SetFlags(FlagPing)
+			c.protoEvent(ProtocolEvent{Kind: EventKeepaliveSent})
 			c.tx.Handle(ctx, ping)
 		}
 	}
@@ -315,9 +328,11 @@ func (c *Conn) sweep(now time.Time) {
 	// Per-stream retransmissions and probes.
 	for _, s := range streams {
 		for _, f := range s.sweepRetx(now, t.probe()) {
+			s.protoEvent(ProtocolEvent{Kind: EventRetransmit})
 			s.transmit(ctx, f)
 		}
 		if f := s.probeDue(now, t.probe()); f != nil {
+			s.protoEvent(ProtocolEvent{Kind: EventProbeSent})
 			// Probes feed the peer-keepalive cadence but not the stream's
 			// own idle clocks (PROTOCOL.md §10.5).
 			c.lastTx.Store(n)
@@ -326,6 +341,7 @@ func (c *Conn) sweep(now time.Time) {
 	}
 	// Tombstoned aborts.
 	for _, f := range tombRetx {
+		c.protoEvent(ProtocolEvent{Kind: EventRetransmit, Sid: f.GetSid()})
 		c.lastTx.Store(n)
 		c.tx.Handle(ctx, f)
 	}

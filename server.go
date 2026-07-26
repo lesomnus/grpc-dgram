@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 )
 
@@ -41,9 +42,11 @@ type Server struct {
 	methodRx          map[string]rxConfig
 	limits            Limits
 
-	// Endpoint-wide call limits (compat.go).
+	// Endpoint-wide call limits and observability (compat.go, stats.go).
 	maxRecv int
 	maxSend int
+	stats   []stats.Handler
+	pstats  []ProtocolStats
 
 	root       context.Context
 	rootCancel context.CancelCauseFunc
@@ -106,6 +109,8 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 
 		maxRecv: sizeOr(opt.maxRecv, defaultMaxRecvMsgSize),
 		maxSend: sizeOr(opt.maxSend, defaultMaxSendMsgSize),
+		stats:   opt.stats,
+		pstats:  opt.pstats,
 	}
 	v.root, v.rootCancel = context.WithCancelCause(context.Background())
 
@@ -199,6 +204,7 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 			return nil
 		}
 		peer, _ := PeerFromContext(ctx)
+		s.protoEvent(ProtocolEvent{Kind: EventResetReceived, Peer: peer, Sid: f.GetSid()})
 		s.resetByPeerSid(peer, f.GetSid(), f.GetPeerEpoch())
 		return nil
 	}
@@ -236,6 +242,7 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 				stored := tb.term != nil
 				s.mu.Unlock()
 				if replay != nil {
+					s.protoEvent(ProtocolEvent{Kind: EventTombstoneReplay, Peer: key.peer, Sid: key.sid})
 					return s.tx.Handle(ctx, replay)
 				}
 				if stored {
@@ -273,6 +280,7 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 			}
 			s.mu.Unlock()
 			if replay != nil {
+				s.protoEvent(ProtocolEvent{Kind: EventTombstoneReplay, Peer: key.peer, Sid: key.sid})
 				return s.tx.Handle(ctx, replay)
 			}
 			return nil
@@ -321,6 +329,14 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 	s.mu.Unlock()
 	s.kickSweep()
 	return nil
+}
+
+// protoEvent reports one endpoint-scope drpc protocol event (stats.go).
+func (s *Server) protoEvent(ev ProtocolEvent) {
+	if len(s.pstats) == 0 {
+		return
+	}
+	statsSink(s.pstats).emit(ev)
 }
 
 // replyBudget is one transport peer's aggregate control-reply window: on top
@@ -380,6 +396,7 @@ func (s *Server) sendReset(ctx context.Context, key callKey, f *Frame) error {
 		s.mu.Unlock()
 		s.kickSweep()
 	}
+	s.protoEvent(ProtocolEvent{Kind: EventResetSent, Peer: key.peer, Sid: key.sid})
 	return s.tx.Handle(ctx, resetFor(f))
 }
 
@@ -486,6 +503,11 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	if rel {
 		st.flowTx.observe(f.GetWindow())
 	}
+	st.statsCtx = st.ctx
+	if len(s.stats) > 0 {
+		st.statsCtx = grpcStats(s.stats).tagRPC(st.ctx, &stats.RPCTagInfo{FullMethodName: desc.fullname})
+		st.ctx = st.statsCtx
+	}
 
 	if desc.IsUnary() {
 		st.ctx = grpc.NewContextWithServerTransportStream(st.ctx, serverTransportUnary{st})
@@ -546,6 +568,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	s.wg.Add(1)
 	s.mu.Unlock()
 	s.kickSweep()
+	st.begin(f)
 
 	if desc.IsUnary() {
 		go s.runUnary(st, f)
@@ -610,7 +633,8 @@ func (s *Server) runUnary(st *serverStream, open *Frame) {
 	var term *Frame
 	defer func() { s.finish(st, term) }()
 
-	// The request rides the OPEN; it is size-capped like any received message.
+	// The request rides the OPEN; it is size-capped and reported like any
+	// received message (grpc.MaxRecvMsgSize, stats.InPayload).
 	dec := func(v any) error { return st.recvInto(open, v) }
 
 	resp, err := st.desc.method.Handler(st.desc.impl, st.ctx, dec, s.unary_int)
@@ -619,17 +643,21 @@ func (s *Server) runUnary(st *serverStream, open *Frame) {
 	}
 	if err == nil {
 		// The unary response rides the terminal frame (PROTOCOL.md §8), so it
-		// is marshaled here and terminalFrame carries it — compressed, and
-		// size-capped on the bytes that actually travel (§12.1).
+		// is marshaled here and terminalFrame carries it.
 		buf, merr := st.codec.Marshal(resp)
 		if merr != nil {
 			err = status.Errorf(codes.Internal, "marshal response: %v", merr)
 		} else {
+			// The size cap is applied where the wire bytes exist — in
+			// terminalFrame, after compression (§12.1) — so a compressible
+			// response is measured as it actually travels.
 			payload := buf.Materialize()
 			buf.Free()
 			st.setResp(payload)
+			grpcStats(s.stats).payloadOut(st.statsCtx, false, resp, payload, len(payload))
 		}
 	}
+
 	f := st.terminalFrame(err)
 
 	// The terminal is sent even when the handler ctx ended: the client (or
@@ -699,6 +727,7 @@ func (s *Server) finish(st *serverStream, term *Frame) {
 	if st.cancelTimeout != nil {
 		st.cancelTimeout()
 	}
+	st.reportFinish(term)
 	s.kickSweep()
 }
 
@@ -800,6 +829,8 @@ type serverOption struct {
 
 	maxRecv *int
 	maxSend *int
+	stats   []stats.Handler
+	pstats  []ProtocolStats
 }
 
 type serverOptionFunc func(*serverOption)

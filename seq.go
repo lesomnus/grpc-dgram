@@ -52,6 +52,16 @@ type rxWindow struct {
 	beyondN    int    // length of the current consistent beyond-window run
 	beyondLast uint32 // last beyond-window seq seen
 	strict     bool   // reliable mode: require exactly l+1, else fail loud
+	gap        uint32 // frames skipped by the last accepted step (§14)
+}
+
+// takeGap returns and clears the size of the gap the last accepted frame
+// jumped over — the skipped-message count PROTOCOL.md §14 promises. Callers
+// hold the same lock they call check under.
+func (w *rxWindow) takeGap() uint32 {
+	g := w.gap
+	w.gap = 0
+	return g
 }
 
 func (w *rxWindow) check(seq uint32) rxVerdict {
@@ -75,6 +85,7 @@ func (w *rxWindow) check(seq uint32) rxVerdict {
 		// Duplicate or older: dedup. Neutral for the beyond-run (§6.3).
 		return rxDup
 	case d <= wFwd:
+		w.gap = d - 1
 		w.l = seq
 		w.beyondN = 0
 		return rxAccept

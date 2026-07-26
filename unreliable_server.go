@@ -297,6 +297,7 @@ func (s *Server) sweep(now time.Time) {
 			continue
 		}
 		delete(s.pendingResets, key)
+		s.protoEvent(ProtocolEvent{Kind: EventResetSent, Peer: key.peer, Sid: key.sid})
 		r := &Frame{}
 		r.SetFlags(FlagReset)
 		r.SetEpoch(pr.echo)
@@ -359,6 +360,7 @@ func (s *Server) sweep(now time.Time) {
 			if n-ps.lastRx.Load() >= int64(t.Liveness) {
 				// Peer lost (§10.4): cancel its calls, degrade tombstones.
 				ps.dead = true
+				s.protoEvent(ProtocolEvent{Kind: EventLivenessExpired, Peer: ek.peer})
 				for k, st := range s.calls {
 					if k.peer == ek.peer && k.epoch == ek.epoch {
 						st.suppressTerm.Store(true)
@@ -376,6 +378,7 @@ func (s *Server) sweep(now time.Time) {
 				ping.SetEpoch(s.epoch)
 				ping.SetFlags(FlagPing)
 				ping.SetPeerEpoch(ps.epoch) // name the incarnation (§6.1)
+				s.protoEvent(ProtocolEvent{Kind: EventKeepaliveSent, Peer: ek.peer})
 				jobs = append(jobs, txJob{ps.txCtx, ping})
 			}
 		}
@@ -394,6 +397,7 @@ func (s *Server) sweep(now time.Time) {
 			continue
 		}
 		if f := st.probeDue(now, t.probe(), s.epoch); f != nil {
+			st.protoEvent(ProtocolEvent{Kind: EventProbeSent})
 			if ps := s.peers[epochKey{peer: st.key.peer, epoch: st.key.epoch}]; ps != nil {
 				ps.lastTx.Store(n)
 			}

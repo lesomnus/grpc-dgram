@@ -72,8 +72,9 @@ func TestReliableRxOverflowBlocks(t *testing.T) {
 func TestReliableRxOverflowBlocksServer(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		gate := make(chan struct{})
+		counters := &drpc.Counters{}
 		pipe := PipeOption{
-			ConnOpts: []drpc.ConnOption{drpc.WithReliable(true)},
+			ConnOpts: []drpc.ConnOption{drpc.WithReliable(true), drpc.WithProtocolStats(counters)},
 			ServerOpts: []drpc.ServerOption{
 				drpc.WithReliable(true), drpc.WithRxBuffer(2, drpc.DropNewest),
 				drpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
@@ -102,11 +103,7 @@ func TestReliableRxOverflowBlocksServer(t *testing.T) {
 		// With the handler gated shut nothing drains the 2-frame buffer, so
 		// the sender is parked on credit — and the c2s pump is NOT blocked.
 		synctest.Wait()
-		select {
-		case err := <-sent:
-			t.Fatalf("the burst must not finish while the handler drains nothing: %v", err)
-		default: // parked on credit, as intended
-		}
+		x.True(t, counters.Snapshot().FlowStall > 0, "the sender must park on flow control, not the receiver")
 		close(gate)
 
 		x.NoError(t, <-sent)

@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
@@ -102,17 +103,25 @@ func enqueueRxReliable(ctx context.Context, rx chan *Frame, f *Frame, done <-cha
 
 // enqueueRx delivers f into the per-stream buffer under the configured drop
 // policy (unreliable mode, PROTOCOL.md §4.2). DropNewest discards the arrival
-// on a full buffer; DropOldest evicts the oldest to admit it.
-func enqueueRx(rx chan *Frame, f *Frame, policy DropPolicy, dropped *atomic.Uint32) {
+// on a full buffer; DropOldest evicts the oldest to admit it. Each discarded
+// frame is counted and reported (§14: a drop is loss the application can see
+// only through the counters).
+func enqueueRx(rx chan *Frame, f *Frame, policy DropPolicy, dropped *atomic.Uint32, report func()) {
 	select {
 	case rx <- f:
 		return
 	default:
 	}
+	drop := func() {
+		dropped.Add(1)
+		if report != nil {
+			report()
+		}
+	}
 	if policy == DropOldest {
 		select {
 		case <-rx: // evict one
-			dropped.Add(1)
+			drop()
 		default:
 		}
 		select {
@@ -121,7 +130,7 @@ func enqueueRx(rx chan *Frame, f *Frame, policy DropPolicy, dropped *atomic.Uint
 		default:
 		}
 	}
-	dropped.Add(1)
+	drop()
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +204,12 @@ type clientStream struct {
 	term        *Frame // server terminal frame, if that is what ended the call
 	termErr     error  // local termination (cancel, RESET, DATA_LOSS)
 	termPayload atomic.Bool
+
+	// statsCtx carries the stats.Handler's per-call tags (grpc parity);
+	// beginTime stamps the call for stats.End, emitted once via endOnce.
+	statsCtx  context.Context
+	beginTime time.Time
+	endOnce   sync.Once
 }
 
 func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, ci *callInfo, openHdr metadata.MD, clientStreams, serverStreams bool) *clientStream {
@@ -228,6 +243,13 @@ func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, ci
 		s.flowRx.enable(uint32(rxCfg.size))
 		s.flowTx.assume(wInit)
 	}
+	s.statsCtx = ctx
+	if len(c.stats) > 0 {
+		s.statsCtx = grpcStats(c.stats).tagRPC(ctx, &stats.RPCTagInfo{
+			FullMethodName: method,
+			FailFast:       true,
+		})
+	}
 	s.rxWin.strict = c.mode.reliable
 	if c.peer != nil {
 		// grpc-go's ClientStream.Context() names the peer; interceptors read
@@ -244,6 +266,31 @@ func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, ci
 	// terminal CLOSE and finish the call locally at once.
 	s.stopAfter = context.AfterFunc(ctx, s.abortFromCtx)
 	return s
+}
+
+// begin reports the call's start, before any frame leaves (gRPC parity: a
+// stats.Handler sees Begin first, then OutHeader).
+func (s *clientStream) begin() {
+	s.beginTime = time.Now()
+	if len(s.conn.stats) == 0 {
+		return
+	}
+	g := grpcStats(s.conn.stats)
+	g.handle(s.statsCtx, &stats.Begin{
+		Client:         true,
+		BeginTime:      s.beginTime,
+		IsClientStream: s.clientStreams,
+		IsServerStream: s.serverStreams,
+	})
+	out := &stats.OutHeader{
+		Client:     true,
+		FullMethod: s.method,
+		Header:     s.openHdr.Copy(),
+	}
+	if p := s.conn.peer; p != nil {
+		out.RemoteAddr, out.LocalAddr = p.Addr, p.LocalAddr
+	}
+	g.handle(s.statsCtx, out)
 }
 
 // finalErr is the call's outcome as a gRPC status error (nil on success).
@@ -274,10 +321,53 @@ func (s *clientStream) reportFinish() {
 	}
 }
 
+// reportStatsEnd emits the stats handler's InTrailer/End pair, exactly once.
+// It is deliberately NOT called from the receive path: gRPC guarantees End is
+// an RPC's last event, and a unary response only becomes an InPayload when the
+// caller unmarshals the terminal frame — after the call has already ended
+// here. So Invoke emits it once the response is delivered, and a stream emits
+// it when the call is released.
+func (s *clientStream) reportStatsEnd() {
+	s.endOnce.Do(func() {
+		if len(s.conn.stats) == 0 {
+			return
+		}
+		s.stMu.Lock()
+		trailer := s.trailer
+		s.stMu.Unlock()
+		g := grpcStats(s.conn.stats)
+		if s.term != nil {
+			g.handle(s.statsCtx, &stats.InTrailer{Client: true, Trailer: trailer})
+		}
+		g.handle(s.statsCtx, &stats.End{
+			Client:    true,
+			BeginTime: s.beginTime,
+			EndTime:   time.Now(),
+			Trailer:   trailer,
+			Error:     s.finalErr(),
+		})
+	})
+}
+
+// protoEvent reports one drpc protocol event for this call (stats.go).
+func (s *clientStream) protoEvent(ev ProtocolEvent) {
+	if len(s.conn.pstats) == 0 {
+		return
+	}
+	if ev.Sid == 0 {
+		ev.Sid = s.sid
+	}
+	if ev.Method == "" {
+		ev.Method = s.method
+	}
+	statsSink(s.conn.pstats).emit(ev)
+}
+
 // recvInto delivers one received frame to the application: size-capped
-// (grpc.MaxCallRecvMsgSize), then unmarshaled. A message past the cap fails
-// the call, as it does on gRPC.
+// (grpc.MaxCallRecvMsgSize), then unmarshaled, then reported to stats.
+// A message past the cap fails the call, as it does on gRPC.
 func (s *clientStream) recvInto(f *Frame, m any) error {
+	wire := len(f.GetPayload())
 	payload, err := decodePayload(f, s.comp, s.ci.maxRecv)
 	if err == nil {
 		err = checkRecvSize(len(payload), s.ci.maxRecv)
@@ -288,7 +378,32 @@ func (s *clientStream) recvInto(f *Frame, m any) error {
 		s.finishLocal(err)
 		return err
 	}
-	return unmarshalBytes(payload, m, s.codec)
+	if err := unmarshalBytes(payload, m, s.codec); err != nil {
+		return err
+	}
+	grpcStats(s.conn.stats).payloadIn(s.statsCtx, true, m, payload, wire)
+	return nil
+}
+
+// grantWindow reports messages the application consumed and sends the
+// resulting credit (§4.2). Called only for buffered data frames — a terminal
+// payload never occupied a buffer slot.
+func (s *clientStream) grantWindow(n uint32) {
+	select {
+	case <-s.done:
+		return // the peer has forgotten this sid; a grant would draw a RESET
+	default:
+	}
+	g := s.flowRx.consumed(n)
+	if g == 0 {
+		return
+	}
+	f := &Frame{}
+	f.SetEpoch(s.conn.epoch)
+	f.SetSid(s.sid)
+	f.SetFlags(FlagWindow)
+	f.SetWindow(g)
+	s.transmit(context.WithoutCancel(s.ctx), f)
 }
 
 // handleRx processes one server frame for this stream. Called by Conn.Handle;
@@ -351,6 +466,7 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 	case rxDataLoss:
 		// Window overrun on a live stream: fail loudly (PROTOCOL.md §6.3)
 		// and abort so the server stops.
+		s.protoEvent(ProtocolEvent{Kind: EventDataLoss})
 		err := status.Error(codes.DataLoss, "seq window overrun: >W_fwd consecutive frames lost")
 		s.sendAbort(codes.DataLoss)
 		s.finishLocal(err)
@@ -361,6 +477,10 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 		s.sendAbort(codes.Internal)
 		s.finishLocal(err)
 		return
+	}
+	if g := s.rxWin.takeGap(); g > 0 {
+		// The §14 skipped-message counter: how many messages the gap ate.
+		s.protoEvent(ProtocolEvent{Kind: EventSkipped, Count: g})
 	}
 	s.noteValidatedRx(f)
 	if s.conn.mode.reliable {
@@ -385,6 +505,7 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 		if !s.serverStreams {
 			// Off-shape: unary/client-streaming has no server data frames.
 			s.rxDropped.Add(1)
+			s.protoEvent(ProtocolEvent{Kind: EventOffShape, Count: 1})
 			return
 		}
 		s.latchHeader(f)
@@ -405,7 +526,9 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 				s.finishLocal(status.Error(codes.Unavailable, "transport closed during delivery"))
 			}
 		} else {
-			enqueueRx(s.rx, f, s.rxCfg.policy, &s.rxDropped)
+			enqueueRx(s.rx, f, s.rxCfg.policy, &s.rxDropped, func() {
+				s.protoEvent(ProtocolEvent{Kind: EventDropped, Count: 1})
+			})
 		}
 	default:
 		s.rxDropped.Add(1)
@@ -523,7 +646,12 @@ func (s *clientStream) send(m any) error {
 	// the receiver's Handle — is what keeps one slow consumer from stalling
 	// the whole channel.
 	if !opening {
-		_, ferr := s.flowTx.acquire(s.ctx, s.done, s.conn.mode.timing.Stall, nil)
+		stalled, ferr := s.flowTx.acquire(s.ctx, s.done, s.conn.mode.timing.Stall, func() {
+			s.protoEvent(ProtocolEvent{Kind: EventFlowStall})
+		})
+		if stalled && ferr == nil {
+			s.protoEvent(ProtocolEvent{Kind: EventFlowResume})
+		}
 		if ferr != nil {
 			if ferr == errCallEnded {
 				return io.EOF
@@ -577,6 +705,7 @@ func (s *clientStream) send(m any) error {
 		s.undoRefused(f, err)
 		return err
 	}
+	grpcStats(s.conn.stats).payloadOut(s.statsCtx, true, m, payload, len(wire))
 	return nil
 }
 
@@ -690,27 +819,6 @@ func (s *clientStream) recvBuffered(f *Frame, m any) error {
 	}
 	s.grantWindow(1)
 	return nil
-}
-
-// grantWindow reports messages the application consumed and sends the
-// resulting credit (§4.2). Called only for buffered data frames — a terminal
-// payload never occupied a buffer slot.
-func (s *clientStream) grantWindow(n uint32) {
-	select {
-	case <-s.done:
-		return // the peer has forgotten this sid; a grant would draw a RESET
-	default:
-	}
-	g := s.flowRx.consumed(n)
-	if g == 0 {
-		return
-	}
-	f := &Frame{}
-	f.SetEpoch(s.conn.epoch)
-	f.SetSid(s.sid)
-	f.SetFlags(FlagWindow)
-	f.SetWindow(g)
-	s.transmit(context.WithoutCancel(s.ctx), f)
 }
 
 func (s *clientStream) terminalRecv(m any) error {
@@ -861,6 +969,11 @@ func (s *clientStream) release() {
 	s.conn.retire(s)
 	s.hdrOnce.Do(func() { close(s.hdrReady) })
 	s.cancel()
+	if s.clientStreams || s.serverStreams {
+		// A streaming call ends here; a unary one ends when Invoke has
+		// delivered the response (see reportStatsEnd).
+		s.reportStatsEnd()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -952,9 +1065,12 @@ type serverStream struct {
 	eofOnce   sync.Once
 	rxEOF     chan struct{}
 
-	// Per-call size caps (grpc.MaxRecvMsgSize / MaxSendMsgSize).
-	maxRecv int
-	maxSend int
+	// Per-call size caps (grpc.MaxRecvMsgSize / MaxSendMsgSize) and the
+	// stats.Handler's per-call tags.
+	maxRecv   int
+	maxSend   int
+	statsCtx  context.Context
+	beginTime time.Time
 }
 
 func newServerStream(ctx context.Context, srv *Server, key callKey, desc *serviceDesc, codec encoding.CodecV2, rxCfg rxConfig, reliable bool) *serverStream {
@@ -1040,11 +1156,15 @@ func (s *serverStream) handleRx(ctx context.Context, f *Frame) {
 	case rxBeyond:
 		return
 	case rxDataLoss:
+		s.protoEvent(ProtocolEvent{Kind: EventDataLoss})
 		s.cancel(status.Error(codes.DataLoss, "seq window overrun: >W_fwd consecutive frames lost"))
 		return
 	case rxProtocolError:
 		s.cancel(status.Error(codes.Internal, "reliable transport lost or reordered a frame"))
 		return
+	}
+	if g := s.rxWin.takeGap(); g > 0 {
+		s.protoEvent(ProtocolEvent{Kind: EventSkipped, Count: g})
 	}
 	s.noteValidatedRx()
 
@@ -1072,7 +1192,9 @@ func (s *serverStream) handleRx(ctx context.Context, f *Frame) {
 				s.cancel(status.Error(codes.Unavailable, "transport closed during delivery"))
 			}
 		} else {
-			enqueueRx(s.rx, f, s.rxCfg.policy, &s.rxDropped)
+			enqueueRx(s.rx, f, s.rxCfg.policy, &s.rxDropped, func() {
+				s.protoEvent(ProtocolEvent{Kind: EventDropped, Count: 1})
+			})
 		}
 	default:
 		s.rxDropped.Add(1)
@@ -1248,7 +1370,10 @@ func (s *serverStream) SendHeader(md metadata.MD) error {
 		s.undoRefused(f, err)
 		return toStatusErr(err)
 	}
-	_ = sent
+	grpcStats(s.server.stats).handle(s.statsCtx, &stats.OutHeader{
+		FullMethod: s.desc.fullname,
+		Header:     sent.Copy(),
+	})
 	return nil
 }
 
@@ -1260,6 +1385,7 @@ func (s *serverStream) SetTrailer(md metadata.MD) {
 		return
 	}
 	if err := validateMD(md); err != nil {
+		s.protoEvent(ProtocolEvent{Kind: EventOffShape, Sid: s.key.sid, Method: s.desc.fullname, Count: 1})
 		return
 	}
 	s.txMu.Lock()
@@ -1280,7 +1406,12 @@ func (s *serverStream) SendMsg(m any) error {
 	if s.desc.stream.ServerStreams {
 		// Flow control (§4.2): park until the client has room, instead of
 		// letting its full buffer stall every call on the channel.
-		_, ferr := s.flowTx.acquire(s.ctx, s.ctx.Done(), s.server.mode.timing.Stall, nil)
+		stalled, ferr := s.flowTx.acquire(s.ctx, s.ctx.Done(), s.server.mode.timing.Stall, func() {
+			s.protoEvent(ProtocolEvent{Kind: EventFlowStall})
+		})
+		if stalled && ferr == nil {
+			s.protoEvent(ProtocolEvent{Kind: EventFlowResume})
+		}
 		if ferr != nil {
 			if ferr == errCallEnded {
 				return ctxErr(s.ctx)
@@ -1326,6 +1457,7 @@ func (s *serverStream) SendMsg(m any) error {
 		s.undoRefused(f, err)
 		return err
 	}
+	grpcStats(s.server.stats).payloadOut(s.statsCtx, false, m, payload, len(wire))
 	return nil
 }
 
@@ -1364,9 +1496,62 @@ func (s *serverStream) RecvMsg(m any) error {
 	}
 }
 
+// begin reports the call's start to the stats handlers: Begin, then the
+// request header the OPEN carried (gRPC parity).
+func (s *serverStream) begin(open *Frame) {
+	s.beginTime = time.Now()
+	if len(s.server.stats) == 0 {
+		return
+	}
+	g := grpcStats(s.server.stats)
+	g.handle(s.statsCtx, &stats.Begin{
+		BeginTime:      s.beginTime,
+		IsClientStream: !s.desc.IsUnary() && s.desc.stream.ClientStreams,
+		IsServerStream: !s.desc.IsUnary() && s.desc.stream.ServerStreams,
+	})
+	in := &stats.InHeader{
+		FullMethod:  s.desc.fullname,
+		WireLength:  len(open.GetPayload()),
+		Compression: open.GetCompressor(),
+	}
+	if h := open.GetHeader(); h != nil {
+		in.Header = h.MD()
+	}
+	if p, ok := peer.FromContext(s.ctx); ok {
+		in.RemoteAddr, in.LocalAddr = p.Addr, p.LocalAddr
+	}
+	g.handle(s.statsCtx, in)
+}
+
+// reportFinish emits the stats handler's OutTrailer/End pair for a finished
+// call. term is the terminal frame actually sent, if any.
+func (s *serverStream) reportFinish(term *Frame) {
+	if len(s.server.stats) == 0 {
+		return
+	}
+	s.txMu.Lock()
+	trailer := s.trailer
+	s.txMu.Unlock()
+	g := grpcStats(s.server.stats)
+	g.handle(s.statsCtx, &stats.OutTrailer{Trailer: trailer})
+	var err error
+	if term != nil && codes.Code(term.GetCode()) != codes.OK {
+		err = term.Err()
+	} else if term == nil {
+		err = ctxErr(s.ctx)
+	}
+	g.handle(s.statsCtx, &stats.End{
+		BeginTime: s.beginTime,
+		EndTime:   time.Now(),
+		Trailer:   trailer,
+		Error:     err,
+	})
+}
+
 // recvInto delivers one received frame to the handler: size-capped
-// (grpc.MaxRecvMsgSize), then unmarshaled.
+// (grpc.MaxRecvMsgSize), unmarshaled, then reported to stats.
 func (s *serverStream) recvInto(f *Frame, m any) error {
+	wire := len(f.GetPayload())
 	payload, err := decodePayload(f, s.comp, s.maxRecv)
 	if err == nil {
 		err = checkRecvSize(len(payload), s.maxRecv)
@@ -1374,7 +1559,11 @@ func (s *serverStream) recvInto(f *Frame, m any) error {
 	if err != nil {
 		return err
 	}
-	return unmarshalBytes(payload, m, s.codec)
+	if err := unmarshalBytes(payload, m, s.codec); err != nil {
+		return err
+	}
+	grpcStats(s.server.stats).payloadIn(s.statsCtx, false, m, payload, wire)
+	return nil
 }
 
 // recvBuffered delivers a frame taken out of the rx buffer and returns the
@@ -1403,6 +1592,14 @@ func (s *serverStream) grantWindow(n uint32) {
 	f.SetFlags(FlagWindow)
 	f.SetWindow(g)
 	s.transmit(context.WithoutCancel(s.ctx), f)
+}
+
+// setResp stores the unary / SendAndClose response payload, which rides the
+// terminal frame (PROTOCOL.md §8).
+func (s *serverStream) setResp(payload []byte) {
+	s.txMu.Lock()
+	s.resp, s.respSet = payload, true
+	s.txMu.Unlock()
 }
 
 // transmitTerminal sends the call's terminal frame, shrinking it until the
@@ -1436,12 +1633,19 @@ func (s *serverStream) transmitTerminal(f *Frame) error {
 	return s.transmit(ctx, f)
 }
 
-// setResp stores the unary / SendAndClose response payload, which rides the
-// terminal frame (PROTOCOL.md §8).
-func (s *serverStream) setResp(payload []byte) {
-	s.txMu.Lock()
-	s.resp, s.respSet = payload, true
-	s.txMu.Unlock()
+// protoEvent reports one drpc protocol event for this call (stats.go).
+func (s *serverStream) protoEvent(ev ProtocolEvent) {
+	if len(s.server.pstats) == 0 {
+		return
+	}
+	ev.Peer = s.key.peer
+	if ev.Sid == 0 {
+		ev.Sid = s.key.sid
+	}
+	if ev.Method == "" && s.desc != nil {
+		ev.Method = s.desc.fullname
+	}
+	statsSink(s.server.pstats).emit(ev)
 }
 
 // terminalFrame builds T after the handler returned (PROTOCOL.md §8).
