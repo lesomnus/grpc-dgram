@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package sensor;
+
+option go_package = "github.com/lesomnus/grpc-dgram/examples/udp-sensor/sensorpb";
+
+// SensorService is the shape grpc-dgram exists for: a server-streaming feed of
+// frequently-produced samples where a lost sample is superseded by the next.
+service SensorService {
+  // Readings streams samples until the client's deadline expires (or the
+  // client goes away). There is no "end" — a sensor keeps sensing.
+  rpc Readings(Subscribe) returns (stream Reading) {}
+}
+
+message Subscribe {
+  // Sample rate the client asks for, in samples per second.
+  uint32 hz = 1;
+}
+
+message Reading {
+  // Monotonic sample number, starting at 1. The client uses it to see exactly
+  // which samples the network ate: what arrives is an ordered subsequence.
+  uint64 seq = 1;
+  double celsius = 2;
+  int64 unix_nanos = 3;
+}

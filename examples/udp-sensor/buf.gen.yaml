@@ -1,0 +1,17 @@
+# Regenerates the checked-in bindings in sensorpb/. Run from the repository
+# root (the plugins are `go tool` entries of the root module):
+#
+#   buf generate examples/udp-sensor/proto --template examples/udp-sensor/buf.gen.yaml
+#
+# The generated files are committed, so building and running the example needs
+# neither buf nor protoc.
+version: v2
+plugins:
+  - local: [go, tool, google.golang.org/protobuf/cmd/protoc-gen-go]
+    out: .
+    opt:
+      - module=github.com/lesomnus/grpc-dgram
+  - local: [go, tool, google.golang.org/grpc/cmd/protoc-gen-go-grpc]
+    out: .
+    opt:
+      - module=github.com/lesomnus/grpc-dgram

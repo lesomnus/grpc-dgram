@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>grpc-dgram over a WebRTC DataChannel</title>
+
+    <!--
+      @lesomnus/grpc-dgram is not published, so the two entries are mapped to
+      the build output this server mounts at /ts/dist/ (build it with
+      `cd ts && pnpm install && pnpm build`). A bundler would do the same
+      thing with an alias; nothing else about the page changes.
+    -->
+    <script type="importmap">
+      {
+        "imports": {
+          "@lesomnus/grpc-dgram": "/ts/dist/index.mjs",
+          "@lesomnus/grpc-dgram/transport/webrtc": "/ts/dist/transport/webrtc.mjs"
+        }
+      }
+    </script>
+    <script type="module" src="/main.js"></script>
+
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0 auto; padding: 2rem 1rem; max-width: 44rem;
+        font: 15px/1.55 ui-sans-serif, system-ui, sans-serif;
+      }
+      h1 { font-size: 1.25rem; margin: 0 0 0.25rem; }
+      p.sub { margin: 0 0 1.5rem; opacity: 0.7; }
+      #state { font-variant-numeric: tabular-nums; }
+      form { display: flex; gap: 0.5rem; margin: 1rem 0; }
+      input { flex: 1; padding: 0.5rem 0.6rem; font: inherit; }
+      button { padding: 0.5rem 1rem; font: inherit; }
+      #log {
+        margin: 0; padding: 0.75rem; min-height: 8rem; max-height: 22rem; overflow: auto;
+        font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+        border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+        border-radius: 6px; white-space: pre-wrap;
+      }
+      .err { color: #c0392b; }
+      .ok { color: #1f8b4c; }
+    </style>
+  </head>
+
+  <body>
+    <h1>grpc-dgram over a WebRTC DataChannel</h1>
+    <p class="sub">
+      The page speaks the drpc wire protocol straight to a Go
+      <code>drpc.Server</code>. No HTTP/2, no proxy, no gRPC-Web — the only
+      HTTP request is the SDP exchange that sets the channel up.
+    </p>
+
+    <div id="state">connecting…</div>
+
+    <form id="form">
+      <input id="input" value="hello from the browser" autocomplete="off" />
+      <button id="send" type="submit" disabled>Echo</button>
+    </form>
+
+    <pre id="log"></pre>
+  </body>
+</html>

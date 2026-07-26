@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package webecho;
+
+option go_package = "github.com/lesomnus/grpc-dgram/examples/browser-webrtc/echopb";
+
+service EchoService {
+  // Echo returns the request message, uppercased, with the peer's name.
+  rpc Echo(EchoRequest) returns (EchoResponse) {}
+}
+
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoResponse {
+  string message = 1;
+  // Which server incarnation answered; handy when watching a page reconnect.
+  string served_by = 2;
+}

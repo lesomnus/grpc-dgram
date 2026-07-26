@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package wsecho;
+
+option go_package = "github.com/lesomnus/grpc-dgram/examples/websocket-echo/echopb";
+
+service EchoService {
+  // Echo returns the request message unchanged.
+  rpc Echo(EchoRequest) returns (EchoResponse) {}
+  // Count streams exactly `count` responses, numbered 1..count. Over a
+  // reliable transport the client must receive every one of them, in order.
+  rpc Count(CountRequest) returns (stream EchoResponse) {}
+}
+
+message EchoRequest {
+  string message = 1;
+}
+
+message CountRequest {
+  uint32 count = 1;
+  // Delay between responses, in milliseconds; lets the demo hold a call open
+  // while the server shuts down gracefully.
+  uint32 interval_ms = 2;
+}
+
+message EchoResponse {
+  string message = 1;
+  uint32 sequence = 2;
+}
