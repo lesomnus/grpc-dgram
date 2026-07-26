@@ -4,9 +4,14 @@ package drpc;
 
 option go_package = "github.com/lesomnus/grpc-dgram;drpc";
 
+// Metadata carries gRPC header/trailer metadata. See PROTOCOL.md §11.
 message Metadata {
   message Entry {
-    repeated string values = 1;
+    // Values are raw bytes, not text: gRPC's binary metadata ("-bin" keys)
+    // carries arbitrary octets, which a proto `string` cannot hold (proto
+    // enforces UTF-8 and marshaling fails). `bytes` and `string` share wire
+    // type 2, so ASCII metadata encodes byte-identically either way.
+    repeated bytes values = 1;
   }
   map<string, Entry> entries = 1;
 }

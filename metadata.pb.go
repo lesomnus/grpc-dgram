@@ -20,6 +20,7 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Metadata carries gRPC header/trailer metadata. See PROTOCOL.md §11.
 type Metadata struct {
 	state              protoimpl.MessageState     `protogen:"opaque.v1"`
 	xxx_hidden_Entries map[string]*Metadata_Entry `protobuf:"bytes,1,rep,name=entries" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
@@ -79,7 +80,7 @@ func (b0 Metadata_builder) Build() *Metadata {
 
 type Metadata_Entry struct {
 	state             protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_Values []string               `protobuf:"bytes,1,rep,name=values"`
+	xxx_hidden_Values [][]byte               `protobuf:"bytes,1,rep,name=values"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -109,21 +110,25 @@ func (x *Metadata_Entry) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-func (x *Metadata_Entry) GetValues() []string {
+func (x *Metadata_Entry) GetValues() [][]byte {
 	if x != nil {
 		return x.xxx_hidden_Values
 	}
 	return nil
 }
 
-func (x *Metadata_Entry) SetValues(v []string) {
+func (x *Metadata_Entry) SetValues(v [][]byte) {
 	x.xxx_hidden_Values = v
 }
 
 type Metadata_Entry_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
-	Values []string
+	// Values are raw bytes, not text: gRPC's binary metadata ("-bin" keys)
+	// carries arbitrary octets, which a proto `string` cannot hold (proto
+	// enforces UTF-8 and marshaling fails). `bytes` and `string` share wire
+	// type 2, so ASCII metadata encodes byte-identically either way.
+	Values [][]byte
 }
 
 func (b0 Metadata_Entry_builder) Build() *Metadata_Entry {
@@ -142,7 +147,7 @@ const file_drpc_metadata_proto_rawDesc = "" +
 	"\bMetadata\x125\n" +
 	"\aentries\x18\x01 \x03(\v2\x1b.drpc.Metadata.EntriesEntryR\aentries\x1a\x1f\n" +
 	"\x05Entry\x12\x16\n" +
-	"\x06values\x18\x01 \x03(\tR\x06values\x1aP\n" +
+	"\x06values\x18\x01 \x03(\fR\x06values\x1aP\n" +
 	"\fEntriesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.drpc.Metadata.EntryR\x05value:\x028\x01B%Z#github.com/lesomnus/grpc-dgram;drpcb\beditionsp\xe8\a"

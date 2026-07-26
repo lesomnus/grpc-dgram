@@ -45,7 +45,11 @@ func dropEvery(match func(f *drpc.Frame) bool) func(drpc.FrameHandler) drpc.Fram
 func wireMd(md metadata.MD) *drpc.Metadata {
 	es := map[string]*drpc.Metadata_Entry{}
 	for k, v := range md {
-		es[k] = drpc.Metadata_Entry_builder{Values: v}.Build()
+		bs := make([][]byte, len(v))
+		for i, s := range v {
+			bs[i] = []byte(s)
+		}
+		es[k] = drpc.Metadata_Entry_builder{Values: bs}.Build()
 	}
 	return drpc.Metadata_builder{Entries: es}.Build()
 }
