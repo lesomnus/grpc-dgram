@@ -204,8 +204,8 @@ type ProtocolEvent struct {
 ```
 
 `Peer` is whatever key the adapter attached with `drpc.NewPeerContext`: a
-`netip.AddrPort` for `transport/udp`, an opaque handle for the WebSocket and
-WebRTC gateways. A `drpc.Conn` talks to exactly one peer, so client-side
+`netip.AddrPort` for `transport/udp`, an opaque handle for the WebSocket,
+WebRTC and message-port gateways. A `drpc.Conn` talks to exactly one peer, so client-side
 events leave it nil. Peer-scope server events — keepalives, liveness expiry —
 carry `Peer` with `Sid = 0` and no method; call-scope events carry all three.
 

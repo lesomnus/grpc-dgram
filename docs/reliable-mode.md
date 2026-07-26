@@ -21,8 +21,9 @@ that knows it is reliable says so through `TransportInfo`, and
 |---|---|
 | [`transport/gorilla`](../transport/gorilla) (WebSocket) | always reliable |
 | [`transport/pion`](../transport/pion) (WebRTC) | ordered + no retransmit/lifetime cap → reliable, else unreliable |
+| [`transport/jsport`](../transport/jsport) (JS message port) | always reliable — a port in one process cannot lose, duplicate or reorder |
 | [`transport/udp`](../transport/udp) | always unreliable |
-| [`ts/src/transport/websocket`](../ts/src/transport/websocket), [`webrtc`](../ts/src/transport/webrtc) | the same two rules, in TypeScript |
+| [`ts/src/transport/websocket`](../ts/src/transport/websocket), [`webrtc`](../ts/src/transport/webrtc), [`port`](../ts/src/transport/port) | the same rules, in TypeScript |
 
 Nothing in the wiring mentions the mode:
 
@@ -383,11 +384,24 @@ from outside it:
   surface `close` on the channel, since the SCTP shutdown needs a live
   transport to travel over. Watch `PeerConnectionState` and close the channel
   — or the `Conn`/`Server` — yourself when it fails.
+- `transport/jsport` and `ts/src/transport/port` have **no keepalive, by
+  design**. Both endpoints of a message port are in one process, so there is
+  nothing to partition and a ping would only measure how busy the peer is.
+  Nor is there anything for the port to report the death of. So death is
+  announced instead: `Close` posts an empty message, the peer's pump reads it
+  as EOF and runs the §4.5 teardown. What only the host knows — a wasm
+  instance that exited, a terminated worker — it declares itself: TypeScript's
+  `close(cause)` carries the cause into the failed calls, and a Go host says it
+  through the core's own `conn.Close(err)` / `srv.DisconnectPeer(peer, err)`,
+  since `Close` there is an `io.Closer` and takes none.
 
 One browser caveat: an `RTCDataChannel` gives no way to pause delivery, so
 inbound messages queue in the adapter while a slow consumer drains. Ordering
 and the no-silent-drop contract still hold; adapter rx memory there is not
-bounded by the window, only by the sender's own pacing.
+bounded by the window, only by the sender's own pacing. `postMessage` gives a
+message port the same shape, with one difference that matters: a port is
+always in reliable mode, so flow control is always running on it and a
+conforming peer cannot post what it has no credit for.
 
 ## Where to look next
 

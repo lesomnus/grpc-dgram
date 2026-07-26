@@ -17,9 +17,11 @@ one. The normative contract is [PROTOCOL.md](./PROTOCOL.md) §3–§4.
 | [`transport/udp`](../transport/udp) | UDP socket | unreliable | `udp.New(conn)` | `udp.NewGateway(pc)` + `Serve` |
 | [`transport/gorilla`](../transport/gorilla) | WebSocket | reliable | `gorilla.New(wsc)` | `gorilla.NewGateway()` + `ServePeer` |
 | [`transport/pion`](../transport/pion) | WebRTC DataChannel | derived per channel | `pion.New(dc)` | `pion.NewGateway()` + `Bind` + `ServePeer` |
+| [`transport/jsport`](../transport/jsport) | JS message port (`js/wasm`) | reliable | `jsport.New(port)` | `jsport.NewGateway()` + `Serve` |
 | [`ts/…/node-udp`](../ts/src/transport/node-udp) | UDP (Node) | unreliable | `new UdpTransport(...)`, `dialUdp` | `new UdpGateway(...)`, `listenUdp` |
 | [`ts/…/websocket`](../ts/src/transport/websocket) | WebSocket | reliable | `new WebSocketTransport(ws)`, `dialWebSocket` | `new WebSocketGateway()` |
 | [`ts/…/webrtc`](../ts/src/transport/webrtc) | WebRTC DataChannel | derived per channel | `new DataChannelTransport(dc)` | `new DataChannelGateway()` |
+| [`ts/…/port`](../ts/src/transport/port) | JS message port | reliable | `new PortTransport(port)`, `startWasmServer` | `new PortGateway()` + `bind` + `servePeer` |
 
 Two things under `ts/src/transport/` are **not** transports, despite living
 there: [`protobuf-es`](../ts/src/transport/protobuf-es) derives method
@@ -28,16 +30,34 @@ turns a `Conn` into a Connect-ES `Transport` so `createClient` works. They are
 bindings; they sit next to the adapters because they are the same kind of
 optional, dependency-carrying edge.
 
-`transport/udp` is part of the core Go module (stdlib only). `gorilla` and
-`pion` are separate modules, so importing the core never pulls their
-dependencies.
+`transport/jsport` and `ts/…/port` are one channel seen from both sides. A
+**message port** is anything with `postMessage` and a `message` event — either
+end of a `MessageChannel`, a `Worker`, a worker's own global scope — and the
+two adapters carry the WebSocket wire on it byte for byte, so a Go server
+compiled to `js/wasm` and running *inside the page* is a peer like any other.
+That is the deployment they exist for;
+[`examples/browser-wasm`](../examples/browser-wasm) is it, running.
+
+For that one pairing the wiring is two lines: `gw.Serve(ctx, srv)` publishes a
+JS entry point — the publish being the readiness signal — and serves every port
+handed to it, while `await startWasmServer('/app.wasm')` on the page waits for
+that publish, makes the `MessageChannel` and returns the transport over its
+end. One instance serves as many connections as it is given ports, each its own
+peer (§6.4); `wasmServer().connect()` opens the next one. Any other shape — a
+`Worker`, an iframe, two TS endpoints — is the manual path below, unchanged.
+
+`transport/udp` and `transport/jsport` are part of the core Go module (stdlib
+only — `jsport` needs nothing but `syscall/js`, and being `//go:build js &&
+wasm` it is silently skipped by `go build ./...` on every other GOOS).
+`gorilla` and `pion` are separate modules, so importing the core never pulls
+their dependencies.
 
 ## How an adapter decides "reliable"
 
 `TransportInfo` is a one-method interface — `Reliable() bool` — discovered by
-type assertion at construction (§4.3). WebSocket answers `true`
-unconditionally; UDP answers `false`. WebRTC is the interesting one, because a
-DataChannel is only reliable if it was configured that way:
+type assertion at construction (§4.3). WebSocket and a message port answer
+`true` unconditionally; UDP answers `false`. WebRTC is the interesting one,
+because a DataChannel is only reliable if it was configured that way:
 
 ```go
 // transport/pion/channel.go
@@ -82,8 +102,10 @@ They are often confused, and they measure different things.
 
 Neither implies the other. A 1200-byte send cap still overflows a 1200-byte
 datagram budget once the frame around it is counted. Defaults: UDP 1200 B,
-WebRTC 1200 B unreliable / 16 KiB reliable, WebSocket unlimited; per-call caps
-are gRPC's own 4 MiB receive and effectively unlimited send.
+WebRTC 1200 B unreliable / 16 KiB reliable, WebSocket and message port
+unlimited — neither channel imposes a ceiling of its own, so the adapter
+invents none; per-call caps are gRPC's own 4 MiB receive and effectively
+unlimited send.
 
 The core never fragments and never asks for an MTU. On an unreliable channel
 that is deliberate: reassembly over a lossy link would rebuild the reliability
@@ -159,7 +181,47 @@ out-of-band signal:
 | gorilla | keepalive ping write failure, plus a write deadline on every send |
 | pion | `OnClose`/`OnError` callbacks and a send-stall timeout at the buffered-amount mark |
 | ts websocket | `onclose`/`onerror` plus a keepalive |
+| jsport, ts port | nothing the channel reports — the peer's goodbye, or an explicit `Close`/`close(cause)` from the host (below) |
 | udp | nothing — UDP is connectionless, so the core's timers (`T_call`, `T_live`) are the bound, and shutdown is the application's move |
+
+### When there is nothing to detect
+
+A message port is the case that row cannot answer. Both endpoints live in one
+process: there is no socket to break, no error event that has to arrive, and
+nothing for a keepalive to measure — two things sharing an event loop cannot be
+partitioned, so an unanswered ping would only report how busy the peer is.
+Death is therefore not detected here. It is **said out loud**, by two
+mechanisms that between them are the whole of the §4.5 duty on this channel.
+
+The first is on the wire: **a 0-byte message is the goodbye**. It is a
+marshaled `Envelop` with no frames — something §4.1 (1..n) means the wire never
+otherwise carries — so `Close` posts one before it drops the port, and the peer
+that reads it tears down. The trigger is the *byte length*, never "the envelop
+decoded to no frames" — protobuf keeps fields it does not know, so a later wire
+version, or another library's traffic on the same port, decodes to no frames as
+well, and reading one of those as a goodbye would kill a healthy channel over
+input §4.2 says to drop.
+
+The second is the host's, because the port cannot report what only the host
+knows: a wasm instance that exited or panicked, a terminated worker, a page
+unloading. Both adapters take an explicit close for it — `Transport.Close` /
+`Gateway.Close` in Go, `close(cause)` in TypeScript. The TS close carries the
+host's cause into the failed calls; Go's `Close` is an `io.Closer` and takes
+none, so a Go host with something to say calls the core's own teardown API
+directly — `conn.Close(err)`, `srv.DisconnectPeer(peer, err)` — which is what
+the adapter's `Close` would otherwise trigger with no cause. For the wasm page
+`startWasmServer` wires that close to `go.run()`'s own promise already, which
+is what keeps a panicking in-page server from hanging its UI
+([`examples/browser-wasm`](../examples/browser-wasm)); a host on the manual
+path owes the same wiring itself. An endpoint that vanishes without
+either signal leaves its peer's calls to their deadlines: with timers off,
+nothing else ever fails them.
+
+Backpressure gets the browser DataChannel's answer. `postMessage` applies none,
+so received messages queue in the adapter — bounded not by the channel but by
+the protocol, since a conforming peer in reliable mode cannot put more in
+flight than the per-stream windows it was granted (§4.2.1). Never drop one to
+make room: a gap in reliable mode is a protocol error, not a lost datagram.
 
 ## Checklist
 
@@ -173,4 +235,8 @@ the read loop.
 The shipped adapters are the reference — [`transport/udp`](../transport/udp) is
 the smallest, [`transport/gorilla`](../transport/gorilla) shows the
 keepalive/teardown pattern, [`transport/pion`](../transport/pion) shows
-per-channel mode and back-pressure.
+per-channel mode and back-pressure, and
+[`transport/jsport`](../transport/jsport) shows teardown on a channel that
+cannot report its own death. Each of the TypeScript adapters
+([`ts/src/transport/`](../ts/src/transport)) is the same contract in the other
+language, with a README next to it.

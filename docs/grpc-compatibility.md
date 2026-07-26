@@ -309,9 +309,10 @@ still reaches the OPEN frame (§8, Appendix C).
 interceptor both work, because the *transport* names the remote end — never
 the frame contents (PROTOCOL.md §6.4). A client transport does it by
 implementing `drpc.TransportPeer`; a gateway does it per frame, attaching a
-`*peer.Peer` to the receive ctx. All three shipped adapters do one or the
+`*peer.Peer` to the receive ctx. All four shipped adapters do one or the
 other, so over UDP `p.Addr` and `p.LocalAddr` are real socket addresses on
-both sides.
+both sides. A channel with no address of its own says so instead:
+`transport/jsport` reports the port's label on network `"js"`.
 
 Two things a port should not assume. **`p.AuthInfo` is always nil**: dRPC
 terminates no TLS and inspects no channel, so code that read it to recover a

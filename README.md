@@ -22,9 +22,9 @@ generated impls <── drpc.Server <──(per frame)──── adapter (unpa
   protocol is **dRPC**, specified in [`docs/PROTOCOL.md`](./docs/PROTOCOL.md)
 - Status: **core + protocol complete and characterized** (unary / server- /
   client- / bidi-streaming, metadata, interceptors, codecs, timeouts,
-  liveness), **transport adapters shipped** (UDP, WebSocket, pion/webrtc), and
-  a **TypeScript port** of the same wire protocol ([`ts/`](./ts) — browser and
-  Node, verified against a real Go server).
+  liveness), **transport adapters shipped** (UDP, WebSocket, pion/webrtc, JS
+  message port), and a **TypeScript port** of the same wire protocol
+  ([`ts/`](./ts) — browser and Node, verified against a real Go server).
 
 ---
 
@@ -58,9 +58,10 @@ subsequence** instead of stalling.
 | Per-stream flow control on reliable channels (no head-of-line blocking) | ✅ HTTP/2-shaped windows, counted in messages |
 | Per-stream buffering & drop policy (`DropNewest` / `DropOldest`) | ✅ per method / per role |
 | Resource caps (tombstones, live calls, reset maps) | ✅ bounded under a junk flood |
-| Transport adapters: UDP, WebSocket, pion/webrtc | ✅ [`transport/udp`](./transport/udp), [`transport/gorilla`](./transport/gorilla), [`transport/pion`](./transport/pion) |
-| Browser / Node TypeScript port (client + server, same wire) | ✅ [`ts/`](./ts) — WebRTC DataChannel, WebSocket, Node UDP, protobuf-es & Connect-ES bindings |
-| Runnable examples | ✅ [`examples/`](./examples) — UDP sensor stream, WebSocket echo, browser↔Go WebRTC |
+| Transport adapters: UDP, WebSocket, pion/webrtc, JS message port | ✅ [`transport/udp`](./transport/udp), [`transport/gorilla`](./transport/gorilla), [`transport/pion`](./transport/pion), [`transport/jsport`](./transport/jsport) |
+| A server compiled to `js/wasm`, served to the page over a message port | ✅ [`transport/jsport`](./transport/jsport) ↔ [`ts/…/transport/port`](./ts/src/transport/port) — same wire as WebSocket, both ends in one process |
+| Browser / Node TypeScript port (client + server, same wire) | ✅ [`ts/`](./ts) — WebRTC DataChannel, WebSocket, JS message port, Node UDP, protobuf-es & Connect-ES bindings |
+| Runnable examples | ✅ [`examples/`](./examples) — UDP sensor stream, WebSocket echo, browser↔Go WebRTC, an in-page wasm server |
 | `Envelop` batching (`Coalescer`) | ⬜ planned |
 
 ## Install
@@ -102,15 +103,18 @@ for {
 }
 ```
 
-Three adapters ship. `transport/udp` is part of the core module (stdlib only);
-`transport/gorilla` (gorilla/websocket) and `transport/pion` (pion/webrtc) live in
-their own Go modules so importing the core never pulls their dependencies.
+Four adapters ship. `transport/udp` and `transport/jsport` are part of the core
+module (stdlib only — `jsport` builds on `js/wasm` alone, and is skipped by
+`go build ./...` everywhere else); `transport/gorilla` (gorilla/websocket) and
+`transport/pion` (pion/webrtc) live in their own Go modules so importing the
+core never pulls their dependencies.
 
 | | transport | mode | client | server |
 |---|---|---|---|---|
 | [`transport/udp`](./transport/udp) | UDP socket | unreliable | `udp.New(conn)` | `udp.NewGateway(pc)` + `Serve` |
 | [`transport/gorilla`](./transport/gorilla) | WebSocket | reliable | `gorilla.New(wsc)` | `gorilla.NewGateway()` + `ServePeer` |
 | [`transport/pion`](./transport/pion) | WebRTC DataChannel | **derived from the channel config** | `pion.New(dc)` | `pion.NewGateway()` + `Bind`+`ServePeer` |
+| [`transport/jsport`](./transport/jsport) | JS message port (`js/wasm`) | reliable | `jsport.New(port)` | `jsport.NewGateway()` + `Bind`+`ServePeer` |
 
 Clients are gRPC-shaped: `drpc.NewConn(tp)` attaches the transport and its
 receive machinery starts by itself; `conn.Close(nil)` (or the transport's
@@ -139,16 +143,19 @@ channel keep flowing** — the head-of-line blocking a single blocking receiver
 would otherwise impose, and the reason gRPC has per-stream HTTP/2 windows.
 This is the path to
 **plain gRPC-over-WebSocket / reliable-datachannel** semantics, and it is
-auto-detected with zero options: `transport/gorilla` always advertises
-reliable, and `transport/pion` derives it from each data channel's
-configuration (ordered, no retransmit/lifetime cap). On the server the mode
-is **per peer**: a gateway annotates each channel's reliability
+auto-detected with zero options: `transport/gorilla` and `transport/jsport`
+always advertise reliable, and `transport/pion` derives it from each data
+channel's configuration (ordered, no retransmit/lifetime cap). On the server
+the mode is **per peer**: a gateway annotates each channel's reliability
 (`drpc.NewReliableContext`), so one `drpc.Server` serves a reliable control
 channel and unreliable telemetry channels side by side — each in its own
 mode. `WithReliable` remains as the explicit override for custom
 transports. With no protocol timers running on a reliable channel, the
 transport's death detection (keepalive, `OnClose`, send stall) is what
-fails live calls — the shipped transports own that duty.
+fails live calls — the shipped transports own that duty. A message port has
+no death to detect at all, both ends being in one process, so `jsport` says
+it instead: an empty message is its goodbye, and the host closes the
+transport when the thing behind it (a wasm instance, a worker) is gone.
 
 ### Tuning (sensor streams)
 
@@ -273,9 +280,11 @@ go test -race ./...     # core + transport/udp — fast & deterministic (testing
 # transport/gorilla and transport/pion are separate modules (their own go.mod),
 # so ./... does not reach them; CI iterates over every go.mod the same way:
 for d in transport/gorilla transport/pion; do (cd $d && go test -race ./...); done
+# transport/jsport is js/wasm-only, so every command above skips it; node runs it:
+GOOS=js GOARCH=wasm go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" -count=1 ./transport/jsport/...
 buf generate            # regenerate protobuf bindings after editing proto/
 go test -run '^$' -fuzz FuzzServerHandle -fuzztime 20s .   # fuzz the frame entry points
-(cd ts && pnpm install && pnpm test)   # TypeScript port, incl. the Go↔TS conformance test
+(cd ts && pnpm install && pnpm test)   # TypeScript port, incl. the Go↔TS conformance tests (UDP, and a wasm server on a port)
 ```
 
 - Documentation: [`docs/`](./docs) — getting started, the transports, the two
@@ -283,7 +292,8 @@ go test -run '^$' -fuzz FuzzServerHandle -fuzztime 20s .   # fuzz the frame entr
 - Wire protocol & design rationale: [`docs/PROTOCOL.md`](./docs/PROTOCOL.md)
 - Runnable examples: [`examples/`](./examples) — a UDP sensor stream with the
   gap/drop counters printed, a reliable WebSocket echo with graceful shutdown,
-  and the browser↔Go WebRTC DataChannel demo
+  the browser↔Go WebRTC DataChannel demo, and a Go server compiled to wasm and
+  restarted by reloading the page
 - TypeScript port (client + server, same wire): [`ts/`](./ts)
 - Behavioral evidence for every guarantee/limitation above:
   [`characterization_test.go`](./characterization_test.go),

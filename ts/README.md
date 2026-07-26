@@ -31,6 +31,16 @@ server and vice versa.
   twin of the Go `transport/gorilla` adapter: reliable mode, one Envelop per
   message, and the §4.5 teardown duty carried by `onclose`/`onerror` plus a
   keepalive — browser-safe (WhatWG `WebSocket`, `binaryType='arraybuffer'`).
+- **Message-port adapter** (`@lesomnus/grpc-dgram/transport/port`), the TS twin
+  of the Go `transport/jsport` adapter: `PortTransport`/`PortGateway` over
+  anything with `postMessage` and a `message` event — a `MessagePort`, a
+  `Worker`, a worker's own `self`. Always reliable, since a port in one process
+  loses nothing, and since nothing dies that a port can report, teardown is
+  spoken: an empty message is the goodbye, and `close(cause)` carries what only
+  the host knows (a wasm instance that exited, a terminated worker). This is
+  what puts a **Go `drpc.Server` compiled to `js/wasm` inside the page** with
+  the UI as its client — `../examples/browser-wasm`, and the cross-language
+  test `test/wasm.test.ts`.
 - **WebRTC DataChannel adapter** (`@lesomnus/grpc-dgram/transport/webrtc`), the TS twin
   of the Go `transport/pion` adapter: the protocol mode is derived from the
   channel's own configuration — an ordered channel with no retransmit or
@@ -174,15 +184,19 @@ calls sharing the channel.
 
 ## Tests
 
-`pnpm test` — 252 tests mirroring the Go suites: the §5 golden wire vectors
+`pnpm test` — 291 tests mirroring the Go suites: the §5 golden wire vectors
 byte-for-byte (including the v1.1 vectors generated from the Go
 implementation), e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,
 probes, liveness), the §6.5 restart walkthroughs, §15 caps and §4.2 drop
 policies, §4.2.1 flow control (advertisement, parking, grants, `T_stall`,
 overrun), compression, size caps and binary metadata, each adapter
-(WebRTC/WebSocket/UDP/protobuf-es/Connect) next to its source, and a
-cross-language conformance test driving a real Go `drpc.Server`.
+(WebRTC/WebSocket/Port/UDP/protobuf-es/Connect) next to its source, and two
+cross-language conformance tests driving a real Go `drpc.Server`: one over
+loopback UDP, one a `js/wasm` build of the server loaded into the test process
+and talked to across a `MessageChannel` — the second being where reliable mode
+is genuinely reliable rather than asserted, so the §4.2.1 windows are exercised
+between the two implementations.
 
 **Layout.** Unit and per-adapter tests are **co-located** next to their source
 (`src/wire.test.ts`, `src/transport/webrtc/index.test.ts`, …); cross-cutting

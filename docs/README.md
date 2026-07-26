@@ -39,5 +39,7 @@ side you are on.
 - **[TODO.md](./TODO.md)** — what is left, and what has to be decided first.
 
 Runnable code lives in [`examples/`](../examples): a UDP sensor stream with the
-loss counters printed, a reliable WebSocket echo with graceful shutdown, and a
-browser↔Go WebRTC demo driving the TypeScript port.
+loss counters printed, a reliable WebSocket echo with graceful shutdown, a
+browser↔Go WebRTC demo driving the TypeScript port, and a Go server compiled to
+`js/wasm` that the page starts on a message port — reload the browser and the
+server restarts.

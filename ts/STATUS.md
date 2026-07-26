@@ -17,7 +17,13 @@ bytes on the wire (`-bin` keys hold base64 in the TS API), `Frame.window` /
 per-message compression via `CompressionStream`, `Frame.details` status
 details, the shape/modifier flag split (§7.1), per-call size caps, and the
 unary `sendHeader` flush. New adapter: **WebSocket** (`transport/websocket`),
-the twin of Go's `transport/gorilla`.
+the twin of Go's `transport/gorilla`. Since **2026-07-26** a second one:
+**message port** (`transport/port`), the twin of Go's new `transport/jsport` —
+the first channel whose two ends can be in one process, which is what lets a Go
+server compiled to `js/wasm` serve the page it runs in
+(`../examples/browser-wasm`). It brings the port's own teardown protocol (an
+empty message is the goodbye) and a second cross-language proof,
+`test/wasm.test.ts`, this one on a channel that is *actually* reliable.
 
 ## Done
 
@@ -25,7 +31,8 @@ Client + server core and the WebRTC DataChannel adapter, wire-compatible with
 the Go reference. The zero-dep core lives in `ts/src/`; each third-party /
 platform adapter is its **own directory** under `ts/src/transport/` — an
 `index.ts` plus a `README.md` — exported as `@lesomnus/grpc-dgram/transport/*`,
-mirroring Go's `transport/{udp,pion,gorilla}/` layout (dir + README each).
+mirroring Go's `transport/{udp,pion,gorilla,jsport}/` layout (dir + README
+each).
 
 | File | Role | Go twin |
 |---|---|---|
@@ -39,16 +46,18 @@ mirroring Go's `transport/{udp,pion,gorilla}/` layout (dir + README each).
 | `server.ts` | `Server` + server stream, per-peer state, sweep, caps | `server.go`, `stream.go`, `unreliable_server.go` |
 | `transport/webrtc/` | `DataChannelTransport` (client) + `DataChannelGateway` (server, mixed-mode) | `transport/pion/*.go` |
 | `transport/websocket/` | `WebSocketTransport` (client) + gateway/`servePeer` (server), reliable | `transport/gorilla/*.go` |
+| `transport/port/` | `PortTransport` + `PortGateway` over `postMessage`, reliable; teardown is the empty-message goodbye plus `close(cause)` | `transport/jsport/*.go` |
 | `transport/node-udp/` | `UdpTransport`/`UdpGateway` + `dialUdp`/`listenUdp` (Node `dgram`) | `transport/udp/*.go` |
 | `transport/protobuf-es/` | `fromService`/`fromMethod` — derive descriptors from generated protobuf-es | grpc-go codegen (G2) |
 | `transport/connect/` | `createDrpcTransport` — a Connect-ES `Transport` over a dRPC `Conn` | — (Connect interop) |
 
 Verified at this commit:
 
-- `pnpm test` → **252 passing** (17 files). Unit and per-adapter tests are
+- `pnpm test` → **291 passing** (19 files). Unit and per-adapter tests are
   co-located next to their source (`src/wire.test.ts`,
   `src/transport/connect/index.test.ts`, …); cross-cutting integration tests
-  (e2e, timeout, restart, limits, conformance, protobufes-gen) stay in `test/`;
+  (e2e, timeout, restart, limits, conformance, wasm, protobufes-gen) stay in
+  `test/`;
   shared fixtures + generated code live in `src/testing/` (not an entry, never
   in `dist/`). Mirrors the Go suites, plus the audit regression pins
   (`transport/node-udp/index.test.ts`, `server.test.ts`, `util.test.ts`):
@@ -62,8 +71,10 @@ Verified at this commit:
   `src/transport/webrtc/index.test.ts` (adapter against a mock RTCDataChannel
   pair, incl. the reliable-datachannel echo — the project's final-goal demo
   shape), `protobufes*.test.ts` (the binding, verified
-  against real `protoc-gen-es` output), and **`conformance.test.ts`** (a TS
-  client driving a **real Go `drpc.Server`** over UDP — see below).
+  against real `protoc-gen-es` output), and the two cross-language suites —
+  **`conformance.test.ts`** (a TS client driving a **real Go `drpc.Server`**
+  over UDP) and **`wasm.test.ts`** (the same server built `GOOS=js GOARCH=wasm`
+  and driven over a `MessageChannel`) — see below.
 - `pnpm check` (`tsc --noEmit`, strict) → clean.
 - `pnpm build` (tsdown) → clean; emits `dist/index.mjs` plus one
   `dist/transport/*.mjs` per adapter entry, with `.d.mts`. `dist/` is
@@ -127,9 +138,11 @@ represent; the message and status always surface.
 ## Deliberately NOT ported (not gaps)
 
 Do not "fix" these — they are intentional, matching the Go feature set or TS
-idiom: client/server **interceptors**; the **stats surface** (planned in Go
-too, M6); **`Envelop` batching / `Coalescer`** (planned M6 in Go; every envelop
-carries one frame, as the shipped Go adapters do); handler signatures are
+idiom: client/server **interceptors**; the **stats surface** (shipped in Go —
+`WithProtocolStats`/`WithStatsHandler`, `docs/observability.md` — and a
+deliberate TS gap, not a pending port); **`Envelop` batching / `Coalescer`**
+(deferred to M8 in Go, design open in `docs/TODO.md`; every envelop carries one
+frame, as the shipped Go adapters do); handler signatures are
 TS-native functions (not grpc-go codegen); `context.Context` → `AbortSignal` +
 `CallOptions`; `metadata.MD` → `Record<string,string[]>`. One genuine
 environmental difference, documented in `transport/webrtc/index.ts`: a browser `RTCDataChannel`
@@ -153,19 +166,35 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
    plus the same shapes through a Connect client. This pins the *behavior*
    across implementations, where the golden vectors pin the *encoding*.
    `skipIf(!go)`, and CI runs it (the `ts` job sets up Go).
-   **Deliberately not pursued: loss-recovery / reliable-transport interop.**
-   Loopback UDP is effectively lossless and ordered, so exercising the §10
-   retransmission path would mean injecting loss in code — a reliable channel
-   plus code-level frame manipulation, which is exactly what each language's
-   own suite already does (fake timers, lossy filters, injected frames). A
-   cross-language loss test would add negligible interop-specific coverage over
-   the happy-path (the same already-golden frames flow; recovery *logic* is
-   per-side) for a large infrastructure cost (a lossy proxy + a TS WebSocket
-   transport to pair with Go `gorilla` for the reliable/strict path). Not worth
-   it; the boundary is covered by the cases above.
+   **Reliable-mode interop — also done** (`test/wasm.test.ts`), and it needed
+   the message-port adapter to be possible. The same `internal/echo` service
+   (`conformance/wasmserver`) is built `GOOS=js GOARCH=wasm`, loaded into the
+   vitest process with the toolchain's own `wasm_exec.js`, and served over a
+   `MessageChannel` — so the channel between the two implementations really is
+   reliable instead of being annotated as such per frame, which is all loopback
+   UDP could offer. That buys the part of v1.1 that exists in reliable mode
+   only: mode discovered from the transport with zero options on either side,
+   the §4.2.1 window advertised on the OPEN, and credit granted in both
+   directions as each side's handler consumes. It also pins both teardown
+   paths, which are what §4.5 costs on a channel with no death to detect —
+   `drpcStop()` (the Go gateway's goodbye → the TS calls fail `UNAVAILABLE`)
+   and `drpcExit()` on a second instance (`os.Exit` says nothing → `go.run()`
+   resolves → the host's `transport.close(cause)` fails them with that cause).
+   Plus a Go-returned status and gzip in both directions.
+   **Deliberately not pursued: loss-recovery interop.** Neither loopback UDP
+   nor a message port loses anything, so exercising the §10 retransmission path
+   across implementations would mean injecting loss in code — which is exactly
+   what each language's own suite already does (fake timers, lossy filters,
+   injected frames). It would add negligible interop-specific coverage over the
+   happy path (the same already-golden frames flow; recovery *logic* is
+   per-side) for the cost of a lossy proxy between the two. Not worth it; the
+   boundary is covered by the cases above.
 3. ~~**`examples/`**~~ — **done**: `../examples/browser-webrtc` runs the
-   browser↔Go WebRTC DataChannel echo against this port's `dist/`
-   (`../examples/` also has a UDP sensor stream and a WebSocket echo).
+   browser↔Go WebRTC DataChannel echo against this port's `dist/`, and
+   `../examples/browser-wasm` runs a Go server compiled to `js/wasm` inside the
+   page over `transport/port` — both import `dist/` through an import map, so
+   `pnpm build` is their prerequisite (`../examples/` also has a UDP sensor
+   stream and a WebSocket echo).
 4. **Packaging** — decide the published name/scope (currently
    `@lesomnus/grpc-dgram`, `private: true`) and a real `version`. *(The
    protobuf-es binding — `@lesomnus/grpc-dgram/transport/protobuf-es`, `fromService` /
@@ -185,7 +214,7 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
 ```
 cd ts
 pnpm install
-pnpm test     # vitest, 252 tests
+pnpm test     # vitest, 291 tests (the two cross-language suites need `go` on PATH)
 pnpm check    # tsc --noEmit (strict)
 pnpm build    # tsdown → dist/
 ```

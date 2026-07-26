@@ -10,11 +10,13 @@ they are documentation that compiles.
 | [`udp-sensor`](./udp-sensor) | UDP | unreliable | the library's actual purpose: a server-streaming sensor feed, `WithMethodRxBuffer` + `DropOldest`, an explicit deadline, and a report of the gap/drop counters |
 | [`websocket-echo`](./websocket-echo) | WebSocket (gorilla) | reliable | timers off, exact sequence, and graceful shutdown draining a live stream |
 | [`browser-webrtc`](./browser-webrtc) | WebRTC DataChannel (pion ↔ browser) | reliable | the final goal: a browser page on the TypeScript port calling a Go service over a data channel |
+| [`browser-wasm`](./browser-wasm) | JS message port (jsport ↔ browser), and WebSocket | reliable | the server compiled to `js/wasm` and run *inside the page* it serves, so a reload restarts and rebuilds it; `?server=ws` points the same UI at the server process |
 
 ```sh
 cd udp-sensor     && go run ./...
 cd websocket-echo && go run ./...
 cd browser-webrtc && go run .      # after: cd ../../ts && pnpm install && pnpm build
+cd browser-wasm   && go run .      # same prerequisite; it builds the in-page server itself
 ```
 
 The `.proto` files and their generated bindings are committed, so nothing here

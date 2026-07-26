@@ -92,7 +92,7 @@ type EnvelopHandler interface { Handle(ctx context.Context, e *Envelop) error }
 - tx path: the core writes frames to a `FrameHandler`. `drpc.Wrap1(a)` adapts an
   `EnvelopHandler` by wrapping each frame in a 1-frame envelop (default). A
   `Coalescer` batching middleware is **planned, not yet implemented** (§4.1;
-  milestone M6) — its normative duties below bind whenever it lands.
+  milestone M8) — its normative duties below bind whenever it lands.
 - rx path: the adapter reads a transport message, unmarshals **one `Envelop`**,
   and calls `Conn.Handle`/`Server.Handle` once per contained frame, in order,
   attaching the peer to `ctx` (§6.4).
@@ -118,11 +118,18 @@ type EnvelopHandler interface { Handle(ctx context.Context, e *Envelop) error }
 - Receivers MUST process contained frames in order (frames of one call may
   share an envelop — e.g. OPEN + data; creation happens mid-envelop and later
   frames land on the new stream). An empty envelop is dropped.
+- The core never *emits* an empty envelop, so an adapter on a channel with no
+  death signal of its own MAY claim the **empty message** as its own close
+  frame — `transport/jsport` does exactly that (§4.5). This is adapter-local
+  framing, not protocol, and it MUST key on the zero-byte message rather than
+  on "decoded to no frames": unknown fields decode to no frames too, and
+  reading one of those as a close would tear down a healthy channel over input
+  §4.2 says to drop.
 - **Loss atomicity:** an envelop is lost/duplicated/reordered as a unit; every
   frame inside shares that fate. Batching couples the fates of otherwise
   independent frames — the sender's choice.
 - Batching is **sender-local policy**, invisible to the protocol: the
-  planned `Coalescer` (M6) packs queued frames while the marshaled envelop
+  planned `Coalescer` (M8) packs queued frames while the marshaled envelop
   stays within its own byte budget (§4.4), flushing on `MaxDelay`, on budget
   exhaustion, or on explicit `Flush()`. Retransmission ticks (§10.3) would
   naturally batch into one envelop. Until it exists, every envelop carries
@@ -282,7 +289,7 @@ where the channel is known — in the adapter:
   `ResourceExhausted` on the owning call (pinned by
   `TestChar_AdapterRefusesTooLargeSend` and end-to-end by the UDP adapter's
   suite).
-- The planned `Coalescer` (batching middleware, M6) owns its own byte budget
+- The planned `Coalescer` (batching middleware, M8) owns its own byte budget
   as plain config (e.g. `Coalescer{MaxBytes: n}`): a frame that fits alone
   but not in the current batch triggers flush-then-new-batch; a frame that
   cannot fit alone MUST fail synchronously in `Coalescer.Handle` (an async
@@ -290,7 +297,9 @@ where the channel is known — in the adapter:
 
 Non-normative sizing guidance for adapter authors: UDP ≈1200 B (below typical
 path MTU); WebRTC unreliable ≈1200 B; WebRTC reliable 16 KiB (SCTP-friendly);
-WebSocket unlimited. These are adapter defaults, not protocol constants.
+WebSocket and JS message port unlimited (both carry any size, and the port
+copies rather than fragments). These are adapter defaults, not protocol
+constants.
 
 **Two ceilings, two axes.** The adapter's limit measures the marshaled
 *Envelop* — frame headers, method string, metadata and framing included — and
@@ -313,6 +322,17 @@ blocks under backpressure (§4.2), so at least one death signal (keepalive
 write failure, transport callback) must fire from outside it and cancel the
 rx ctx, unblocking the loop so this teardown can run. Both APIs are
 idempotent and safe to call from adapter callbacks.
+
+A channel with **nothing to detect** — two endpoints in one process, e.g. a JS
+message port (`transport/jsport`) — owes the same teardown by other means:
+death there is announced, not observed. Such an adapter MUST post a close
+signal before abandoning the channel, and MUST treat the peer's as EOF and run
+the teardown; the empty message is the natural carrier (§4.1). It MUST also
+expose an entry point through which the *host* can declare a death the channel
+never will — a wasm instance that exited or panicked, a terminated worker, a
+page unloading — carrying a cause into the failed calls. An endpoint that
+vanishes without either signal leaves its peer's live calls to their deadlines,
+which in reliable mode never come.
 
 ## 5. Frame format
 
@@ -654,7 +674,7 @@ Rules:
 On every received frame, in order:
 
 1. Unmarshal; malformed → drop (the malformed-frame counter is part of the
-   planned stats surface, M6).
+   protocol stats surface, §14).
 2. `RESET` → §9.3. (RESET is processed but **never** refreshes liveness; a
    RESET matching a tombstoned call clears its pending retransmission, §10.3.)
 3. **Client only — incarnation echo gate (§6.1):** a frame whose `peer_epoch`
@@ -986,7 +1006,7 @@ assume a single loss of the named frame and exclude one-way propagation delay;
 `k` independent losses add ~`k` recovery rounds **at the then-current backoff
 interval** (`RTI` doubling, ≤ `T_probe` cap, §10.3). The `+ RTI` terms cover
 the per-tombstone replay / per-call `H`-replay rate limits. The planned
-`Coalescer` (M6) would add up to `MaxDelay` per direction to every row.
+`Coalescer` (M8) would add up to `MaxDelay` per direction to every row.
 
 With defaults, in unreliable mode:
 
@@ -1329,7 +1349,7 @@ Appendix B mirrors the body; where they disagree, the body governs.
   depend on an rx ctx surviving.
 - **Header fields:** separate rx-header / tx-header per stream + `headerReady`
   signal (§11); the server stores its creation `H` for replay (§8).
-- **Coalescer** (planned, M6) must re-expose `TransportInfo` of the wrapped
+- **Coalescer** (planned, M8) must re-expose `TransportInfo` of the wrapped
   adapter (§3) and fail oversize frames synchronously (§4.4). Remember
   `MaxDelay` appears in the §10.7 bounds.
 - **Eager OPEN** is emitted by the innermost streamer after interceptors run

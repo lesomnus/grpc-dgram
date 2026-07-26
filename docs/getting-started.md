@@ -24,7 +24,9 @@ go get github.com/lesomnus/grpc-dgram
 
 Go 1.26+. The package's import name is `drpc`. `transport/udp` is part of the
 core module and uses only the standard library, so everything below needs
-that one `go get`.
+that one `go get`. So is `transport/jsport`, the JS message-port adapter —
+`syscall/js` is stdlib too, and its `//go:build js && wasm` files simply do not
+exist on any other GOOS.
 
 The other two adapters are separate Go modules, so importing the core never
 pulls their dependencies:
@@ -35,10 +37,11 @@ go get github.com/lesomnus/grpc-dgram/transport/pion      # WebRTC DataChannel
 ```
 
 Nothing is tagged yet, and those two modules reach the core through a
-`replace` directive. A `replace` is ignored by anyone who *depends* on a
-module, so today the WebSocket and WebRTC adapters resolve only from inside a
-checkout of this repository (via its `go.work`, or your own `replace`). The
-release list in [TODO.md](./TODO.md) tracks the fix.
+`replace` directive of their own. A `replace` is ignored by anyone who
+*depends* on a module, so today the WebSocket and WebRTC adapters resolve only
+from inside a checkout of this repository — where each module's own `replace`
+is enough, no workspace file required — or through a `replace` you add
+yourself. The release list in [TODO.md](./TODO.md) tracks the fix.
 
 ## A service
 
@@ -365,6 +368,7 @@ sitting, and its `.proto` bindings are committed — running them needs neither
 cd examples/udp-sensor     && go run ./...
 cd examples/websocket-echo && go run ./...
 cd examples/browser-webrtc && go run .     # after: cd ts && pnpm install && pnpm build
+cd examples/browser-wasm   && go run .     # same prerequisite
 ```
 
 - [`udp-sensor`](../examples/udp-sensor) — this guide's workload for real: an
@@ -375,6 +379,10 @@ cd examples/browser-webrtc && go run .     # after: cd ts && pnpm install && pnp
   off, every response in order, `GracefulStop` draining a live stream.
 - [`browser-webrtc`](../examples/browser-webrtc) — a browser page on the
   TypeScript port calling a Go service over a WebRTC data channel.
+- [`browser-wasm`](../examples/browser-wasm) — the same service compiled to
+  `js/wasm` and served *to the page it answers*, so reloading the browser
+  restarts (and rebuilds) the server; the identical UI code talks to the
+  process over WebSocket with a query parameter.
 
 ## Where to go next
 
@@ -385,9 +393,12 @@ cd examples/browser-webrtc && go run .     # after: cd ts && pnpm install && pnp
   protocol does *not* protect you from.
 - The adapter READMEs — [`transport/udp`](../transport/udp),
   [`transport/gorilla`](../transport/gorilla),
-  [`transport/pion`](../transport/pion) — each documents its own options,
+  [`transport/pion`](../transport/pion),
+  [`transport/jsport`](../transport/jsport) — each documents its own options,
   message-size ceiling, and death-detection behavior. Those are per-adapter
   properties; the core has no opinion on them (§4.4).
+  [Transports](./transports.md) compares them, and covers the TypeScript
+  adapters that pair with them.
 - [`ts/README.md`](../ts/README.md) — the TypeScript port (browser and Node,
   same wire, verified against a real Go server); [`ts/STATUS.md`](../ts/STATUS.md)
   for where it deliberately stops short of the Go feature set.

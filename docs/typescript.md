@@ -26,7 +26,7 @@ ts/src/
   wire.ts     frame/envelop/metadata codec, flags, shape helpers
   conn.ts     Conn + ClientStream          server.ts  Server + streams
   seq.ts      tx seq + rx window           flow (in util.ts) credit windows
-  transport/  webrtc · websocket · node-udp · protobuf-es · connect
+  transport/  webrtc · websocket · port · node-udp · protobuf-es · connect
 ```
 
 ## How interoperability is kept honest
@@ -41,11 +41,18 @@ value containing `00 01 ff 80 7f`, a present-but-empty `Metadata`, a key with
 no values, a key with one empty value. If either side's encoder drifts, the
 byte comparison fails.
 
-**The conformance suite** pins the *behavior*. `ts/test/conformance.test.ts`
-builds and runs the real Go server in `conformance/udpserver` and drives it
-over UDP from a TS client — all four RPC shapes, metadata, a Go-encoded
-`Timestamp`, non-OK statuses with details, unknown methods, edge payloads. It
-skips itself when `go` is absent; CI installs Go so it always runs.
+**The conformance suites** pin the *behavior*, on two channels.
+`ts/test/conformance.test.ts` builds and runs the real Go server in
+`conformance/udpserver` and drives it over UDP from a TS client — all four RPC
+shapes, metadata, a Go-encoded `Timestamp`, non-OK statuses with details,
+unknown methods, edge payloads. `ts/test/wasm.test.ts` builds
+`conformance/wasmserver` for `GOOS=js GOARCH=wasm`, loads it into the test
+process and drives it over a `MessageChannel`
+([`transport/port`](../ts/src/transport/port) ↔
+[`transport/jsport`](../transport/jsport)): a genuinely reliable channel
+between the two implementations, which is what the flow-control cases (§4.2.1,
+reliable mode only) and both teardown paths need. Both skip themselves when
+`go` is absent; CI installs Go so they always run.
 
 The distinction matters for one case in particular. Binary metadata is the only
 place where the two languages' *idiomatic representations* differ, so a
@@ -131,7 +138,7 @@ stalls other calls — it is only adapter memory.
 ```sh
 cd ts
 pnpm install
-pnpm test    # vitest — unit, e2e, and the Go↔TS conformance suite
+pnpm test    # vitest — unit, e2e, and both Go↔TS conformance suites
 pnpm check   # tsc --noEmit, strict
 pnpm build   # tsdown → dist/
 ```

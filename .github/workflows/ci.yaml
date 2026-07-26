@@ -12,6 +12,9 @@ on:
       - "buf.gen.yaml"
       - "ts/**"
       - "conformance/**"
+      # The examples are documentation that compiles, and one of them (the
+      # browser-wasm page) is JavaScript and HTML this workflow type-checks.
+      - "examples/**"
   push:
     paths: *paths
 
@@ -45,6 +48,19 @@ jobs:
           for d in $(find . -name go.mod -not -path '*/.*' -printf '%h\n' | sort); do
             (cd "$d" && go test -race -timeout 120s -count=1 ./...)
           done
+
+      # transport/jsport and conformance/wasmserver are //go:build js && wasm,
+      # so every command above skipped them without a word — that is what the
+      # tag buys, and it is also how they would rot unnoticed. GOOS=js pulls
+      # them in; the test runs under the runner's node through the toolchain's
+      # own exec wrapper (no -race: the wasm port has no race detector).
+      - name: Test (js/wasm)
+        run: |
+          GOOS=js GOARCH=wasm go build ./...
+          GOOS=js GOARCH=wasm go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" -count=1 ./transport/jsport/...
+          # The example's in-page server is its own module, so ./... above does
+          # not reach it — and it is the whole point of that example.
+          (cd examples/browser-wasm && GOOS=js GOARCH=wasm go build ./...)
 
       - name: Fuzz smoke
         run: |
@@ -123,9 +139,11 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
   # The TypeScript port (ts/). Runs typecheck, the vitest suite, and the build.
-  # Go is set up because the cross-language conformance test
-  # (ts/test/conformance.test.ts) builds and drives conformance/udpserver — it
-  # skips itself when `go` is absent, but CI wants it exercised.
+  # Go is set up because the cross-language tests build and drive a real Go
+  # server: conformance/udpserver over loopback UDP
+  # (ts/test/conformance.test.ts), and conformance/wasmserver built for
+  # GOOS=js GOARCH=wasm and loaded into the test process (ts/test/wasm.test.ts).
+  # Both skip themselves when `go` is absent, but CI wants them exercised.
   ts:
     runs-on: ubuntu-latest
     defaults:
@@ -157,3 +175,12 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      # The browser examples' pages are plain ES modules checked against the
+      # port's own .d.mts output, which only exists after the build above.
+      # Nothing else compiles them, and a page that stopped type-checking is a
+      # page that stopped working.
+      - name: Typecheck the example pages
+        run: |
+          pnpm exec tsc -p ../examples/browser-webrtc
+          pnpm exec tsc -p ../examples/browser-wasm
