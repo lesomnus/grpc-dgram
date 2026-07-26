@@ -46,15 +46,22 @@ subsequence** instead of stalling.
 | Unary / Server- / Client- / Bidi-streaming | ✅ standard gRPC surface, generated stubs unchanged |
 | Metadata (header / trailer) | ✅ on success and on error |
 | Interceptors (unary + stream, client + server, chained) | ✅ |
-| Codecs (`grpc.ForceCodecV2`) | ✅ (proto default; JSON etc. via call option) |
+| Codecs (`grpc.ForceCodecV2`, `grpc.CallContentSubtype`) | ✅ (proto default; JSON etc. via call option) |
+| Message compression (`grpc.UseCompressor`) | ✅ per message, stateless (gzip and any registered compressor) |
+| Rich status details (`status.WithDetails`) | ✅ travel on the terminal frame (dropped only if it would not fit the channel) |
+| Binary metadata (`-bin` keys) | ✅ arbitrary bytes, gRPC's own validation rules |
+| Per-call size limits, `OnFinish`, `Peer`, `PerRPCCredentials`, `GetServiceInfo` (reflection) | ✅ gRPC-parity option surface |
+| `stats.Handler` + drpc protocol counters (gaps, drops, RESETs, stalls) | ✅ [`stats.go`](./stats.go) |
 | Client & server deadlines | ✅ propagated on the wire, enforced both ends |
 | Default timeout / liveness so lost frames never hang a call | ✅ core design (see [Guarantees](#guarantees)) |
 | Reliable transports: loss machinery off, violations fail loud (`INTERNAL` on a seq gap/duplicate) | ✅ auto-detected per transport / per peer — see [Reliable transports](#reliable-transports) |
+| Per-stream flow control on reliable channels (no head-of-line blocking) | ✅ HTTP/2-shaped windows, counted in messages |
 | Per-stream buffering & drop policy (`DropNewest` / `DropOldest`) | ✅ per method / per role |
 | Resource caps (tombstones, live calls, reset maps) | ✅ bounded under a junk flood |
 | Transport adapters: UDP, WebSocket, pion/webrtc | ✅ [`transport/udp`](./transport/udp), [`transport/gorilla`](./transport/gorilla), [`transport/pion`](./transport/pion) |
-| Browser / Node TypeScript port (client + server, same wire) | ✅ [`ts/`](./ts) — WebRTC DataChannel, Node UDP, protobuf-es & Connect-ES bindings |
-| Stats handler (gap / drop counters), `Envelop` batching | ⬜ planned |
+| Browser / Node TypeScript port (client + server, same wire) | ✅ [`ts/`](./ts) — WebRTC DataChannel, WebSocket, Node UDP, protobuf-es & Connect-ES bindings |
+| Runnable examples | ✅ [`examples/`](./examples) — UDP sensor stream, WebSocket echo, browser↔Go WebRTC |
+| `Envelop` batching (`Coalescer`) | ⬜ planned |
 
 ## Install
 
@@ -125,9 +132,12 @@ transport as a reference.
 Over a reliable, ordered transport, timers and retransmission are off,
 delivery is the exact sequence, and any gap or duplicate is surfaced as
 `INTERNAL` (a broken "reliable" transport). A consumer that falls behind
-stalls the wire instead of losing messages — the receive path blocks on a
-full buffer and the stall propagates into the transport's own flow control
-(TCP/SCTP backpressure), exactly like gRPC-over-TCP. This is the path to
+stops its *own* producer instead of losing messages: each stream carries a
+credit window (advertised on the OPEN and on the creation ack, refreshed as
+the application consumes), so the sender parks and **other calls on the same
+channel keep flowing** — the head-of-line blocking a single blocking receiver
+would otherwise impose, and the reason gRPC has per-stream HTTP/2 windows.
+This is the path to
 **plain gRPC-over-WebSocket / reliable-datachannel** semantics, and it is
 auto-detected with zero options: `transport/gorilla` always advertises
 reliable, and `transport/pion` derives it from each data channel's
@@ -195,9 +205,13 @@ reorder, and duplication. Every item below is pinned by an executable test
   `DisconnectPeer` drain handlers deterministically.
 
 The standard gRPC surface (value+status on all four RPC types, header/trailer
-on success and error, `Header()` blocking correctly, interceptor chaining,
-metadata round-trip, `Unimplemented` for unknown methods) matches gRPC; the
-divergences are in [Limitations & caveats](#limitations--caveats).
+on success and error, `Header()` blocking correctly — including a `SendHeader`
+flush that returns before the response — interceptor chaining, metadata
+round-trip including `-bin` keys, status details, per-call size limits,
+`OnFinish`/`Peer`/`PerRPCCredentials`/`CallContentSubtype`, `GetServiceInfo`
+for reflection, `stats.Handler`, and `Unimplemented` for unknown methods)
+matches gRPC; the divergences are in
+[Limitations & caveats](#limitations--caveats).
 
 ## Limitations & caveats
 
@@ -221,17 +235,20 @@ bugs — a lost reading is superseded by the next.
   over **DTLS / WSS / WebRTC** (all encrypted) and this is unreachable. Client
   streams reject foreign-epoch frames, so cross-incarnation poisoning is
   closed; same-epoch injection is the transport's job to prevent.
-- **Status details are dropped.** `code` and `message` travel; a
-  `status.WithDetails` payload does not (the frame carries only `code`+`desc`).
-  Put needed detail in the message string or in trailer metadata (which does
-  travel).
+- **Status details are a passenger.** `code`, `message` and
+  `status.WithDetails` payloads all travel — but details are the first thing
+  dropped if the terminal frame would not fit the channel, because a lost
+  terminal is what strands a call. Keep them small.
 - **Best-effort, single-datagram messages.** No `WaitForReady`, no transparent
-  retry. The message-size limit is **your transport's, not drpc's**: the core
-  is size-agnostic and never fragments; an unreliable adapter rejects a
-  message that doesn't fit its datagram at send (`ResourceExhausted`), while a
-  reliable transport carries any size. Batched frames in one datagram
-  fate-share. Set explicit deadlines; keep messages within a datagram
-  (natural for sensor readings).
+  retry, no load balancing — those need a connectivity model a datagram
+  channel does not have. The transport's message-size limit is **your
+  adapter's, not drpc's**: the core is size-agnostic and never fragments; an
+  unreliable adapter rejects a message that doesn't fit its datagram at send
+  (`ResourceExhausted`), while a reliable transport carries any size. The
+  per-call `MaxCallRecvMsgSize`/`MaxCallSendMsgSize` guards are a separate
+  axis — they measure one message, the adapter measures the whole frame. Set
+  explicit deadlines; keep messages within a datagram (natural for sensor
+  readings).
 - **Not HTTP/2 gRPC.** No wire-compatibility with standard gRPC, proxies, or
   the HTTP/2 ecosystem. If you need interop with existing gRPC infrastructure,
   this is the wrong transport.
@@ -261,6 +278,9 @@ go test -run '^$' -fuzz FuzzServerHandle -fuzztime 20s .   # fuzz the frame entr
 ```
 
 - Wire protocol & design rationale: [`PROTOCOL.md`](./PROTOCOL.md)
+- Runnable examples: [`examples/`](./examples) — a UDP sensor stream with the
+  gap/drop counters printed, a reliable WebSocket echo with graceful shutdown,
+  and the browser↔Go WebRTC DataChannel demo
 - TypeScript port (client + server, same wire): [`ts/`](./ts)
 - Behavioral evidence for every guarantee/limitation above:
   [`characterization_test.go`](./characterization_test.go),

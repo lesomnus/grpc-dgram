@@ -1,8 +1,8 @@
 # drpc Wire Protocol — v1.0
 
-> **Status: v1.0 (2026-07-11), pre-release.** The wire format — frame fields,
-> flags, seq/epoch rules, and the OPEN/CLOSE/RESET/PING state machines — is
-> fully implemented (M1–M5) and characterized by an executable test suite
+> **Status: v1.1 (2026-07-25), pre-release.** The wire format — frame fields,
+> flags, seq/epoch rules, and the OPEN/CLOSE/RESET/PING/WINDOW state machines —
+> is fully implemented (M1–M7) and characterized by an executable test suite
 > (`characterization_test.go`, `timeout_test.go`, `restart_test.go`, and the
 > adapter suites under `transport/`); every §-level guarantee below is pinned
 > by a test, including the adapter duties of §4.4–§4.5. Nothing is released
@@ -21,11 +21,21 @@
 > §6.1) — and reconciled every confirmed spec/implementation divergence.
 > Residual limitations are enumerated in §16.
 >
-> **What v1.0 pins down:** the on-wire encoding and the normative behaviors
-> that two independent implementations must agree on. **What may still evolve
-> compatibly:** timer *defaults* (§10.1), resource *cap* defaults (§15), and
-> additive fields reserved for future work (§5, §10.3) — none change how a
-> conforming peer parses or answers a frame.
+> **v1.1 (2026-07-25)** is the gRPC-fidelity round, and it is a breaking wire
+> change (pre-release, no migration): metadata values became `bytes` so gRPC's
+> binary metadata survives; terminal frames carry `google.rpc.Status.details`;
+> a call may name a message `compressor`; and reliable mode gained **per-stream
+> flow control** (the `window` field and the `WINDOW` flag), which removes the
+> head-of-line blocking a single blocking receiver used to impose on every call
+> sharing its channel. Appendix A lists the deltas.
+>
+> **What this document pins down:** the on-wire encoding and the normative
+> behaviors that two independent implementations must agree on. **What may
+> still evolve compatibly:** timer *defaults* (§10.1), resource *cap* defaults
+> (§15), and additive *fields* reserved for future work (§5, §10.3). **New flag
+> bits are not compatible** — they change how a frame is routed and how its
+> payload is read, which is why §7.1 makes an unimplemented flag a call
+> failure rather than something to ignore.
 
 The key words MUST, MUST NOT, SHOULD, MAY are to be interpreted as in RFC 2119.
 
@@ -135,20 +145,74 @@ type EnvelopHandler interface { Handle(ctx context.Context, e *Envelop) error }
     suited to state-sync streams).
   Both policies preserve the ordered-subsequence contract (§14).
 - **Reliable mode:** dropping would violate the exact-sequence contract
-  (§14), so a receiver MUST NOT drop on a full buffer: `Handle` blocks until
-  the stream buffer drains, bounded by the rx `ctx` (adapter teardown) and by
-  the call's own end (a frame for a finished call is moot). If the rx `ctx`
-  dies mid-delivery the core fails that call loudly (`UNAVAILABLE`) — the
-  frame is gone and a silent gap is not an option. The drop policy is inert
-  in this mode. Adapters on reliable transports SHOULD call `Handle`
-  synchronously from their read loop so that blocking propagates into the
-  transport's own flow control (TCP/SCTP backpressure) — but then the
-  adapter MUST be able to deliver the rx-ctx bound **while `Handle` is
-  blocked**: a blocked read loop reads nothing, so death detection that
-  lives only in the read loop (read errors, read deadlines) can never fire
-  exactly when the bound is needed. Detect death out-of-band — a keepalive
-  write failure, `OnClose`/`OnError` callbacks, a send stall — and cancel
-  the rx ctx from there (the shipped adapters do).
+  (§14), so a receiver MUST NOT drop on a full buffer. Which of the two
+  remaining options applies depends on whether the stream is flow-controlled
+  (§4.2.1):
+  - **Flow-controlled (the normal case):** a conforming sender never exceeds
+    the window it was granted, so a full buffer is a contract violation. The
+    receiver MUST NOT block — it fails **that call** with `INTERNAL`. Blocking
+    here is what flow control exists to remove, and it would deadlock: the
+    grant that would unpark the peer travels the very read loop the block
+    stalls.
+  - **Not flow-controlled** (a peer that advertised no window): `Handle`
+    blocks until the stream buffer drains, bounded by the rx `ctx` (adapter
+    teardown) and by the call's own end (a frame for a finished call is
+    moot). If the rx `ctx` dies mid-delivery the core fails that call loudly
+    (`UNAVAILABLE`) — the frame is gone and a silent gap is not an option.
+  The drop policy is inert in this mode. Adapters on reliable transports
+  SHOULD call `Handle` synchronously from their read loop so that any
+  blocking propagates into the transport's own flow control (TCP/SCTP
+  backpressure) — but then the adapter MUST be able to deliver the rx-ctx
+  bound **while `Handle` is blocked**: a blocked read loop reads nothing, so
+  death detection that lives only in the read loop (read errors, read
+  deadlines) can never fire exactly when the bound is needed. Detect death
+  out-of-band — a keepalive write failure, `OnClose`/`OnError` callbacks, a
+  send stall — and cancel the rx ctx from there (the shipped adapters do).
+
+### 4.2.1 Per-stream flow control (reliable mode)
+
+Message-level flow control, in the shape of HTTP/2's per-stream windows but
+counted in **messages** rather than bytes. It exists for one reason: without
+it the only back-pressure a receiver has is to stall its read loop, and since
+a reliable adapter delivers every call's frames from **one** loop (§4.2), one
+slow consumer stalls every call on the channel — the head-of-line blocking
+gRPC does not have.
+
+- **Scope.** Reliable mode only. Unreliable mode ignores `window` and the
+  `WINDOW` flag entirely: there a full buffer drops by policy, and a peer that
+  cannot be trusted to retransmit cannot be paced.
+- **Advertisement.** A receiver advertises its per-call buffer, in messages,
+  as `Frame.window`:
+  - the client on its **OPEN**;
+  - the server on its **creation-ack `H`** (§8), which is why that ack is
+    mandatory for streaming calls in this mode.
+  A `window` of 0 (absent) means "this peer does no flow control": the sender
+  is then unlimited, and the receiver falls back to the blocking rule above.
+- **Initial window.** Until an advertisement arrives, a sender paces itself by
+  `W_init` = 32 messages (Appendix B), exactly as an HTTP/2 sender assumes
+  65535 bytes before SETTINGS. A receiver in reliable mode MUST therefore
+  buffer at least `W_init` messages per call; implementations raise a smaller
+  configured buffer to it. The advertisement is **authoritative** and replaces
+  the assumption, counted against what the sender has already sent — a smaller
+  window simply parks the sender until the receiver drains.
+- **Grants.** A `WINDOW` frame (§7) carries additive credit for its sid in
+  `window`. A receiver SHOULD grant once the application has consumed at least
+  half the window (one small frame per window/2 messages); it MUST grant
+  whenever the sender could otherwise starve. A receiver MUST NOT grant after
+  its call has ended, and a `WINDOW` frame for an unknown, finished or
+  tombstoned sid MUST be dropped **silently** — never answered with a RESET
+  (§9.3), since a grant legitimately races the call's end.
+- **Sending.** A sender consumes one credit per **data frame**. `OPEN`, `H`,
+  `T`, half-close, abort, RESET, PING and WINDOW frames are never credited:
+  they are not buffered, and crediting them would make a call at zero credit
+  unable to terminate (G1). A sender with no credit parks — bounded by the
+  call's own ctx/deadline, by the call ending, and by `T_stall` (§10.1), after
+  which the call fails `UNAVAILABLE`. That bound is load-bearing: reliable
+  mode runs no protocol timers and the park happens before the adapter's write
+  path, so nothing else would ever break it.
+- **A grant never enables flow control by itself.** Only an advertisement
+  does. Otherwise a single stray, duplicated or injected `WINDOW` frame could
+  park a sender that was never flow-controlled (§15).
 - An adapter's tx `Handle` SHOULD apply backpressure (e.g. WebRTC
   `OnBufferedAmountLow`), bounded by `ctx`. In **reliable mode** the core
   runs no timers and does not bound the tx ctx, so the adapter MUST bound a
@@ -228,6 +292,14 @@ Non-normative sizing guidance for adapter authors: UDP ≈1200 B (below typical
 path MTU); WebRTC unreliable ≈1200 B; WebRTC reliable 16 KiB (SCTP-friendly);
 WebSocket unlimited. These are adapter defaults, not protocol constants.
 
+**Two ceilings, two axes.** The adapter's limit measures the marshaled
+*Envelop* — frame headers, method string, metadata and framing included — and
+is a property of the channel. The per-call limits of the gRPC surface
+(`MaxCallRecvMsgSize` / `MaxCallSendMsgSize`) measure one *message*, after
+compression on the way out and after decompression on the way in, and are an
+application guard. Neither implies the other: a 1200-byte send cap still
+overflows a 1200-byte datagram budget once the frame around it is counted.
+
 ### 4.5 Adapter teardown duty
 
 Connection-oriented adapters (WebSocket, DataChannel) MUST detect transport
@@ -252,7 +324,9 @@ message Frame {
   fixed32 epoch        = 1;   // sender's incarnation nonce (§6.1); RESET echoes instead (§9.3).
   fixed32 sid          = 2;   // stream id (§6.2). 0 = peer-scope control (PING).
   fixed32 seq          = 3;   // per-stream, per-direction sequence (§6.3).
-  uint32  flags        = 4;   // bitmask: 1=OPEN 2=CLOSE 4=RESET 8=PING (§7).
+  uint32  flags        = 4;   // bitmask: 1=OPEN 2=CLOSE 4=RESET 8=PING
+                              // 16=WINDOW 32=COMPRESSED (§7); the frame's
+                              // shape is flags & 0x1F (§7.1).
   string  method       = 5;   // full method name; OPEN frames only (§13).
   reserved 6;                 // was method_index; removed pre-release (§13).
   string  codec        = 7;   // codec name; OPEN frames only; "" = proto (§12).
@@ -263,9 +337,17 @@ message Frame {
   Metadata header      = 12;  // §11.
   Metadata trailer     = 13;  // §11.
   fixed32 peer_epoch   = 14;  // client-incarnation echo (§6.1); RESET re-echoes it (§9.3).
+  uint32  window       = 15;  // flow-control credit, in messages (§4.2.1).
+  string  compressor   = 16;  // message compressor name; OPEN only (§12.1).
+  repeated google.protobuf.Any details = 17;  // google.rpc.Status.details (§5).
 }
 
 message Envelop { repeated Frame frames = 1; }
+
+message Metadata {                      // §11
+  message Entry { repeated bytes values = 1; }
+  map<string, Entry> entries = 1;
+}
 ```
 
 Notes:
@@ -288,10 +370,27 @@ Notes:
   server resets exactly that incarnation's call (§9.3). Client→server call
   frames leave it 0 — their field 1 already names the incarnation. 0 means
   "absent" — which is why an epoch is never 0 (§6.1).
-- Only `code` and `desc` travel: rich status details
-  (`google.rpc.Status.details`, `status.WithDetails`) are silently dropped.
-  Known gap — an additive details field (`google.rpc.Status`) on terminal
-  frames is reserved future work.
+- `details` carries what `status.WithDetails` attaches, on terminal frames
+  only; a receiver rebuilds the status from `code`+`desc`+`details`. Details
+  are a **passenger**: a terminal frame the channel refuses as too large
+  (§4.4) MUST be re-sent without them, and if it still does not fit, as a bare
+  `RESOURCE_EXHAUSTED` terminal. Every termination path depends on the
+  terminal arriving (§10.7), so nothing may cost it.
+- `window` is a count of **messages**, never bytes (§4.2.1). `compressor`
+  names a message compressor for the whole call, like `codec` (§12.1).
+- **Metadata values are `bytes`, not text** (§11). gRPC's binary metadata
+  (`-bin` keys) carries arbitrary octets, which a proto `string` cannot hold;
+  `bytes` and `string` share wire type 2, so text metadata encodes
+  byte-identically either way. Three presence facts are load-bearing and a
+  port must reproduce them: a **present but empty** `Metadata` message (`62
+  00` for `header`) is what an explicit `SendHeader` with no metadata emits,
+  and is distinct from an absent field (§7, §11); an `Entry` with **no**
+  values is distinct from an absent key; and a **zero-length value** is a
+  present value.
+- Map entry order is **not** significant and MUST NOT be relied on: proto map
+  serialization is unordered. Implementations that need reproducible bytes
+  (golden vectors) marshal deterministically.
+- The next free field number is 18.
 
 ## 6. Identity
 
@@ -340,8 +439,9 @@ Notes:
   abort, and header frames**. Retransmitted control frames (§10.3) and
   replayed `H`/`T` frames (§9.2, §10.3) reuse their original `seq`
   (idempotence).
-- Stateless frames — RESET, and PING of either scope — carry `seq = 0` and
-  bypass seq validation.
+- Stateless frames — RESET, PING of either scope, and WINDOW — carry
+  `seq = 0` and bypass seq validation. A WINDOW frame therefore neither
+  advances nor is checked against the window, in strict mode included.
 - **Validation** (per stream, per direction; `L` = highest accepted seq.
   Server direction of a call: `L` is initialized by the accepted OPEN, whose
   seq MUST be 1. Client side, for server-sent frames: `L` initializes to 0 and
@@ -437,8 +537,25 @@ next connection from any stragglers of the previous one.
 | `CLOSE` (2) | both | Sender's direction is finished. **Without `code`** (client only): half-close; the call continues. **With `code`**: terminal — from the server it is the call's result, carrying `trailer` **and `header`** (§11); from the client it is an abort. MAY carry `payload` only where a §8 shape shows it; payload is processed before the close takes effect. |
 | `RESET` (4) | both | Stateless "I have no such call". `epoch` **echoes the offending frame's epoch** and `peer_epoch` re-echoes its `peer_epoch` (§9.3); no payload, `seq = 0`. |
 | `PING` (8) | both | `sid = 0`: peer keepalive (§10.4). `sid ≠ 0`: **stream probe** (§10.5). `seq = 0`, no payload, never delivered to the application. A probe does **not** count as the "first server frame" of §10.3. |
+| `WINDOW` (16) | both | Stateless flow-control grant for `sid`: `window` adds that many messages of credit (§4.2.1). `seq = 0`, no payload, never delivered to the application, reliable mode only. |
+| `COMPRESSED` (32) | both | **Modifier, not a shape** (§7.1): `payload` is compressed with the call's compressor (§12.1). May ride any payload-bearing frame, including a terminal. |
 
-Frames with no flags:
+### 7.1 Shape and modifier bits
+
+- `SHAPE_MASK` = `OPEN|CLOSE|RESET|PING|WINDOW` = `0x1F`. A frame's **shape**
+  is `flags & SHAPE_MASK`. Every routing decision, every §8 conformance check
+  and every drop-and-count rule in this document is made on the **shape**,
+  never on the whole bitmask — a compressed data frame is still a data frame.
+- The legal shapes are exactly: `0`, `OPEN`, `CLOSE`, `OPEN|CLOSE`, `RESET`,
+  `PING`, `WINDOW`. Any other combination is unroutable.
+- Bits outside `SHAPE_MASK` are **modifiers**; `COMPRESSED` is the only one
+  defined. A receiver that meets an unroutable shape, or a modifier it does
+  not implement, MUST NOT deliver the frame and MUST NOT silently drop it:
+  it fails the call with `INTERNAL`. Delivering would corrupt (the bit changes
+  what the payload means); dropping would be a silent gap, which §14 forbids
+  in reliable mode and §6.3's window would hide in unreliable mode.
+
+Frames with no shape flags:
 
 - **data frame** — payload **present** (even if 0 bytes): one stream message.
 - **header frame `H`** — payload **absent**: delivers server header MD (§11)
@@ -449,6 +566,9 @@ Frames with no flags:
 
 A unary or client-streaming client that receives a payload-bearing data frame
 (its shape has none) drops and counts it.
+
+`H` and `OPEN` frames additionally carry the flow-control advertisement of
+§4.2.1 in `window` when the sending side is in reliable mode.
 
 ## 8. Call shapes (canonical and mandatory)
 
@@ -499,6 +619,13 @@ Rules:
   frame is emitted right away. This stops the client's OPEN retransmission
   (§10.3); `Header()` unblocking follows §11 (header-present frame or `T`).
   Unary is exempt — its OPEN retransmission is bounded by the call deadline.
+  **In reliable mode the ack is mandatory even for SS**, because it carries
+  the flow-control advertisement (§4.2.1).
+- **Unary header flush.** A unary handler that flushes header metadata
+  (`SendHeader`, §11) emits an `H` before its terminal, so a client blocked in
+  `Header()` is released before the response exists — gRPC's separate HEADERS
+  frame, in this protocol's shape. A unary call that never flushes keeps the
+  single-frame shape above; either way `T` re-carries the header.
 - **Ack recovery.** On receiving a **duplicate OPEN** (seq-1 dedup) for a live
   streaming call, the server MUST respond with `H` — the stored creation `H`
   replayed byte-identically if one exists, else a freshly-seq'd `H` carrying
@@ -536,6 +663,10 @@ On every received frame, in order:
    §9.3) so the desynced server stops that call; a foreign keepalive
    (`PING sid=0`) is simply dropped. Such frames refresh no liveness.
 4. `PING sid=0` → refresh peer liveness (§10.4); done.
+   `WINDOW` (any sid) → in reliable mode, credit the named call and stop; in
+   unreliable mode, drop. A WINDOW for an unknown, finished or tombstoned sid
+   is dropped **silently** — it never draws a RESET and never refreshes
+   liveness (§4.2.1).
 5. Resolve (peer, client-epoch, sid) [server] / (sid) [client]:
    a. **live stream** → `PING sid≠0` is a probe: no-op beyond liveness
       (§10.5). Duplicate OPEN on a live streaming call → replay `H` (§8).
@@ -560,7 +691,9 @@ that creates a call **or draws a rejection terminal** (§9.4 — the peer is
 manifestly alive and mid-conversation, even when the answer is
 `UNIMPLEMENTED`/`RESOURCE_EXHAUSTED`), (iii) a tombstone hit, or (iv) a
 well-formed PING of either scope. Unknown-sid frames, watermark-RESET OPENs,
-beyond-window drops, RESETs, and malformed frames are **not** validated.
+beyond-window drops, RESETs, WINDOW frames, and malformed frames are **not**
+validated — a flow-control grant says nothing about the peer's liveness, and
+it exists only in the mode where liveness is the adapter's job anyway.
 Peer liveness (§10.4) and the idle clocks (§10.5) advance on validated
 frames only — junk floods cannot keep a ghost peer alive.
 
@@ -581,7 +714,8 @@ frames only — junk floods cannot keep a ghost peer alive.
   preserve dedup:
   - **Byte cap:** the oldest stored terminals degrade to key-only entries
     (sid dedup preserved; replay lost — that call falls back to timeout
-    behavior).
+    behavior). The cap counts the **whole stored frame**, not just its
+    payload: status details (§5) and trailer metadata cost the same memory.
   - **Entry cap:** the lowest-sid entry is evicted and the container's
     **tombstone floor** rises to that sid. sids are monotonic per incarnation
     (§6.2), so every sid at or below the floor keeps key-only semantics —
@@ -692,8 +826,10 @@ frames only — junk floods cannot keep a ghost peer alive.
 | `TTL_tomb` | 30 s (floors: §9.2) | Tombstone lifetime; also the watermark age gate (§9.4). |
 | `W_fwd` / `K_loud` | 4096 / 3 | seq window / fail-loud threshold (§6.3). |
 | `T_hold` | `RTI` | Delayed-RESET grace (§9.3). |
+| `T_stall` | 30 s | Longest a send may wait for flow-control credit before the call fails `UNAVAILABLE` (§4.2.1). **Runs in reliable mode too** — it is the only bound a parked sender has there. |
+| `W_init` | 32 messages | Initial per-stream window a sender assumes before the peer advertises (§4.2.1); also the minimum reliable-mode rx buffer. |
 
-The timers — `T_call`, `T_live`, `RTI`, `TTL_tomb`, `T_hold` — are
+The timers — `T_call`, `T_live`, `RTI`, `TTL_tomb`, `T_hold`, `T_stall` — are
 option-overridable (`WithTiming`); `T_probe` is derived from `T_live`.
 `W_fwd` and `K_loud` are **fixed protocol constants** (receiver-local, not
 option-tunable — a knob would buy nothing but a config surface two
@@ -838,7 +974,8 @@ ends disagree.
 | Aged watermark | on (`hwm_aged`, §9.4) | on, degenerate: plain `sid > hwm`, no aging/checkpoints; state until adapter teardown (§9.4) |
 | `T_hold` | `RTI` | **0** — RESET immediately; no reordering exists |
 | seq validation | window + fail-loud (§6.3) | any gap or duplicate = broken transport: **fail the call with `INTERNAL`** (fail loud) |
-| rx buffering | drop per policy (§4.2) | `Handle` MAY block (transport flow control) |
+| rx buffering | drop per policy (§4.2) | per-stream flow control (§4.2.1); `Handle` blocks only for a peer that advertises no window |
+| Flow control (`window`, WINDOW) | **off** — ignored entirely | **on**: advertise, grant, park; `T_stall` bounds a parked sender |
 | Liveness responsibility | protocol (PING) | **adapter** (§4.5) — non-optional |
 
 ### 10.7 Termination bounds (G1, testable)
@@ -864,10 +1001,29 @@ With defaults, in unreliable mode:
 | > `W_fwd` loss burst on a live stream | ≤ `K_loud` beyond-window arrivals — including byte-identical `T` replays (§6.3) — each elicited within ~`max(RTI, T_probe)` | + `TTL_tomb` |
 
 In reliable mode every row reduces to "when the adapter reports transport
-death" (§4.5) or the call's own completion — identical to gRPC-over-TCP.
+death" (§4.5), the call's own completion, or — for a send parked on
+flow-control credit — `T_stall` (§4.2.1). That is the one bound reliable mode
+owns itself, and it exists because the park happens before the adapter's write
+path, where its write deadline would otherwise have been the backstop.
 
 ## 11. Metadata
 
+- **Representation.** Keys are strings; values are **bytes** (§5). A key
+  ending in `-bin` carries arbitrary octets — gRPC's binary metadata — and a
+  language binding surfaces it in whatever form is idiomatic there (grpc-go
+  keeps the raw octets in a string; the TypeScript port base64s them). Every
+  other key's values are printable ASCII text.
+- **Validation, mirroring gRPC.** A key MUST be non-empty and drawn from
+  `[0-9 a-z _ - .]`; the values of a non-`-bin` key MUST be printable ASCII
+  (`%x20-%x7E`); `-bin` values are unvalidated. A sender MUST reject a
+  violation locally, with `INTERNAL`, naming the key — never by failing an
+  encode deep inside an adapter. Credential-produced metadata (§15) goes
+  through the same gate.
+- **Receiving non-conforming metadata.** A receiver MUST NOT fail the call or
+  crash on a value its binding cannot represent — a hostile peer must not be
+  able to break a call by sending one. It surfaces whatever its language
+  allows (raw octets in Go, a base64 or replacement-charactered string in a
+  JS runtime) and never rejects the frame for it.
 - Request header MD rides **only** the OPEN frame (retransmissions carry it
   again); a call can never start without its metadata.
 - Server header MD rides the **first server frame sent after the handler sets
@@ -876,14 +1032,21 @@ death" (§4.5) or the call's own completion — identical to gRPC-over-TCP.
   **and `T` always carries it again once set** (so the header survives
   first-frame loss at trailer time; `H` is additionally replayable, §8).
   Frames sent before the handler sets a header carry the field **absent**.
-- `SendHeader` flushes immediately as an `H` frame on **streaming** calls;
-  a unary call has a single response frame, so its `SendHeader` behaves as
-  `SetHeader` and the MD rides `T` (§8). `SetHeader` defers to the next
-  outgoing frame.
+- `SendHeader` flushes immediately as an `H` frame — on **streaming and
+  unary calls alike** (§8), so a client's `Header()` returns before the
+  response exists, as it does on gRPC. The flushed `H` carries the header
+  field **present** even when the handler set no metadata; that is what
+  releases `Header()`. `SetHeader` defers to the next outgoing frame.
+  Flushing twice is an error (`INTERNAL`), and the core's own creation ack is
+  not a flush.
 - `Header()` (client) blocks until the first accepted server frame with
   header MD **present**, or the terminal frame — and returns the latched MD
-  (nil if the call ended without one). Per grpc-go contract it never returns
-  the call's status error. Implementation note: rx-header and tx-header are
+  (nil if the call ended without one). It never returns the call's status
+  error, and never a context error: a cancelled caller ends the call through
+  the abort path, which releases both waits, so the result does not depend on
+  which fires first. Divergence worth knowing: because `T` always re-carries
+  the header (below), `Header()` returns metadata here where gRPC's
+  trailers-only response would yield nil. Implementation note: rx-header and tx-header are
   separate fields with a `headerReady` signal (the v0 single `s.header` field
   cannot express this).
 - Trailer rides only `T`. Duplicate `T`s are dropped by dedup/tombstone rules
@@ -898,6 +1061,27 @@ death" (§4.5) or the call's own completion — identical to gRPC-over-TCP.
 - `""` means `proto`. The client always knows its own codec locally (default
   or `ForceCodecV2` at call creation), so `T`-with-payload decoding is
   well-defined on both sides.
+
+### 12.1 Compression
+
+- A call MAY name a message **compressor** on its OPEN (`compressor`, "" =
+  none). Like the codec it governs the whole call, both directions.
+- A frame whose payload is actually compressed carries the `COMPRESSED`
+  modifier (§7.1). The decision is per frame: a sender MUST NOT compress a
+  payload that would grow (already-compressed or tiny messages), and MUST NOT
+  compress an empty payload — a 0-byte message is meaningful (§5, §7).
+- Compression is **per message and stateless**. A shared stream dictionary is
+  forbidden: in unreliable mode a lost message would make every later one
+  undecodable.
+- An unknown compressor at the server → `T{UNIMPLEMENTED}`, tombstone-stored,
+  exactly like an unknown codec.
+- A receiver MUST bound decompression by its receive size cap and fail
+  `RESOURCE_EXHAUSTED` past it, so a compression bomb costs nothing.
+- Interop baseline: an implementation that supports compression at all SHOULD
+  support `gzip`; a peer that does not know the named compressor answers
+  `UNIMPLEMENTED`, so nothing silently degrades.
+- Compression happens **below** the size caps of §16/gRPC parity: a send cap
+  measures the compressed bytes, a receive cap the decompressed message.
 
 ## 13. Method addressing
 
@@ -952,12 +1136,19 @@ At-most-once residuals (stated honestly):
   `DEADLINE_EXCEEDED` — as in gRPC, deadline expiry does not undo server work.
 
 Gap visibility: the receiver counts skipped messages per stream (seq deltas)
-and exposes the counter — alongside per-stream drop and per-peer RESET
-counters — through the planned stats surface (M6); applications that
-react to gaps (e.g. request a snapshot) read it there rather than
-reimplementing sequencing. Applications that cannot tolerate gaps at all must
-use a reliable transport. This is the documented, intentional difference from
-gRPC.
+and exposes the counter — alongside per-stream drop, per-peer RESET,
+retransmission, probe, liveness-expiry, tombstone-replay and flow-stall
+counters — through the **protocol stats surface**, which is implemented:
+an endpoint takes an observer (`WithProtocolStats`) and a ready-made counter
+sink. Applications that react to gaps (e.g. request a snapshot) read it there
+rather than reimplementing sequencing. Applications that cannot tolerate gaps
+at all must use a reliable transport. This is the documented, intentional
+difference from gRPC.
+
+Endpoints additionally accept a **gRPC `stats.Handler`** (`WithStatsHandler`),
+so existing gRPC instrumentation observes drpc calls unchanged: `Begin`,
+`In/OutHeader`, `In/OutPayload`, `In/OutTrailer`, `End`, with the payload
+lengths split into message size and wire size (§12.1).
 
 ## 15. Security & resource bounds
 
@@ -982,6 +1173,11 @@ gRPC.
   per-method rx buffer sizes (§4.2). `W_fwd`/`K_loud` are fixed protocol
   constants (§10.1). Message size is bounded by the adapter (§4.4), not by a
   core knob.
+- Flow-control credit is bounded too (§4.2.1): a grant never enables flow
+  control by itself, so a stray or injected `WINDOW` cannot park a sender that
+  was never paced; the credit accumulator saturates rather than wrapping; and
+  a receiver never advertises more than it can buffer, so the memory a peer
+  can pin per call stays its own configured buffer.
 - RESET never attests liveness (§9.1); junk floods cannot keep a ghost peer
   alive. Forging a `K_loud` fail-loud run requires sniffing live (epoch, sid,
   seq≈L) — no cheaper than the single forged RESET the threat model already
@@ -1003,8 +1199,19 @@ transport.
 | L1 | **Ordered subsequence, not the exact sequence** | any dropped / reordered / over-buffered data frame, unreliable mode | silent gap, no error until the terminal (skip count via the planned stats surface, §14) | the sensor trade; move to a reliable transport (the mode changes at both ends, §10.6) or an idempotent/superseding stream if every message matters |
 | L2 | **At-most-once is per server incarnation** | server restart (new epoch) mid-call, or a whole epoch container evicted under the §15 container cap before a > `TTL_tomb`-delayed duplicate arrives | handler may run a second time — dedup state did not survive | bounded to the incarnation; make handlers idempotent if cross-restart duplicates are unacceptable. (Tombstone *entry*-cap pressure no longer opens this window: the container floor keeps dedup, §9.2 — cap pressure costs replays only.) |
 | L3 | **No wire authentication** (§15) | raw-UDP attacker who can sniff a live `(epoch, sid, seq)` and inject datagrams | a forged same-epoch RESET kills a call; a forged `K_loud` run forces `DATA_LOSS` | deploy over DTLS / WSS / WebRTC (encrypted → unreachable). Incarnation isolation is closed in both directions (§6.1: server keying c→s, `peer_epoch` echo s→c, the server-epoch stream lock); same-epoch injection is the transport's job |
-| L6 | **Status details dropped** | handler returns `status.WithDetails(...)` | `code`+`desc` travel; the details payload does not | put detail in the message string or trailer metadata; a details field is reserved future work (§5) |
+| L6 | **Status details are a passenger** | a terminal frame that would not fit the channel (§4.4) | `code`+`desc` always travel; the details are dropped to keep the terminal sendable, and a still-oversize terminal degrades to a bare `RESOURCE_EXHAUSTED` | keep details small; the terminal is what every termination bound depends on (§10.7) |
 | L7 | **Best-effort, single-datagram messages** | porting code that needs `WaitForReady`, transparent retry, per-RPC size override, or large/fragmented messages | none of these exist; the core never fragments, and an unreliable adapter rejects a message that doesn't fit its datagram at send with `ResourceExhausted` (§4.4); batched frames fate-share | set explicit deadlines; keep messages within a datagram; don't batch messages that must survive independently |
+
+**Resolved in v1.1:** rich status details now travel (§5); gRPC's binary
+metadata survives the wire (§11); a call may compress its messages (§12.1);
+and reliable mode gained per-stream flow control (§4.2.1), which removes the
+head-of-line blocking a single blocking receiver used to impose on every call
+sharing a channel — the back-pressure now lands on the sender, as it does in
+HTTP/2. New residuals it introduces, all bounded and stated: a sender parked
+on credit is bounded only by `T_stall` (§10.1); a reliable-mode receiver's rx
+buffer has a floor of `W_init` (§4.2.1); and a peer that overruns its
+advertised window fails **that call** with `INTERNAL` rather than stalling the
+channel.
 
 **Resolved in v1.0 (were blockers L4/L5):** the per-peer live-call cap
 (§15, `Limits.MaxLiveCalls`) and reliable-mode strict-seq fail-loud (§10.6)
@@ -1045,6 +1252,19 @@ Wire (all breaking; pre-v1.0, no migration):
    hole across a client restart (§6.1) and makes RESET surgical (§9.3).
    Epochs are nonzero from here on.
 
+v1.1 (2026-07-25), breaking, pre-release:
+
+7. `Metadata.Entry.values` `string` → `bytes` — gRPC binary metadata (`-bin`)
+   could not be represented and failed the encode outright (§11).
+8. `Frame.window` (15) + the `WINDOW` flag (16): per-stream flow control in
+   reliable mode (§4.2.1). `Frame.compressor` (16) + the `COMPRESSED` flag
+   (32): per-message compression (§12.1). `Frame.details` (17): rich status
+   details on terminal frames (§5).
+9. Flag semantics split into **shape** and **modifier** bits with a mask
+   (§7.1); every routing decision moved onto the shape.
+10. The unary shape may now carry an `H` before its `T` when the handler
+    flushes a header (§8, §11).
+
 Behavioral:
 
 6. Client EOF = server `T` frame (was: inferred from `code=OK` + empty
@@ -1075,7 +1295,10 @@ Behavioral:
 | `TTL_tomb` (also watermark age) | 30 s (floors §9.2) | reliable mode (state lives until teardown) |
 | `W_fwd` / `K_loud` | 4096 / 3 | — (fixed protocol constants, §10.1; reliable mode uses the strict gap check instead) |
 | `T_hold` (delayed RESET) | `RTI` | reliable mode: 0 (immediate) |
-| rx buffer / policy | 32 frames / `DropNewest` | endpoint-wide `WithRxBuffer`, per-method `WithMethodRxBuffer` (server) — §4.2; reliable mode blocks instead of dropping |
+| `T_stall` (flow-control park) | 30 s | — (runs in both modes; only reachable in reliable, §4.2.1) |
+| `W_init` (assumed window) | 32 messages | unreliable mode (flow control is off there) |
+| rx buffer / policy | 32 frames / `DropNewest` | endpoint-wide `WithRxBuffer`, per-method `WithMethodRxBuffer` (server) — §4.2; in reliable mode the size is also the advertised window and is floored at `W_init` |
+| message size caps (per call) | recv 4 MiB / send unlimited | `WithMaxRecvMsgSize` / `WithMaxSendMsgSize`, or gRPC's per-call options — gRPC's own defaults |
 | message size | adapter-enforced (§4.4); the core is size-agnostic | — |
 | `WithMaxHandlerTimeout` | off | — (setting it is the opt-in, §10.2) |
 
