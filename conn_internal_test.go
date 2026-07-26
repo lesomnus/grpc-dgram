@@ -24,7 +24,7 @@ func TestSidExhaustionLatch(t *testing.T) {
 	c.mu.Unlock()
 
 	// The last sid of the space is still allocatable.
-	s, err := c.newStream(context.Background(), "/a.B/C", false, false)
+	s, err := c.newStream(context.Background(), "/a.B/C", c.newCallInfo(), false, false)
 	if err != nil {
 		t.Fatalf("the final sid must still be allocatable: %v", err)
 	}
@@ -35,7 +35,7 @@ func TestSidExhaustionLatch(t *testing.T) {
 	// The next allocation wraps sidNext to 0: the space is spent. sids are
 	// never recycled within an epoch (§6.2) — RESOURCE_EXHAUSTED, and the
 	// exhausted latch trips.
-	_, err = c.newStream(context.Background(), "/a.B/C", false, false)
+	_, err = c.newStream(context.Background(), "/a.B/C", c.newCallInfo(), false, false)
 	if got := status.Code(err); got != codes.ResourceExhausted {
 		t.Fatalf("expected ResourceExhausted at sid wrap, got %v (err=%v)", got, err)
 	}
@@ -49,7 +49,7 @@ func TestSidExhaustionLatch(t *testing.T) {
 	// Sticky: every later attempt fails the same way; the application must
 	// create a new Conn (new epoch) to keep calling.
 	for i := range 3 {
-		_, err := c.newStream(context.Background(), "/a.B/C", false, false)
+		_, err := c.newStream(context.Background(), "/a.B/C", c.newCallInfo(), false, false)
 		if got := status.Code(err); got != codes.ResourceExhausted {
 			t.Fatalf("attempt %d: the latch must be sticky, got %v (err=%v)", i, got, err)
 		}

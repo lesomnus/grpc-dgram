@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
@@ -117,6 +118,7 @@ type clientStream struct {
 	clientStreams bool
 	serverStreams bool
 
+	ci        *callInfo
 	codec     encoding.CodecV2
 	codecName string
 
@@ -171,7 +173,7 @@ type clientStream struct {
 	termPayload atomic.Bool
 }
 
-func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, clientStreams, serverStreams bool) *clientStream {
+func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, ci *callInfo, openHdr metadata.MD, clientStreams, serverStreams bool) *clientStream {
 	rxCfg := c.rx.withDefaults()
 	s := &clientStream{
 		conn: c,
@@ -181,18 +183,23 @@ func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, cl
 		clientStreams: clientStreams,
 		serverStreams: serverStreams,
 
-		codec:     defaultCodec,
+		ci:        ci,
+		codec:     ci.codec,
+		codecName: ci.codecName,
 		callerCtx: ctx,
+		openHdr:   openHdr,
 
 		rx:       make(chan *Frame, rxCfg.size),
 		rxCfg:    rxCfg,
 		hdrReady: make(chan struct{}),
 		done:     make(chan struct{}),
 	}
-	if md, ok := metadata.FromOutgoingContext(ctx); ok {
-		s.openHdr = md
-	}
 	s.rxWin.strict = c.mode.reliable
+	if c.peer != nil {
+		// grpc-go's ClientStream.Context() names the peer; interceptors read
+		// it with the standard peer.FromContext (§6.4).
+		ctx = peer.NewContext(ctx, c.peer)
+	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
 	n := nowNano()
@@ -203,6 +210,46 @@ func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, cl
 	// terminal CLOSE and finish the call locally at once.
 	s.stopAfter = context.AfterFunc(ctx, s.abortFromCtx)
 	return s
+}
+
+// finalErr is the call's outcome as a gRPC status error (nil on success).
+// Valid only once done is closed.
+func (s *clientStream) finalErr() error {
+	if s.termErr != nil {
+		return s.termErr
+	}
+	if s.term != nil && codes.Code(s.term.GetCode()) != codes.OK {
+		return s.term.Err()
+	}
+	return nil
+}
+
+// reportFinish runs the completion side effects gRPC promises to have applied
+// by the time the caller sees the result: the grpc.Peer call option and the
+// grpc.OnFinish callbacks. It runs before done closes, which is what makes
+// them observable on return.
+func (s *clientStream) reportFinish() {
+	err := s.finalErr()
+	if p := s.conn.peer; p != nil {
+		for _, out := range s.ci.peerOut {
+			*out = *p
+		}
+	}
+	for _, f := range s.ci.onFinish {
+		f(err)
+	}
+}
+
+// recvInto delivers one received frame to the application: size-capped
+// (grpc.MaxCallRecvMsgSize), then unmarshaled. A message past the cap fails
+// the call, as it does on gRPC.
+func (s *clientStream) recvInto(f *Frame, m any) error {
+	if err := checkRecvSize(len(f.GetPayload()), s.ci.maxRecv); err != nil {
+		s.sendAbort(codes.ResourceExhausted)
+		s.finishLocal(err)
+		return err
+	}
+	return f.unmarshal(m, s.codec)
 }
 
 // handleRx processes one server frame for this stream. Called by Conn.Handle;
@@ -383,6 +430,13 @@ func (s *clientStream) send(m any) error {
 		s.txMu.Unlock()
 		return err
 	}
+	payload := buf.Materialize()
+	buf.Free()
+	if err := checkSendSize(len(payload), s.ci.maxSend); err != nil {
+		// grpc.MaxCallSendMsgSize: refused locally, nothing reaches the wire.
+		s.txMu.Unlock()
+		return err
+	}
 
 	var f *Frame
 	if !s.txOpened {
@@ -396,8 +450,7 @@ func (s *clientStream) send(m any) error {
 	} else {
 		f = s.nextFrame()
 	}
-	f.SetPayload(buf.Materialize())
-	buf.Free()
+	f.SetPayload(payload)
 	s.txMu.Unlock()
 
 	// Transmit outside txMu: a blocking adapter must not stall the whole
@@ -476,12 +529,12 @@ func (s *clientStream) RecvMsg(m any) error {
 	// delivered in order even after done closes.
 	select {
 	case f := <-s.rx:
-		return f.unmarshal(m, s.codec)
+		return s.recvInto(f, m)
 	default:
 	}
 	select {
 	case f := <-s.rx:
-		return f.unmarshal(m, s.codec)
+		return s.recvInto(f, m)
 	case <-s.done:
 	case <-s.ctx.Done():
 		// The stream ctx is cancelled as part of finishing; prefer the
@@ -494,7 +547,7 @@ func (s *clientStream) RecvMsg(m any) error {
 	}
 	select {
 	case f := <-s.rx:
-		return f.unmarshal(m, s.codec)
+		return s.recvInto(f, m)
 	default:
 	}
 	return s.terminalRecv(m)
@@ -511,7 +564,7 @@ func (s *clientStream) terminalRecv(m any) error {
 	if f.HasPayload() && s.termPayload.CompareAndSwap(false, true) {
 		// Terminal payload (unary response, SendAndClose result) is
 		// delivered once; the next Recv reports end-of-stream.
-		return f.unmarshal(m, s.codec)
+		return s.recvInto(f, m)
 	}
 	return io.EOF
 }
@@ -583,6 +636,10 @@ func (s *clientStream) sendAbort(code codes.Code) {
 func (s *clientStream) finishTerm(f *Frame) {
 	s.doneOnce.Do(func() {
 		s.term = f
+		// The completion side effects run BEFORE done closes: gRPC promises
+		// grpc.Peer(&p) and OnFinish are observable once the call returns,
+		// and done closing is exactly what lets the caller return.
+		s.reportFinish()
 		// done must close before release cancels the stream ctx, so waiters
 		// racing between the two observe the terminal, not a cancellation.
 		close(s.done)
@@ -594,6 +651,7 @@ func (s *clientStream) finishTerm(f *Frame) {
 func (s *clientStream) finishLocal(err error) {
 	s.doneOnce.Do(func() {
 		s.termErr = err
+		s.reportFinish()
 		close(s.done)
 		s.release()
 	})
@@ -733,6 +791,10 @@ type serverStream struct {
 	rxDropped atomic.Uint32
 	eofOnce   sync.Once
 	rxEOF     chan struct{}
+
+	// Per-call size caps (grpc.MaxRecvMsgSize / MaxSendMsgSize).
+	maxRecv int
+	maxSend int
 }
 
 func newServerStream(ctx context.Context, srv *Server, key callKey, desc *serviceDesc, codec encoding.CodecV2, rxCfg rxConfig, reliable bool) *serverStream {
@@ -747,6 +809,8 @@ func newServerStream(ctx context.Context, srv *Server, key callKey, desc *servic
 		rxCfg: rxCfg,
 		rxEOF: make(chan struct{}),
 	}
+	s.maxRecv = srv.maxRecv
+	s.maxSend = srv.maxSend
 	s.rxWin.l = 1 // the accepted OPEN
 	s.rxWin.strict = reliable
 	n := nowNano()
@@ -960,6 +1024,9 @@ func (s *serverStream) SendMsg(m any) error {
 	}
 	payload := buf.Materialize()
 	buf.Free()
+	if err := checkSendSize(len(payload), s.maxSend); err != nil {
+		return err
+	}
 
 	s.txMu.Lock()
 	if !s.desc.stream.ServerStreams {
@@ -1006,22 +1073,39 @@ func (s *serverStream) undoRefused(f *Frame, err error) {
 func (s *serverStream) RecvMsg(m any) error {
 	select {
 	case f := <-s.rx:
-		return f.unmarshal(m, s.codec)
+		return s.recvInto(f, m)
 	default:
 	}
 	select {
 	case f := <-s.rx:
-		return f.unmarshal(m, s.codec)
+		return s.recvInto(f, m)
 	case <-s.rxEOF:
 		select {
 		case f := <-s.rx:
-			return f.unmarshal(m, s.codec)
+			return s.recvInto(f, m)
 		default:
 		}
 		return io.EOF
 	case <-s.ctx.Done():
 		return ctxErr(s.ctx)
 	}
+}
+
+// recvInto delivers one received frame to the handler: size-capped
+// (grpc.MaxRecvMsgSize), then unmarshaled.
+func (s *serverStream) recvInto(f *Frame, m any) error {
+	if err := checkRecvSize(len(f.GetPayload()), s.maxRecv); err != nil {
+		return err
+	}
+	return f.unmarshal(m, s.codec)
+}
+
+// setResp stores the unary / SendAndClose response payload, which rides the
+// terminal frame (PROTOCOL.md §8).
+func (s *serverStream) setResp(payload []byte) {
+	s.txMu.Lock()
+	s.resp, s.respSet = payload, true
+	s.txMu.Unlock()
 }
 
 // terminalFrame builds T after the handler returned (PROTOCOL.md §8).

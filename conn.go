@@ -8,6 +8,9 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -20,6 +23,18 @@ type Conn struct {
 	mode   mode
 	rx     rxConfig
 	limits Limits
+
+	// Endpoint-wide call defaults; per-call options override them
+	// (see callinfo.go).
+	maxRecv      int
+	maxSend      int
+	creds        []credentials.PerRPCCredentials
+	assumeSecure bool
+	authority    string
+
+	// peer names the remote end when the transport knows it (grpc.Peer,
+	// PROTOCOL.md §6.4).
+	peer *peer.Peer
 
 	mu        sync.Mutex
 	ss        map[uint32]*clientStream
@@ -58,7 +73,18 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 		tombs:   map[uint32]*clientTomb{},
 		resetAt: map[uint32]int64{},
 
+		maxRecv:      sizeOr(opt.maxRecv, defaultMaxRecvMsgSize),
+		maxSend:      sizeOr(opt.maxSend, defaultMaxSendMsgSize),
+		creds:        opt.creds,
+		assumeSecure: opt.assumeSecure,
+		authority:    opt.authority,
+
 		call_opts: []grpc.CallOption{},
+	}
+	// A transport that knows the remote end names it, so grpc.Peer(&p) works
+	// as it does on gRPC (PROTOCOL.md §6.4).
+	if p, ok := tx.(TransportPeer); ok {
+		v.peer = p.Peer()
 	}
 	if opt.call_opts != nil {
 		v.call_opts = append(v.call_opts, opt.call_opts...)
@@ -205,18 +231,18 @@ func (c *Conn) Invoke(ctx context.Context, method string, in, out any, opts ...g
 	}
 	opts = append(c.call_opts, opts...)
 	return c.unary_int(ctx, method, in, out, nil, func(ctx context.Context, method string, in, out any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
-		s, err := c.newStream(ctx, method, false, false)
+		ci, err := c.resolveCallOptions(opts)
 		if err != nil {
 			return err
 		}
-		defer s.abandon()
-
-		for _, opt := range opts {
-			if opt, ok := opt.(grpc.ForceCodecV2CallOption); ok {
-				s.codec = opt.CodecV2
-				s.codecName = opt.CodecV2.Name()
-			}
+		s, err := c.newStream(ctx, method, ci, false, false)
+		if err != nil {
+			// The call never started; grpc-go still runs OnFinish on this
+			// path, and interceptors release resources there.
+			endOfCall(ci, err)
+			return err
 		}
+		defer s.abandon()
 
 		err = nil
 		if serr := s.send(in); serr != nil && serr != io.EOF {
@@ -252,15 +278,14 @@ func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method stri
 	// The stream is created by the innermost streamer so the OPEN frame sees
 	// the interceptor-final ctx and merged call options (PROTOCOL.md §8).
 	streamer := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-		s, err := c.newStream(ctx, method, desc.ClientStreams, desc.ServerStreams)
+		ci, err := c.resolveCallOptions(opts)
 		if err != nil {
 			return nil, err
 		}
-		for _, opt := range opts {
-			if opt, ok := opt.(grpc.ForceCodecV2CallOption); ok {
-				s.codec = opt.CodecV2
-				s.codecName = opt.CodecV2.Name()
-			}
+		s, err := c.newStream(ctx, method, ci, desc.ClientStreams, desc.ServerStreams)
+		if err != nil {
+			endOfCall(ci, err)
+			return nil, err
 		}
 
 		if desc.ClientStreams {
@@ -277,7 +302,23 @@ func (c *Conn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method stri
 	return c.stream_int(ctx, desc, nil, method, streamer, opts...)
 }
 
-func (c *Conn) newStream(ctx context.Context, method string, clientStreams, serverStreams bool) (*clientStream, error) {
+func (c *Conn) newStream(ctx context.Context, method string, ci *callInfo, clientStreams, serverStreams bool) (*clientStream, error) {
+	// Outgoing metadata is validated before the call exists, as grpc-go does:
+	// an illegal key or a non-printable value in a text key must surface as
+	// Internal here, not as a marshal failure inside the adapter (§11).
+	md, _ := metadata.FromOutgoingContext(ctx)
+	if md != nil {
+		if err := validateMD(md); err != nil {
+			return nil, mdStatusErr(err)
+		}
+	}
+	// Per-RPC credentials are a metadata producer; they ride the OPEN like any
+	// request header (§11, §15).
+	md, err := c.applyPerRPCCredentials(ctx, ci, method, md)
+	if err != nil {
+		return nil, err
+	}
+
 	c.mu.Lock()
 
 	if c.closed {
@@ -304,7 +345,7 @@ func (c *Conn) newStream(ctx context.Context, method string, clientStreams, serv
 		c.lastRx.Store(n)
 		c.lastTx.Store(n)
 	}
-	s := newClientStream(ctx, c, c.sidNext, method, clientStreams, serverStreams)
+	s := newClientStream(ctx, c, c.sidNext, method, ci, md, clientStreams, serverStreams)
 	c.ss[s.sid] = s
 	c.mu.Unlock()
 
@@ -323,6 +364,12 @@ type connOption struct {
 	timing   Timing
 	rx       rxConfig
 	limits   Limits
+
+	maxRecv      *int
+	maxSend      *int
+	creds        []credentials.PerRPCCredentials
+	assumeSecure bool
+	authority    string
 }
 
 type ConnOption interface {

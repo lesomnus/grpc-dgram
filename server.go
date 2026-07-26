@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -39,6 +40,10 @@ type Server struct {
 	methodRx          map[string]rxConfig
 	limits            Limits
 
+	// Endpoint-wide call limits (compat.go).
+	maxRecv int
+	maxSend int
+
 	root       context.Context
 	rootCancel context.CancelCauseFunc
 
@@ -58,6 +63,9 @@ type Server struct {
 	// that (PROTOCOL.md §13).
 	serving  atomic.Bool
 	services map[string]*serviceDesc
+	// serviceDescs keeps the registration order per service so
+	// GetServiceInfo can report it the way grpc.Server does.
+	serviceDescs map[string]*grpc.ServiceDesc
 
 	// sawUnreliable latches once any unreliable-mode state exists; until
 	// then the sweeper has nothing it could ever do (reliable peers run no
@@ -92,7 +100,11 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 		livePeer:      map[any]int{},
 		replyBudget:   map[any]*replyBudget{},
 
-		services: map[string]*serviceDesc{},
+		services:     map[string]*serviceDesc{},
+		serviceDescs: map[string]*grpc.ServiceDesc{},
+
+		maxRecv: sizeOr(opt.maxRecv, defaultMaxRecvMsgSize),
+		maxSend: sizeOr(opt.maxSend, defaultMaxSendMsgSize),
 	}
 	v.root, v.rootCancel = context.WithCancelCause(context.Background())
 
@@ -126,6 +138,7 @@ func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
 		return d
 	}
 
+	s.serviceDescs[desc.ServiceName] = desc
 	for i, method := range desc.Methods {
 		d := register(fmt.Sprintf("/%s/%s", desc.ServiceName, method.MethodName))
 		d.service = desc
@@ -143,6 +156,28 @@ func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
 // rxReliable resolves the mode governing a received frame: the adapter's
 // per-channel annotation when present (NewReliableContext, PROTOCOL.md
 // §4.3), else the server's own mode.
+// GetServiceInfo returns the registered services and their methods, the same
+// map grpc.Server exposes — so google.golang.org/grpc/reflection.Register
+// accepts a *drpc.Server unchanged.
+func (s *Server) GetServiceInfo() map[string]grpc.ServiceInfo {
+	out := make(map[string]grpc.ServiceInfo, len(s.serviceDescs))
+	for name, d := range s.serviceDescs {
+		methods := make([]grpc.MethodInfo, 0, len(d.Methods)+len(d.Streams))
+		for _, m := range d.Methods {
+			methods = append(methods, grpc.MethodInfo{Name: m.MethodName})
+		}
+		for _, m := range d.Streams {
+			methods = append(methods, grpc.MethodInfo{
+				Name:           m.StreamName,
+				IsClientStream: m.ClientStreams,
+				IsServerStream: m.ServerStreams,
+			})
+		}
+		out[name] = grpc.ServiceInfo{Methods: methods, Metadata: d.Metadata}
+	}
+	return out
+}
+
 func (s *Server) rxReliable(ctx context.Context) bool {
 	if r, ok := reliableFromContext(ctx); ok {
 		return r
@@ -396,6 +431,17 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	if key.peer != nil {
 		sctx = NewPeerContext(sctx, key.peer)
 	}
+	// Name the remote end the gRPC way as well, so peer.FromContext works for
+	// handlers and interceptors written against gRPC: the adapter's own
+	// *peer.Peer if it attached one, else the peer key when it is an address.
+	if p, ok := peer.FromContext(ctx); ok {
+		sctx = peer.NewContext(sctx, p)
+	} else {
+		// Always non-nil: the universal interceptor idiom is
+		// `p, _ := peer.FromContext(ctx); p.Addr.String()`, and an adapter
+		// with an opaque key still names *something* (§6.4).
+		sctx = peer.NewContext(sctx, peerOf(key.peer))
+	}
 	sctx = newIncomingContext(sctx, f)
 
 	// The client-asserted budget bounds the handler ctx, clamped by the
@@ -544,9 +590,8 @@ func (s *Server) runUnary(st *serverStream, transport *serverTransportUnary, ope
 	var term *Frame
 	defer func() { s.finish(st, term) }()
 
-	dec := func(v any) error {
-		return open.unmarshal(v, st.codec)
-	}
+	// The request rides the OPEN; it is size-capped like any received message.
+	dec := func(v any) error { return st.recvInto(open, v) }
 
 	resp, err := st.desc.method.Handler(st.desc.impl, st.ctx, dec, s.unary_int)
 	if err == nil && st.ctx.Err() != nil {
@@ -571,9 +616,14 @@ func (s *Server) runUnary(st *serverStream, transport *serverTransportUnary, ope
 		if merr != nil {
 			f.setError(status.Errorf(codes.Internal, "marshal response: %v", merr))
 		} else {
-			f.SetPayload(buf.Materialize())
+			payload := buf.Materialize()
 			buf.Free()
-			f.SetCode(uint32(codes.OK))
+			if serr := checkSendSize(len(payload), st.maxSend); serr != nil {
+				f.setError(toStatusErr(serr))
+			} else {
+				f.SetPayload(payload)
+				f.SetCode(uint32(codes.OK))
+			}
 		}
 	}
 
@@ -741,6 +791,9 @@ type serverOption struct {
 	rx                rxConfig
 	methodRx          map[string]rxConfig
 	limits            Limits
+
+	maxRecv *int
+	maxSend *int
 }
 
 type serverOptionFunc func(*serverOption)
