@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package todo;
+
+option go_package = "github.com/lesomnus/grpc-dgram/examples/browser-wasm/todopb";
+
+// TodoService is an ordinary gRPC service — the kind a project's UI is built
+// against. It is served twice from the same handlers: over a WebSocket by a
+// real server process, and inside the browser page by the same code compiled
+// to js/wasm, where a reload restarts it.
+service TodoService {
+  rpc List(ListRequest) returns (ListResponse) {}
+  rpc Add(AddRequest) returns (Task) {}
+  rpc Toggle(ToggleRequest) returns (Task) {}
+  rpc Remove(RemoveRequest) returns (RemoveResponse) {}
+
+  // Watch streams every mutation until the client goes away. It is what makes
+  // the page a subscriber rather than a poller — and the part of a UI that is
+  // most tedious to fake by hand, which is the point of running the real
+  // server in the page.
+  rpc Watch(WatchRequest) returns (stream Event) {}
+}
+
+message Task {
+  uint32 id = 1;
+  string title = 2;
+  bool done = 3;
+}
+
+message ListRequest {}
+
+message ListResponse {
+  repeated Task tasks = 1;
+  // Which process answered: "in-page (wasm)" or the server's address. The page
+  // shows it, so switching transports is visible rather than assumed.
+  string served_by = 2;
+}
+
+message AddRequest {
+  string title = 1;
+}
+
+message ToggleRequest {
+  uint32 id = 1;
+}
+
+message RemoveRequest {
+  uint32 id = 1;
+}
+
+message RemoveResponse {
+  uint32 id = 1;
+}
+
+message WatchRequest {}
+
+message Event {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_ADDED = 1;
+    KIND_CHANGED = 2;
+    KIND_REMOVED = 3;
+  }
+
+  Kind kind = 1;
+  Task task = 2;
+}

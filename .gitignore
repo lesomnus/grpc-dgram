@@ -7,3 +7,8 @@ node_modules
 # the benchmark job, whose nested checkout the tree-root workspace captured.
 go.work
 go.work.sum
+
+# The in-page server of examples/browser-wasm, when it is built by hand for
+# `-rebuild=false`. It is a 21 MB build output; the default dev-server path
+# never writes here at all (it builds into a temporary directory).
+examples/browser-wasm/web/app.wasm

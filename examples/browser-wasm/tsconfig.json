@@ -1,0 +1,30 @@
+{
+  // Type-checks the page against the TypeScript port's build output. The page
+  // itself is plain JavaScript (`// @ts-check` + JSDoc), so there is nothing
+  // to compile — this only reports mistakes:
+  //
+  //   cd ts && pnpm install && pnpm build
+  //   cd ts && pnpm exec tsc -p ../examples/browser-wasm
+  //
+  // The `paths` entries stand in for the import map in index.html: the package
+  // is unpublished, so all of them point at ts/dist.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowJs": true,
+    "checkJs": true,
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": [],
+    "paths": {
+      "@lesomnus/grpc-dgram": ["../../ts/dist/index.d.mts"],
+      "@lesomnus/grpc-dgram/transport/port": ["../../ts/dist/transport/port.d.mts"],
+      "@lesomnus/grpc-dgram/transport/port/wasm": ["../../ts/dist/transport/port/wasm.d.mts"],
+      "@lesomnus/grpc-dgram/transport/websocket": ["../../ts/dist/transport/websocket.d.mts"]
+    }
+  },
+  "include": ["web"]
+}
