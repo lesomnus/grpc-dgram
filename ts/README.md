@@ -1,7 +1,7 @@
 # @lesomnus/grpc-dgram
 
 TypeScript port of [grpc-dgram](../): gRPC-style RPC over unreliable datagram
-channels, implementing the **drpc wire protocol v1.1** (`../PROTOCOL.md`).
+channels, implementing the **drpc wire protocol v1.1** (`../docs/PROTOCOL.md`).
 Wire-compatible with the Go implementation — the §5 golden byte vectors are
 shared between the two test suites — so a TS client interoperates with a Go
 server and vice versa.

@@ -24,7 +24,7 @@ generated impls <── drpc.Server <──(per frame)──── adapter (unpa
   liveness), **transport adapters shipped** (UDP, WebSocket, pion/webrtc), and
   a **TypeScript port** of the same wire protocol ([`ts/`](./ts) — browser and
   Node, verified against a real Go server).
-  Wire protocol: [`PROTOCOL.md`](./PROTOCOL.md).
+  Wire protocol: [`docs/PROTOCOL.md`](./docs/PROTOCOL.md).
 
 ---
 
@@ -124,7 +124,7 @@ To wire a custom transport instead: the wire unit is one marshaled `Envelop`
 `TransportInfo` (+ `ConnAttacher` and `io.Closer` for the self-managing
 client shape), feed received frames to `Conn.Handle`/`Server.Handle`, and
 honor the teardown duty on connection-oriented channels. See
-[`PROTOCOL.md`](./PROTOCOL.md) §3–§4 for the contract and any shipped
+[`docs/PROTOCOL.md`](./docs/PROTOCOL.md) §3–§4 for the contract and any shipped
 transport as a reference.
 
 ### Reliable transports
@@ -277,7 +277,7 @@ go test -run '^$' -fuzz FuzzServerHandle -fuzztime 20s .   # fuzz the frame entr
 (cd ts && pnpm install && pnpm test)   # TypeScript port, incl. the Go↔TS conformance test
 ```
 
-- Wire protocol & design rationale: [`PROTOCOL.md`](./PROTOCOL.md)
+- Wire protocol & design rationale: [`docs/PROTOCOL.md`](./docs/PROTOCOL.md)
 - Runnable examples: [`examples/`](./examples) — a UDP sensor stream with the
   gap/drop counters printed, a reliable WebSocket echo with graceful shutdown,
   and the browser↔Go WebRTC DataChannel demo

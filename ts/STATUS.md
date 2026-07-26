@@ -4,7 +4,7 @@ Read this before continuing the port.
 
 ## TL;DR
 
-The TypeScript port of drpc **v1.1** (`../PROTOCOL.md`) is **functionally
+The TypeScript port of drpc **v1.1** (`../docs/PROTOCOL.md`) is **functionally
 complete, green, and adversarially audited**. Cross-language interop with the
 Go server is verified at runtime over UDP — including the v1.1 surface, where
 a Go/TS split would be silent: binary metadata, status details and the
