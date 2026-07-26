@@ -27,6 +27,7 @@ import (
 
 	drpc "github.com/lesomnus/grpc-dgram"
 	"github.com/pion/webrtc/v4"
+	"google.golang.org/grpc/peer"
 )
 
 type options struct {
@@ -125,6 +126,13 @@ func (t *Transport) Close() error {
 // Reliable reports the mode derived from the channel configuration; see
 // channelReliable. drpc.NewConn reads it once at construction.
 func (t *Transport) Reliable() bool { return t.ch.reliable }
+
+// Peer names the remote end for grpc.Peer and peer.FromContext
+// (drpc.TransportPeer). A DataChannel has no address of its own, so it is
+// named by its label.
+func (t *Transport) Peer() *peer.Peer {
+	return &peer.Peer{Addr: dcAddr{label: t.ch.dc.Label()}}
+}
 
 // Handle sends one frame as a single-frame envelop.
 func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
@@ -237,6 +245,9 @@ func (g *Gateway) ServePeer(ctx context.Context, srv *drpc.Server, dc *webrtc.Da
 
 	ctx = drpc.NewPeerContext(ctx, b.key)
 	ctx = drpc.NewReliableContext(ctx, b.ch.reliable)
+	// The peer key is opaque (one channel = one key); handlers reading the
+	// standard peer.FromContext get the channel's label.
+	ctx = peer.NewContext(ctx, &peer.Peer{Addr: dcAddr{label: dc.Label()}})
 	err := b.ch.serve(ctx, srv)
 	srv.DisconnectPeer(b.key, err)
 	return err

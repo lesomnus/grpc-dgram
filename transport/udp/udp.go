@@ -30,6 +30,7 @@ import (
 	"time"
 
 	drpc "github.com/lesomnus/grpc-dgram"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -76,7 +77,7 @@ func buildOptions(opts []Option) options {
 }
 
 func marshal(e *drpc.Envelop, limit int) ([]byte, error) {
-	data, err := proto.Marshal(e)
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(e)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +162,12 @@ func (t *Transport) Close() error {
 // Reliable reports false: UDP loses, duplicates, and reorders.
 func (t *Transport) Reliable() bool { return false }
 
+// Peer names the remote end for grpc.Peer and peer.FromContext
+// (drpc.TransportPeer).
+func (t *Transport) Peer() *peer.Peer {
+	return &peer.Peer{Addr: t.c.RemoteAddr(), LocalAddr: t.c.LocalAddr()}
+}
+
 // Handle sends one frame as a single-frame envelop.
 func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
 	e := &drpc.Envelop{}
@@ -234,11 +241,15 @@ func (g *Gateway) Serve(ctx context.Context, h drpc.FrameHandler) error {
 	stop := context.AfterFunc(ctx, func() { g.c.SetReadDeadline(unblockNow) })
 	defer stop()
 	rxCtx := drpc.NewReliableContext(ctx, false)
+	local := g.c.LocalAddr()
 	return serve(ctx, h, func(buf []byte) (int, context.Context, error) {
 		n, addr, err := g.c.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			return n, rxCtx, err
 		}
-		return n, drpc.NewPeerContext(rxCtx, addr), nil
+		// The peer key is the source address; naming it as a *peer.Peer too
+		// lets handlers use the standard peer.FromContext.
+		c := drpc.NewPeerContext(rxCtx, addr)
+		return n, peer.NewContext(c, &peer.Peer{Addr: net.UDPAddrFromAddrPort(addr), LocalAddr: local}), nil
 	})
 }

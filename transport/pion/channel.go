@@ -60,6 +60,14 @@ func channelReliable(dc *webrtc.DataChannel) bool {
 // it is constructed (pion does not replay messages that arrive before a
 // handler is registered) and gates outbound messages on channel open and on
 // the buffered-amount mark.
+// dcAddr names a DataChannel as a net.Addr, so peer.FromContext and
+// grpc.Peer report something meaningful on a transport that has no socket
+// address of its own: the channel's label and id.
+type dcAddr struct{ label string }
+
+func (a dcAddr) Network() string { return "webrtc" }
+func (a dcAddr) String() string  { return "datachannel:" + a.label }
+
 type channel struct {
 	dc       *webrtc.DataChannel
 	reliable bool
@@ -186,7 +194,7 @@ func (ch *channel) bufLowWait() <-chan struct{} {
 // to open, and blocks while BufferedAmount is at the high-water mark — each
 // wait bounded by ctx and by channel death.
 func (ch *channel) send(ctx context.Context, e *drpc.Envelop) error {
-	data, err := proto.Marshal(e)
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(e)
 	if err != nil {
 		return err
 	}

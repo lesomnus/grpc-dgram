@@ -34,6 +34,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	drpc "github.com/lesomnus/grpc-dgram"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -93,7 +94,7 @@ func buildOptions(opts []Option) options {
 }
 
 func marshal(e *drpc.Envelop, limit int) ([]byte, error) {
-	data, err := proto.Marshal(e)
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(e)
 	if err != nil {
 		return nil, err
 	}
@@ -307,6 +308,12 @@ func (t *Transport) Close() error {
 // §10.6), which is what makes the attached pump's teardown duty mandatory.
 func (t *Transport) Reliable() bool { return true }
 
+// Peer names the remote end for grpc.Peer and peer.FromContext
+// (drpc.TransportPeer).
+func (t *Transport) Peer() *peer.Peer {
+	return &peer.Peer{Addr: t.s.c.RemoteAddr(), LocalAddr: t.s.c.LocalAddr()}
+}
+
 // Handle sends one frame as a single-frame envelop.
 func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
 	e := &drpc.Envelop{}
@@ -393,6 +400,9 @@ func (g *Gateway) ServePeer(ctx context.Context, srv *drpc.Server, c *websocket.
 	g.mu.Unlock()
 
 	rxCtx := drpc.NewReliableContext(drpc.NewPeerContext(ctx, key), true)
+	// The peer key is opaque (one connection = one key), so the address the
+	// server reports to handlers comes from the socket itself.
+	rxCtx = peer.NewContext(rxCtx, &peer.Peer{Addr: c.RemoteAddr(), LocalAddr: c.LocalAddr()})
 	err := serve(ctx, c, g.o, rxCtx, srv)
 
 	g.mu.Lock()
