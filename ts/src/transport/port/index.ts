@@ -8,8 +8,9 @@
 // and hand that port here.
 //
 // The motivating deployment is a Go `drpc.Server` compiled to GOOS=js
-// GOARCH=wasm running inside the page, with the browser UI as its client, so
-// a page reload restarts the whole server. Nothing here knows about wasm
+// GOARCH=wasm running in the browser, with the UI as its client, so a page
+// reload restarts the whole server; ../../wasm is the entry that starts one,
+// in a Worker, and this is what it is built on. Nothing here knows about wasm
 // though: it is a port, and the peer could equally be another TS endpoint
 // across a Worker boundary. This is the TS twin of the Go transport/jsport
 // adapter and interoperates with it on the wire.
@@ -417,6 +418,68 @@ export class PortTransport implements FrameHandler, TransportInfo, ConnAttacher 
   // Idempotent — Conn.close calls it, and it is safe to call directly.
   close(cause?: unknown): void {
     this.pt.close(cause)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// bring your own worker
+// ---------------------------------------------------------------------------
+
+// WorkerLike is a Worker seen from the thread that made it, reduced to the one
+// thing connectWorker needs: a postMessage that takes a transfer list. It is
+// separate from PortLike because what crosses here is not a frame — it is the
+// port itself, with a plain object beside it.
+export interface WorkerLike {
+  postMessage(message: unknown, transfer?: unknown[]): void
+}
+
+export interface WorkerConnectOptions extends PortOptions {
+  // The message posted alongside the port. The default is `{ drpc: 'serve' }`,
+  // which is what the worker this package ships answers (src/wasm/protocol.ts)
+  // — so connectWorker and that worker are a working pair with nothing
+  // configured. A worker of your own can ignore the message entirely: a
+  // transferred port always arrives as `ev.ports[0]`, whatever came with it.
+  message?: unknown
+}
+
+// connectWorker opens one connection to a worker: a fresh MessageChannel, one
+// end transferred to the worker, a PortTransport over the other.
+//
+//   const conn = new Conn(connectWorker(worker))
+//
+// A transferred port is the safe way in, and the reason this is a function
+// rather than `new PortTransport(worker)`: a MessagePort queues everything
+// posted into it until the far side binds it, so a call opened on this very
+// tick is delivered late rather than dropped, whereas a worker's own global
+// scope is wired through onmessage and loses whatever arrives before its
+// handler is registered. It is also what makes the second connection possible
+// at all — call it again for another, independent peer (PROTOCOL.md §6.4),
+// each with its own epoch, sid space and windows, where the worker object
+// itself is one channel shared by everything on it.
+//
+// The worker is never terminated here, not even when the transport dies:
+// terminate() aborts it at once, discarding whatever is still queued for it,
+// and killing a worker is the host's decision, taken after its endpoints have
+// torn down. Nothing else here owns it either — the far end's §4.5 duty is the
+// worker's own (the goodbye it posts when its instance dies), and this end's
+// belongs to the returned transport.
+export function connectWorker(worker: WorkerLike, opts: WorkerConnectOptions = {}): PortTransport {
+  const ch = new MessageChannel()
+  let tx: PortTransport | undefined
+  try {
+    // The transport is constructed BEFORE the far end is handed over, so
+    // nothing the worker posts on its first tick arrives unlistened.
+    tx = new PortTransport(ch.port1, opts)
+    worker.postMessage(opts.message ?? { drpc: 'serve' }, [ch.port2])
+    return tx
+  } catch (e) {
+    // Nothing is left half-attached: the transport takes its listeners off its
+    // end, and both ends are closed — a live MessagePort keeps the event loop
+    // (and, in node, the whole process) alive.
+    tx?.close(e)
+    ch.port1.close()
+    ch.port2.close()
+    throw e
   }
 }
 

@@ -6,9 +6,11 @@
 // between them is a marshaled Envelop (§4.1) posted through the port.
 //
 // The wiring is the shipped pair and not a fixture of its own —
-// jsport.Gateway.Serve publishing the entry point, startWasmServer awaiting it
-// and making the channel — so the handshake the two halves agree on is under
-// test here too, in the only place where both of them are real.
+// jsport.Gateway.Serve publishing the entry point, open() awaiting it and
+// dialling the channel — so the handshake the two halves agree on is under
+// test here too, in the only place where both of them are real. The page's
+// own two lines, with `{ worker: false }` because node has no DOM Worker:
+// everything else about that path is what a browser runs.
 //
 // This is the counterpart to test/conformance.test.ts, which drives the same
 // service over loopback UDP. Two things are only provable here. First, the
@@ -31,10 +33,10 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Conn } from '../src/conn'
+import type { FrameHandler } from '../src/seam'
 import { Code, type StatusError } from '../src/status'
-import type { PortTransport } from '../src/transport/port'
-import { startWasmServer } from '../src/transport/port/wasm'
 import { fromService } from '../src/transport/protobuf-es'
+import { open, type WasmSock } from '../src/wasm'
 import { FlagCompressed, FlagOpen, FlagWindow, shapeOf, type Frame } from '../src/wire'
 import { EchoRequestSchema, EchoService } from '../src/testing/gen/echo/echo_pb.js'
 
@@ -64,8 +66,8 @@ function hasGo(): boolean {
 // ---------------------------------------------------------------------------
 
 // The two teardown globals conformance/wasmserver installs. The third,
-// drpcServe, is never named here: startWasmServer waits for it, calls it with
-// one end of a channel it made itself, and takes the property back off
+// drpcServe, is never named here: open() waits for it, hands it one end of a
+// channel it made itself on every dial(), and takes the property back off
 // globalThis before it returns.
 declare global {
   var drpcStop: () => void
@@ -82,31 +84,35 @@ function loadGoRuntime(): void {
   new Function(readFileSync(join(goroot, 'lib', 'wasm', 'wasm_exec.js'), 'utf8'))()
 }
 
-// Instance is one running wasm server: the client end of its channel, and the
+// Instance is one running wasm server: the sock, one connection to it, and the
 // two globals it installed. Those are captured at readiness on purpose — a
 // second instance overwrites them, and each of the two lifecycles below has to
 // keep driving its own server.
 interface Instance {
-  transport: PortTransport
+  sock: WasmSock
+  conn: Conn
   stop: () => void
   exit: () => void
 }
 
 // startInstance is the page's own two lines (examples/browser-wasm/web), run
-// against the fixture: startWasmServer instantiates the module, waits for
+// against the fixture: open() instantiates the module and waits for
 // Gateway.Serve to publish drpcServe — publishing it IS the readiness signal,
 // and it is raced against the instance dying on the way up, which is why a
 // fixture that panics in main reports that instead of timing this suite out —
-// makes the MessageChannel, and wires go.run()'s promise to
-// transport.close(cause). That wiring is the host's half of §4.5 and it is
-// load-bearing for every case here, not just the exit case: a handler that
-// panics kills the instance exactly as os.Exit does, and with every protocol
-// timer off (§10.6) nothing else would ever fail the call that was in flight.
+// and dial() makes the MessageChannel. go.run()'s promise is wired to closing
+// every connection with the cause; that wiring is the host's half of §4.5 and
+// it is load-bearing for every case here, not just the exit case: a handler
+// that panics kills the instance exactly as os.Exit does, and with every
+// protocol timer off (§10.6) nothing else would ever fail the call that was in
+// flight.
 async function startInstance(mod: WebAssembly.Module): Promise<Instance> {
   // The source is the compiled Module the suite already holds — nothing to
-  // fetch here, the fixture came off disk.
-  const transport = await startWasmServer(mod)
-  return { transport, stop: globalThis.drpcStop, exit: globalThis.drpcExit }
+  // fetch here, the fixture came off disk. `{ worker: false }` runs it in this
+  // realm: node has no DOM Worker, and what is under test is the Go/TS
+  // handshake, which is the same one either way.
+  const sock = await open(mod, { worker: false })
+  return { sock, conn: sock.dial(), stop: globalThis.drpcStop, exit: globalThis.drpcExit }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,12 +128,17 @@ interface Wire {
   rx: Frame[]
 }
 
-function record(transport: PortTransport, conn: Conn): Wire {
+function record(conn: Conn): Wire {
   const w: Wire = { tx: [], rx: [] }
-  const send = transport.handle.bind(transport)
-  transport.handle = (f) => {
+  // The send side is the transport the Conn was dialled over. A page never
+  // needs it — open() makes it, attaches it and closes it — so this suite
+  // reaches for it, which is the same tap test/conformance.test.ts puts on the
+  // transport it built by hand.
+  const tx = (conn as unknown as { tx: FrameHandler }).tx
+  const send = tx.handle.bind(tx)
+  tx.handle = (f, ctx) => {
     w.tx.push({ ...f }) // snapshot: flags may still be mutated by the sender
-    return send(f)
+    return send(f, ctx)
   }
   const recv = conn.handle.bind(conn)
   conn.handle = (f, ctx) => {
@@ -175,8 +186,8 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go wasm ser
 
     server = await startInstance(mod)
     // Zero options on either side: mode comes from the adapter (§4.3).
-    conn = new Conn(server.transport)
-    wire = record(server.transport, conn)
+    conn = server.conn
+    wire = record(conn)
   }, 60_000)
 
   afterAll(() => {
@@ -187,7 +198,7 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go wasm ser
     // is what lets the process exit at all, since a MessagePort with a
     // listener on it keeps the event loop alive and a vitest run that never
     // ends is the one thing this hook exists to prevent.
-    conn?.close()
+    server?.sock.close()
     server?.exit()
   })
 
@@ -365,10 +376,10 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go wasm ser
   it('a second instance dying without a word: go.run() resolves, the host says why (§4.5)', async () => {
     // Its own instance and its own channel, because it ends with a dead
     // server: the one the cases above share is untouched and still serving.
-    // Also a second startWasmServer on the same entry point, which only works
-    // because the first gave the name back once it had caught its publish.
+    // Also a second open() on the same entry point, which only works because
+    // the first gave the name back once it had caught its publish.
     const inst = await startInstance(mod)
-    const conn2 = new Conn(inst.transport)
+    const conn2 = inst.conn
 
     const stream = conn2.newStream(Echo.live, {})
     await stream.send(create(EchoRequestSchema, { message: 'hi', repeat: 1, circularShift: 1 }))
@@ -377,7 +388,7 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go wasm ser
     // os.Exit runs nothing — no deferred code, no goodbye — and a MessagePort
     // whose peer stopped existing looks exactly like one whose peer is merely
     // quiet, so go.run()'s promise is the only evidence that ever arrives.
-    // startWasmServer wired it to transport.close(cause) at handover; without
+    // open() wired it to closing every connection with the cause; without
     // that, this recv hangs forever.
     inst.exit()
     const err = (await stream.recv().catch((e) => e)) as StatusError

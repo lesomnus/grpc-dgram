@@ -17,7 +17,7 @@ import { Server } from '../../server'
 import { Code, type StatusError } from '../../status'
 import { echo, registerEcho, tick } from '../../testing'
 import { FlagPing, frame } from '../../wire'
-import { PortGateway, PortTransport, type PortLike, type PortOptions } from './index'
+import { connectWorker, PortGateway, PortTransport, type PortLike, type PortOptions, type WorkerLike } from './index'
 
 // Every real port opened by a test, closed in afterEach: a live MessagePort
 // keeps node's event loop alive and the run would never exit.
@@ -514,6 +514,121 @@ describe('malformed messages are ignored, never fatal (§4.2)', () => {
     expect(await net.conn.invoke(echo.once, { text: 'alive' })).toEqual({ text: 'echo:alive' })
     net.conn.close()
     await net.serving
+  })
+})
+
+describe('connectWorker: bring your own worker', () => {
+  // A worker seen from the thread that made it, reduced to what connectWorker
+  // touches — and, on the far side, the worker's own half: it takes the port
+  // off the transfer list (where a transferred port always arrives, whatever
+  // message came with it) and serves it off a real Server.
+  class MockWorker implements WorkerLike {
+    readonly messages: unknown[] = []
+    readonly taken: MessagePort[] = []
+    private readonly pending: MessagePort[] = []
+    terminated = 0
+    private readonly gateway = new PortGateway()
+    readonly server = new Server(this.gateway)
+    readonly counts = registerEcho(this.server)
+    // Off, the port is held: an instance that has not bound what it was handed
+    // yet, which is the normal case for a call opened on the same tick.
+    autoServe = true
+
+    postMessage(message: unknown, transfer?: unknown[]): void {
+      this.messages.push(message)
+      const port = transfer?.[0]
+      if (port instanceof MessagePort) {
+        this.taken.push(port)
+        this.pending.push(port)
+        opened.push(port)
+        if (this.autoServe) this.serve()
+      }
+    }
+
+    serve(): void {
+      for (const port of this.pending.splice(0)) {
+        this.gateway.bind(port)
+        void this.gateway.servePeer(this.server, port)
+      }
+    }
+
+    terminate(): void {
+      this.terminated++
+    }
+  }
+
+  it('connects over a transferred port, and again for a second peer', async () => {
+    const worker = new MockWorker()
+    const first = new Conn(connectWorker(worker))
+    const second = new Conn(connectWorker(worker))
+    expect(await first.invoke(echo.once, { text: 'a' })).toEqual({ text: 'echo:a' })
+    expect(await second.invoke(echo.once, { text: 'b' })).toEqual({ text: 'echo:b' })
+    // One port is one peer (§6.4), so these are two independent connections to
+    // one worker, not two views of one.
+    expect(worker.taken).toHaveLength(2)
+    expect(worker.counts.once).toBe(2)
+    // The default message is the word the shipped wasm worker answers; the
+    // port is never in it, because a MessagePort cannot be cloned.
+    expect(worker.messages).toEqual([{ drpc: 'serve' }, { drpc: 'serve' }])
+
+    // Killing one is one teardown: the other keeps serving.
+    second.close()
+    await tick()
+    expect(await first.invoke(echo.once, { text: 'still' })).toEqual({ text: 'echo:still' })
+    first.close()
+  })
+
+  it('delivers a call opened before the worker binds the port', async () => {
+    // The reason a port is transferred instead of the worker being handed to a
+    // PortTransport: a MessagePort queues everything posted into it until its
+    // owner binds it, so a call opened on this very tick is delivered late
+    // rather than dropped. A worker's own global scope, wired through
+    // onmessage, would have lost it.
+    const worker = new MockWorker()
+    worker.autoServe = false
+    const conn = new Conn(connectWorker(worker))
+    const call = conn.invoke(echo.once, { text: 'early' })
+    await tick()
+
+    worker.serve()
+    expect(await call).toEqual({ text: 'echo:early' })
+    conn.close()
+  })
+
+  it('carries a message of your own, and the port options through', async () => {
+    const worker = new MockWorker()
+    const conn = new Conn(connectWorker(worker, { message: { kind: 'rpc', id: 7 }, maxMessageSize: 128 }))
+    expect(worker.messages).toEqual([{ kind: 'rpc', id: 7 }])
+    const err = (await conn.invoke(echo.once, { text: 'x'.repeat(500) }).catch((e) => e)) as StatusError
+    expect(err.code).toBe(Code.RESOURCE_EXHAUSTED) // §4.4, from the options given here
+    expect(await conn.invoke(echo.once, { text: 'ok' })).toEqual({ text: 'echo:ok' })
+    conn.close()
+  })
+
+  it('never terminates the worker, not even when the connection dies', async () => {
+    // terminate() aborts a worker at once, discarding whatever is still queued
+    // for it. Killing it is the host's decision, taken after its endpoints have
+    // torn down — never a side effect of one peer's §4.5 teardown.
+    const worker = new MockWorker()
+    const transport = connectWorker(worker)
+    const conn = new Conn(transport)
+    expect(await conn.invoke(echo.once, { text: 'hi' })).toEqual({ text: 'echo:hi' })
+    conn.close()
+    transport.close()
+    await tick()
+    expect(worker.terminated).toBe(0)
+  })
+
+  it('leaves nothing half-attached when the worker refuses the port', async () => {
+    // A terminated worker throws on postMessage. Both ends of the channel are
+    // released — a live MessagePort keeps node's event loop alive — and the
+    // transport that was already listening on one of them is closed.
+    const worker = {
+      postMessage(): void {
+        throw new Error('worker terminated')
+      },
+    }
+    expect(() => connectWorker(worker)).toThrow(/worker terminated/)
   })
 })
 

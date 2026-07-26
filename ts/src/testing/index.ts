@@ -1,6 +1,7 @@
-// Shared test plumbing: a JSON payload codec, an echo service, and in-memory
+// Shared test plumbing: a JSON payload codec, an echo service, in-memory
 // transports that round-trip every frame through the real wire codec (the
-// same way the Go e2e pipes marshal real Envelops).
+// same way the Go e2e pipes marshal real Envelops), and the fake Go runtime
+// both src/wasm suites drive.
 
 import { Conn, type ConnOptions } from '../conn'
 import { bidiMethod, clientStreamingMethod, serverStreamingMethod, unaryMethod, type PayloadCodec } from '../desc'
@@ -126,4 +127,72 @@ export const flagsOf = (f: Frame) => f.flags
 export async function tick(): Promise<void> {
   // Settle promise chains without advancing timers.
   for (let i = 0; i < 20; i++) await Promise.resolve()
+}
+
+// ---------------------------------------------------------------------------
+// wasm (src/wasm)
+// ---------------------------------------------------------------------------
+
+// The smallest thing WebAssembly.instantiate accepts: the 8-byte header of an
+// empty module — no imports, no exports, nothing to run. The wasm entry only
+// ever hands the instance to go.run(), and FakeGo ignores it.
+export const emptyModule = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00])
+
+// FakeGo is wasm_exec's Go class reduced to what src/wasm touches, plus the
+// controls a test needs: what the instance does when it starts (onRun, i.e.
+// main), and how it ends. It lives here because both suites in src/wasm drive
+// one — the in-realm path takes it as an option, the worker path finds it as
+// globalThis.Go — and a second copy of it would be a second definition of what
+// a wasm instance does.
+//
+// It publishes the way the real thing does, `Reflect.set(globalThis, name,
+// fn)`, which is what `js.Global().Set(name, fn)` reaches JS as and the reason
+// an accessor can catch it at all; its run() promise is controllable, so the
+// two ways an instance dies — a resolution, which is what a Go panic does, and
+// a trap — are both reachable.
+export class FakeGo {
+  readonly importObject: WebAssembly.Imports = {}
+  entryPoint = 'drpcServe'
+  runs = 0
+  // wasm_exec's re-entry point, which every js.Func the instance registered
+  // calls. The real one throws "Go program has already exited" once run() has
+  // settled; this one records that it was reached.
+  _resume = (): void => {
+    this.resumes++
+  }
+  resumes = 0
+  // onRun stands in for main(): a server publishes, a broken one exits.
+  onRun: (go: FakeGo) => void = () => {}
+  private readonly finished: Promise<void>
+  private stop!: () => void
+  private crash!: (e: unknown) => void
+
+  constructor() {
+    this.finished = new Promise((res, rej) => {
+      this.stop = res
+      this.crash = rej
+    })
+  }
+
+  run(_instance: WebAssembly.Instance): Promise<void> {
+    this.runs++
+    this.onRun(this)
+    return this.finished
+  }
+
+  // publish is js.Global().Set(name, fn) seen from JS.
+  publish(fn: unknown): void {
+    Reflect.set(globalThis, this.entryPoint, fn)
+  }
+
+  // exit RESOLVES run(), which is what wasm_exec does for a clean exit and
+  // for a Go panic alike (it exits with code 2 and resolves).
+  exit(): void {
+    this.stop()
+  }
+
+  // trap rejects it, as an unrecoverable wasm error does.
+  trap(e: unknown): void {
+    this.crash(e)
+  }
 }

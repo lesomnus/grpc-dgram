@@ -16,10 +16,12 @@ deliberately does *not* cover `window.postMessage`, whose second argument is a
 `MessagePort` through the window and hand that port here.
 
 The motivating deployment is a Go `drpc.Server` compiled to `GOOS=js
-GOARCH=wasm` **running inside the page**, with the browser UI as its client, so
-a page reload restarts the whole server. Neither end knows about wasm, though:
-it is a port, and both could equally be TS endpoints across a `Worker`
-boundary.
+GOARCH=wasm` **running in the browser**, with the UI as its client, so a page
+reload restarts the whole server. Neither end knows about wasm, though: it is a
+port, and both could equally be TS endpoints across a `Worker` boundary. That
+page is [`@lesomnus/grpc-dgram/wasm`](../../wasm)'s two lines and none of this
+one's; everything here is what the other shapes — a worker of your own, an
+iframe, two TS endpoints — are built from.
 
 ## Client — `PortTransport`
 
@@ -30,17 +32,18 @@ itself — nothing to manage — and the transport owns the port from then on.
 import { Conn } from '@lesomnus/grpc-dgram'
 import { PortTransport } from '@lesomnus/grpc-dgram/transport/port'
 
-const worker = new Worker('./server.js', { type: 'module' })
-const transport = new PortTransport(worker) // construct it on the same tick
-const conn = new Conn(transport)            // reliable mode auto-detected
+const transport = new PortTransport(port) // an end you kept, or a worker's self
+const conn = new Conn(transport)          // reliable mode auto-detected
 
 await conn.invoke(Once, req)
 
 conn.close() // says goodbye, closes the port, fails every live call
 ```
 
-Construct it promptly after the port exists: a `Worker` drops messages that
-arrive before a listener is registered.
+Construct it promptly after the port exists: a `MessagePort` queues what
+arrives until someone starts it, but a `Worker` — or a worker's own `self` —
+drops every message posted before a listener is registered, which is why
+`connectWorker` below transfers a port instead of wrapping the worker.
 
 When the host knows *why* the endpoint died — the classic case being a wasm
 instance that exited or panicked — say so, and every hanging call reports it:
@@ -51,122 +54,77 @@ const inst = await WebAssembly.instantiateStreaming(fetch('/server.wasm'), go.im
 void go.run(inst.instance).finally(() => transport.close('the wasm instance exited'))
 ```
 
-For that deployment — a Go server in the page — `startWasmServer` below does
-this, and the four other things around it, for you.
+For a wasm instance, [`open()`](../../wasm) does that wiring — and the rest of
+the handshake around it — for you.
 
-## The wasm page — `startWasmServer`
+## A worker — `connectWorker`
 
-A separate entry, `@lesomnus/grpc-dgram/transport/port/wasm`, because it is
-the only part of this adapter that knows what wasm is. It pairs with
-`jsport.Gateway.Serve` on the Go side:
+One connection to a worker: a fresh `MessageChannel`, one end transferred, a
+`PortTransport` over the other.
 
 ```ts
 import { Conn } from '@lesomnus/grpc-dgram'
-import { startWasmServer } from '@lesomnus/grpc-dgram/transport/port/wasm'
+import { connectWorker } from '@lesomnus/grpc-dgram/transport/port'
 
-const conn = new Conn(await startWasmServer('/app.wasm'))
+const worker = new Worker('./server.js', { type: 'module' })
+const conn = new Conn(connectWorker(worker))     // call again for another peer
 ```
 
-`globalThis.Go` comes from the toolchain's `wasm_exec.js`, which the page loads
-as a classic `<script>`; it is version-coupled to the compiler that produced
-the module, so nothing here imports or vendors it.
+Why a transferred port rather than `new PortTransport(worker)`: a `MessagePort`
+**queues** everything posted into it until the far side binds it, so a call
+opened on this very tick is delivered late rather than dropped, where a
+worker's own global scope is wired through `onmessage` and loses whatever
+arrives before its handler is registered. It is also what makes a second
+connection possible at all — the worker object itself is one channel shared by
+everything on it, while each transferred port is its own peer (§6.4).
 
-| Option | Default | Meaning |
-|---|---|---|
-| `entryPoint` | `'drpcServe'` (`DefaultEntryPoint`) | the global the instance publishes its port-taking function as; must match the name the Go side serves under |
-| `go` | `new globalThis.Go()` | a `Go` instance you built yourself — the way to pass argv or env |
-| `readyTimeoutMs` | `10_000` | how long to wait for that publish; `<= 0` waits forever |
-| `maxMessageSize`, `transfer` | see [Options](#options) | passed to the `PortTransport` it returns |
+The port arrives at the worker as `ev.ports[0]`, alongside `{ drpc: 'serve' }`
+— the message the [shipped wasm worker](../../wasm) answers, and one your own
+worker can ignore entirely (the `message` option sets it to anything else you
+like). The worker is never terminated here, not even when the transport dies:
+killing a worker is the host's decision, taken after its endpoints have torn
+down.
 
-The source may be a URL (`string` or `URL`), a `Response` or the promise of
-one, the module's bytes, or a `WebAssembly.Module` compiled once and
-instantiated many times.
+## The wasm page — `open()`
 
-### What it does under the hood
-
-1. Fetches and instantiates — streaming where the response says
-   `application/wasm`, buffered otherwise, so a server that mislabels the MIME
-   type still works. **A non-ok response throws with the body text**: a dev
-   server answers a broken build with a 500 whose body is the compiler output,
-   and streaming instantiation would discard the one thing that names the line
-   that stopped compiling.
-2. Installs an accessor on `globalThis[entryPoint]` *before* `go.run`, so the
-   publish cannot be missed. **Publishing the entry point is the readiness
-   signal** — `js.Global().Set` reaches JS as `Reflect.set`, which triggers an
-   accessor — so there is no second magic name on either side, and the property
-   is removed again once caught: call it twice and the second start is as clean
-   as the first.
-3. Races that publish against `go.run()`'s promise and against
-   `readyTimeoutMs`. An instance that dies on the way up **rejects** instead of
-   hanging: a Go panic *resolves* `go.run()` (wasm_exec exits with code 2), so
-   any settlement before readiness is a failure, and with every protocol timer
-   off (§10.6) nothing else would ever end the wait.
-4. Creates the `MessageChannel`, keeps one end for the returned
-   `PortTransport` — constructed before the far end is handed over, so nothing
-   the server posts arrives unlistened — and passes the other to the entry
-   point.
-5. Wires the §4.5 duty: `go.run()` settling closes the transport with a cause
-   (`the wasm instance exited`, or the trap), which is the whole reason a live
-   call on this channel ever fails. An exited instance keeps its `js.Func`s
-   registered on the port it was handed — `os.Exit` detaches nothing — so
-   wasm_exec's re-entry point is neutralized first: without that, the goodbye
-   posted to a dead instance throws *Go program has already exited* out of an
-   event handler, which a page logs and node dies of.
-
-It does **not** own the instance's lifetime: nothing can stop a Go program once
-`go.run` has started it. So a failure before that leaves nothing running, and a
-failure after it — a module that never publishes — rejects with the instance
-still alive, which only a page reload, a `terminate()` or the module's own
-shutdown entry point can end. What it does clean up is what it made: the global
-property, on every path including the successful one; and the channel, on every
-path that does not hand it over — after a handover one end belongs to the
-transport and the other to the instance.
-
-`Gateway.Serve` on the Go side takes the same view of the name: it unpublishes
-on ctx cancellation only while `globalThis[entryPoint]` still holds what it
-published, because by then this helper has normally taken the property back and
-restored whatever the page had under it.
-
-Everything else stays on the manual path: for a `Worker`, an iframe or two TS
-endpoints, `new PortTransport(port)` on one side and `PortGateway` on the other
-is the whole API — a `MessageChannel` is one channel with two *entangled,
-symmetric* ends, and the only thing distinguishing them is which one you give
-away.
-
-### More than one connection to the same instance
-
-One port is one peer (§6.4), and an instance serves as many as it is given:
-each gets its own epoch, sid space, flow-control windows and per-peer resource
-caps, and a teardown that reaches only it. `wasmServer()` hands back the
-instance `startWasmServer` started, so a second connection costs a line:
+A Go server compiled to `js/wasm` has its own entry,
+[`@lesomnus/grpc-dgram/wasm`](../../wasm), because it is the only part of this
+that knows what wasm is — and it ships the worker, so the page is two lines:
 
 ```ts
-import { startWasmServer, wasmServer } from '@lesomnus/grpc-dgram/transport/port/wasm'
+import { open } from '@lesomnus/grpc-dgram/wasm'
 
-const conn  = new Conn(await startWasmServer('/app.wasm'))
-const other = new Conn(wasmServer().connect())   // independent peer, same server
+const sock = await open('/app.wasm')
+const conn = sock.dial()      // again for a second, independent peer (§6.4)
 ```
 
-`connect()` wires the same §4.5 teardown as the first connection: when the
-instance exits, *every* connection to it fails, because they share the process
-that stopped existing. It throws once that has happened — a connection to a
-corpse would hang forever rather than fail, so the error names which of the two
-went wrong.
+It pairs with `jsport.Gateway.Serve` on the Go side: the readiness handshake,
+the instantiation, the channel per connection and the §4.5 teardown a dying
+instance cannot perform for itself are all in there, with the reasoning.
 
-`openPort()` is `connect()` without the transport: the raw end to transfer
-somewhere this page cannot reach.
+## The manual path
+
+For an iframe, a worker of your own on both ends, or two TS endpoints in one
+page, `new PortTransport(port)` on one side and `PortGateway` on the other is
+the whole API. A `MessageChannel` is one channel with two *entangled,
+symmetric* ends — what is posted into one arrives at the other, and the only
+thing distinguishing them is which one you give away:
 
 ```ts
-const port = wasmServer().openPort()
-worker.postMessage({ port }, [port])              // the worker wraps it itself
-wasmServer().exited.then(() => worker.terminate())
+const ch = new MessageChannel()
+const conn = new Conn(new PortTransport(ch.port1)) // the end you keep
+iframe.contentWindow.postMessage({ drpc: 'serve' }, targetOrigin, [ch.port2])
 ```
 
-That second line is not optional. A transferred port is out of this page's
-reach, and an instance that dies posts no goodbye, so whoever holds the far end
-owns its own §4.5 duty — `exited` (which resolves, never rejects, with the
-cause) is what the page has to end it with. Give each instance its own
-`entryPoint` if you run more than one, and `wasmServer(name)` picks it out.
+`window.postMessage` is not a port — its second argument is a `targetOrigin`,
+not a transfer list — so an iframe is exactly this: transfer a `MessagePort`
+through the window, and hand *that* port to the two APIs. Either way the wire
+is unchanged; only who creates the channel moves.
+
+What the manual path owes, and the helpers do for you, is the §4.5 teardown:
+whatever the host knows and the port cannot report — an instance that exited, a
+worker about to be terminated, a page unloading — has to reach `close(cause)`,
+or the calls in flight hang forever.
 
 ## Server — `PortGateway`
 
@@ -183,10 +141,12 @@ const gw = new PortGateway()
 const server = new Server(gw)
 // server.register(...)
 
-// inside a worker: every client hands us one end of its own MessageChannel
+// inside a worker: every client transfers one end of its own MessageChannel,
+// which arrives on the event rather than in it — a MessagePort cannot be cloned
 self.addEventListener('message', (ev) => {
-  const port = ev.data.port as MessagePort
-  gw.bind(port)
+  const port = ev.ports[0]
+  if (port === undefined) return  // somebody else's traffic on this channel
+  gw.bind(port)                   // synchronously: nothing queued is lost
   void gw.servePeer(server, port) // resolves with the death cause
 })
 ```
