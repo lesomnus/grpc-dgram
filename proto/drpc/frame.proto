@@ -3,6 +3,7 @@ edition = "2023";
 package drpc;
 
 import "drpc/metadata.proto";
+import "google/protobuf/any.proto";
 import "google/protobuf/duration.proto";
 
 option features.field_presence = IMPLICIT;
@@ -10,11 +11,15 @@ option go_package = "github.com/lesomnus/grpc-dgram;drpc";
 
 // Frame is the unit of the drpc protocol. See PROTOCOL.md §5.
 //
-// Flags (bitmask on `flags`):
-//   1 = OPEN  — creates the call; client→server only; seq MUST be 1.
-//   2 = CLOSE — sender's direction finished; with `code` it is terminal.
-//   4 = RESET — stateless "no such call"; `epoch` echoes the offending frame.
-//   8 = PING  — sid 0: peer keepalive; sid≠0: stream probe.
+// Flags (bitmask on `flags`). The first five are the frame's SHAPE and are
+// mutually exclusive with "no flags" (a data or header frame); COMPRESSED is
+// orthogonal and may ride any payload-bearing frame.
+//   1  = OPEN       — creates the call; client→server only; seq MUST be 1.
+//   2  = CLOSE      — sender's direction finished; with `code` it is terminal.
+//   4  = RESET      — stateless "no such call"; `epoch` echoes the offending frame.
+//   8  = PING       — sid 0: peer keepalive; sid≠0: stream probe.
+//   16 = WINDOW     — stateless flow-control credit for `sid` (reliable mode).
+//   32 = COMPRESSED — `payload` is compressed with the call's compressor.
 message Frame {
   // Sender's incarnation nonce, chosen at random per Conn/Server instance.
   // Exception: RESET frames echo the epoch of the frame they answer.
@@ -72,4 +77,21 @@ message Frame {
   // exactly that incarnation's call. Client→server call frames leave it 0
   // (their field 1 already names the incarnation).
   fixed32 peer_epoch = 14;
+
+  // Flow-control credit, in messages, for this stream — reliable mode only
+  // (§4.2). On OPEN and on the creation-ack H it advertises the sender's
+  // initial receive window; on a WINDOW frame it is an additive grant.
+  // Field 15 — the last one-byte tag — because it rides frequent frames.
+  uint32 window = 15;
+
+  // Message compressor name; OPEN frames only; "" = none. Like `codec`, it
+  // governs the whole call in both directions. A frame whose payload is
+  // actually compressed carries the COMPRESSED flag (§12.1).
+  string compressor = 16;
+
+  // Rich status details — the payload of google.rpc.Status.details, i.e. what
+  // status.WithDetails attaches. Terminal frames only. Best effort: a
+  // terminal that would not fit the channel is re-sent without them
+  // (PROTOCOL.md §4.4, §5).
+  repeated google.protobuf.Any details = 17;
 }

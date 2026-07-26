@@ -9,6 +9,7 @@ package drpc
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	anypb "google.golang.org/protobuf/types/known/anypb"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	reflect "reflect"
 	unsafe "unsafe"
@@ -23,12 +24,16 @@ const (
 
 // Frame is the unit of the drpc protocol. See PROTOCOL.md §5.
 //
-// Flags (bitmask on `flags`):
+// Flags (bitmask on `flags`). The first five are the frame's SHAPE and are
+// mutually exclusive with "no flags" (a data or header frame); COMPRESSED is
+// orthogonal and may ride any payload-bearing frame.
 //
-//	1 = OPEN  — creates the call; client→server only; seq MUST be 1.
-//	2 = CLOSE — sender's direction finished; with `code` it is terminal.
-//	4 = RESET — stateless "no such call"; `epoch` echoes the offending frame.
-//	8 = PING  — sid 0: peer keepalive; sid≠0: stream probe.
+//	1  = OPEN       — creates the call; client→server only; seq MUST be 1.
+//	2  = CLOSE      — sender's direction finished; with `code` it is terminal.
+//	4  = RESET      — stateless "no such call"; `epoch` echoes the offending frame.
+//	8  = PING       — sid 0: peer keepalive; sid≠0: stream probe.
+//	16 = WINDOW     — stateless flow-control credit for `sid` (reliable mode).
+//	32 = COMPRESSED — `payload` is compressed with the call's compressor.
 type Frame struct {
 	state                  protoimpl.MessageState `protogen:"opaque.v1"`
 	xxx_hidden_Epoch       uint32                 `protobuf:"fixed32,1,opt,name=epoch"`
@@ -44,6 +49,9 @@ type Frame struct {
 	xxx_hidden_Header      *Metadata              `protobuf:"bytes,12,opt,name=header"`
 	xxx_hidden_Trailer     *Metadata              `protobuf:"bytes,13,opt,name=trailer"`
 	xxx_hidden_PeerEpoch   uint32                 `protobuf:"fixed32,14,opt,name=peer_epoch,json=peerEpoch"`
+	xxx_hidden_Window      uint32                 `protobuf:"varint,15,opt,name=window"`
+	xxx_hidden_Compressor  string                 `protobuf:"bytes,16,opt,name=compressor"`
+	xxx_hidden_Details     *[]*anypb.Any          `protobuf:"bytes,17,rep,name=details"`
 	XXX_raceDetectHookData protoimpl.RaceDetectHookData
 	XXX_presence           [1]uint32
 	unknownFields          protoimpl.UnknownFields
@@ -166,6 +174,29 @@ func (x *Frame) GetPeerEpoch() uint32 {
 	return 0
 }
 
+func (x *Frame) GetWindow() uint32 {
+	if x != nil {
+		return x.xxx_hidden_Window
+	}
+	return 0
+}
+
+func (x *Frame) GetCompressor() string {
+	if x != nil {
+		return x.xxx_hidden_Compressor
+	}
+	return ""
+}
+
+func (x *Frame) GetDetails() []*anypb.Any {
+	if x != nil {
+		if x.xxx_hidden_Details != nil {
+			return *x.xxx_hidden_Details
+		}
+	}
+	return nil
+}
+
 func (x *Frame) SetEpoch(v uint32) {
 	x.xxx_hidden_Epoch = v
 }
@@ -199,12 +230,12 @@ func (x *Frame) SetPayload(v []byte) {
 		v = []byte{}
 	}
 	x.xxx_hidden_Payload = v
-	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 7, 13)
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 7, 16)
 }
 
 func (x *Frame) SetCode(v uint32) {
 	x.xxx_hidden_Code = v
-	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 8, 13)
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 8, 16)
 }
 
 func (x *Frame) SetDesc(v string) {
@@ -221,6 +252,18 @@ func (x *Frame) SetTrailer(v *Metadata) {
 
 func (x *Frame) SetPeerEpoch(v uint32) {
 	x.xxx_hidden_PeerEpoch = v
+}
+
+func (x *Frame) SetWindow(v uint32) {
+	x.xxx_hidden_Window = v
+}
+
+func (x *Frame) SetCompressor(v string) {
+	x.xxx_hidden_Compressor = v
+}
+
+func (x *Frame) SetDetails(v []*anypb.Any) {
+	x.xxx_hidden_Details = &v
 }
 
 func (x *Frame) HasTimeout() bool {
@@ -322,6 +365,20 @@ type Frame_builder struct {
 	// exactly that incarnation's call. Client→server call frames leave it 0
 	// (their field 1 already names the incarnation).
 	PeerEpoch uint32
+	// Flow-control credit, in messages, for this stream — reliable mode only
+	// (§4.2). On OPEN and on the creation-ack H it advertises the sender's
+	// initial receive window; on a WINDOW frame it is an additive grant.
+	// Field 15 — the last one-byte tag — because it rides frequent frames.
+	Window uint32
+	// Message compressor name; OPEN frames only; "" = none. Like `codec`, it
+	// governs the whole call in both directions. A frame whose payload is
+	// actually compressed carries the COMPRESSED flag (§12.1).
+	Compressor string
+	// Rich status details — the payload of google.rpc.Status.details, i.e. what
+	// status.WithDetails attaches. Terminal frames only. Best effort: a
+	// terminal that would not fit the channel is re-sent without them
+	// (PROTOCOL.md §4.4, §5).
+	Details []*anypb.Any
 }
 
 func (b0 Frame_builder) Build() *Frame {
@@ -336,17 +393,20 @@ func (b0 Frame_builder) Build() *Frame {
 	x.xxx_hidden_Codec = b.Codec
 	x.xxx_hidden_Timeout = b.Timeout
 	if b.Payload != nil {
-		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 7, 13)
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 7, 16)
 		x.xxx_hidden_Payload = b.Payload
 	}
 	if b.Code != nil {
-		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 8, 13)
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 8, 16)
 		x.xxx_hidden_Code = *b.Code
 	}
 	x.xxx_hidden_Desc = b.Desc
 	x.xxx_hidden_Header = b.Header
 	x.xxx_hidden_Trailer = b.Trailer
 	x.xxx_hidden_PeerEpoch = b.PeerEpoch
+	x.xxx_hidden_Window = b.Window
+	x.xxx_hidden_Compressor = b.Compressor
+	x.xxx_hidden_Details = &b.Details
 	return m0
 }
 
@@ -354,7 +414,7 @@ var File_drpc_frame_proto protoreflect.FileDescriptor
 
 const file_drpc_frame_proto_rawDesc = "" +
 	"\n" +
-	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x1egoogle/protobuf/duration.proto\"\x8f\x03\n" +
+	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x19google/protobuf/any.proto\x1a\x1egoogle/protobuf/duration.proto\"\xf7\x03\n" +
 	"\x05Frame\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\aR\x05epoch\x12\x10\n" +
 	"\x03sid\x18\x02 \x01(\aR\x03sid\x12\x10\n" +
@@ -370,23 +430,30 @@ const file_drpc_frame_proto_rawDesc = "" +
 	"\x06header\x18\f \x01(\v2\x0e.drpc.MetadataR\x06header\x12(\n" +
 	"\atrailer\x18\r \x01(\v2\x0e.drpc.MetadataR\atrailer\x12\x1d\n" +
 	"\n" +
-	"peer_epoch\x18\x0e \x01(\aR\tpeerEpochJ\x04\b\x06\x10\aR\fmethod_indexB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
+	"peer_epoch\x18\x0e \x01(\aR\tpeerEpoch\x12\x16\n" +
+	"\x06window\x18\x0f \x01(\rR\x06window\x12\x1e\n" +
+	"\n" +
+	"compressor\x18\x10 \x01(\tR\n" +
+	"compressor\x12.\n" +
+	"\adetails\x18\x11 \x03(\v2\x14.google.protobuf.AnyR\adetailsJ\x04\b\x06\x10\aR\fmethod_indexB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
 
 var file_drpc_frame_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_drpc_frame_proto_goTypes = []any{
 	(*Frame)(nil),               // 0: drpc.Frame
 	(*durationpb.Duration)(nil), // 1: google.protobuf.Duration
 	(*Metadata)(nil),            // 2: drpc.Metadata
+	(*anypb.Any)(nil),           // 3: google.protobuf.Any
 }
 var file_drpc_frame_proto_depIdxs = []int32{
 	1, // 0: drpc.Frame.timeout:type_name -> google.protobuf.Duration
 	2, // 1: drpc.Frame.header:type_name -> drpc.Metadata
 	2, // 2: drpc.Frame.trailer:type_name -> drpc.Metadata
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	3, // 3: drpc.Frame.details:type_name -> google.protobuf.Any
+	4, // [4:4] is the sub-list for method output_type
+	4, // [4:4] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_drpc_frame_proto_init() }
