@@ -61,7 +61,7 @@ subsequence** instead of stalling.
 | Transport adapters: UDP, WebSocket, pion/webrtc, JS message port | ✅ [`transport/udp`](./transport/udp), [`transport/gorilla`](./transport/gorilla), [`transport/pion`](./transport/pion), [`transport/jsport`](./transport/jsport) |
 | A server compiled to `js/wasm`, served to the page over a message port | ✅ [`transport/jsport`](./transport/jsport) ↔ [`ts/…/transport/port`](./ts/src/transport/port) — same wire as WebSocket, both ends in one process |
 | Browser / Node TypeScript port (client + server, same wire) | ✅ [`ts/`](./ts) — WebRTC DataChannel, WebSocket, JS message port, Node UDP, protobuf-es & Connect-ES bindings |
-| Runnable examples | ✅ [`examples/`](./examples) — UDP sensor stream, WebSocket echo, browser↔Go WebRTC, an in-page wasm server |
+| Runnable examples | ✅ [`examples/`](./examples) — UDP sensor stream, WebSocket echo, browser↔Go WebRTC, a Go server compiled to wasm and started by the page |
 | `Envelop` batching (`Coalescer`) | ⬜ planned |
 
 ## Install

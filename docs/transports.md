@@ -21,7 +21,7 @@ one. The normative contract is [PROTOCOL.md](./PROTOCOL.md) §3–§4.
 | [`ts/…/node-udp`](../ts/src/transport/node-udp) | UDP (Node) | unreliable | `new UdpTransport(...)`, `dialUdp` | `new UdpGateway(...)`, `listenUdp` |
 | [`ts/…/websocket`](../ts/src/transport/websocket) | WebSocket | reliable | `new WebSocketTransport(ws)`, `dialWebSocket` | `new WebSocketGateway()` |
 | [`ts/…/webrtc`](../ts/src/transport/webrtc) | WebRTC DataChannel | derived per channel | `new DataChannelTransport(dc)` | `new DataChannelGateway()` |
-| [`ts/…/port`](../ts/src/transport/port) | JS message port | reliable | `new PortTransport(port)`, `startWasmServer` | `new PortGateway()` + `bind` + `servePeer` |
+| [`ts/…/port`](../ts/src/transport/port) | JS message port | reliable | `new PortTransport(port)`, `connectWorker` | `new PortGateway()` + `bind` + `servePeer` |
 
 Two things under `ts/src/transport/` are **not** transports, despite living
 there: [`protobuf-es`](../ts/src/transport/protobuf-es) derives method
@@ -34,17 +34,19 @@ optional, dependency-carrying edge.
 **message port** is anything with `postMessage` and a `message` event — either
 end of a `MessageChannel`, a `Worker`, a worker's own global scope — and the
 two adapters carry the WebSocket wire on it byte for byte, so a Go server
-compiled to `js/wasm` and running *inside the page* is a peer like any other.
+compiled to `js/wasm` and running *in the browser* is a peer like any other.
 That is the deployment they exist for;
 [`examples/browser-wasm`](../examples/browser-wasm) is it, running.
 
-For that one pairing the wiring is two lines: `gw.Serve(ctx, srv)` publishes a
-JS entry point — the publish being the readiness signal — and serves every port
-handed to it, while `await startWasmServer('/app.wasm')` on the page waits for
-that publish, makes the `MessageChannel` and returns the transport over its
-end. One instance serves as many connections as it is given ports, each its own
-peer (§6.4); `wasmServer().connect()` opens the next one. Any other shape — a
-`Worker`, an iframe, two TS endpoints — is the manual path below, unchanged.
+For that one pairing the wiring is two lines a side. `gw.Serve(ctx, srv)`
+publishes a JS entry point — the publish being the readiness signal — and
+serves every port handed to it; [`open('/app.wasm')`](../ts/src/wasm) on the
+page starts the instance in the worker that entry ships, waits for that publish
+and hands back a sock, and `sock.dial()` is one connection over a channel it
+makes itself. One instance serves as many as it is given ports, each its own
+peer (§6.4), so a second `dial()` is the next one. Any other shape — a `Worker`
+of your own (`connectWorker`), an iframe, two TS endpoints — is the manual path
+below, unchanged.
 
 `transport/udp` and `transport/jsport` are part of the core Go module (stdlib
 only — `jsport` needs nothing but `syscall/js`, and being `//go:build js &&
@@ -210,8 +212,10 @@ host's cause into the failed calls; Go's `Close` is an `io.Closer` and takes
 none, so a Go host with something to say calls the core's own teardown API
 directly — `conn.Close(err)`, `srv.DisconnectPeer(peer, err)` — which is what
 the adapter's `Close` would otherwise trigger with no cause. For the wasm page
-`startWasmServer` wires that close to `go.run()`'s own promise already, which
-is what keeps a panicking in-page server from hanging its UI
+[`open()`](../ts/src/wasm) has that wired already: `go.run()`'s promise is
+watched in whichever realm runs the instance, and a worker says the goodbye on
+every port it holds before reporting the death, which is what keeps a panicking
+wasm server from hanging its UI
 ([`examples/browser-wasm`](../examples/browser-wasm)); a host on the manual
 path owes the same wiring itself. An endpoint that vanishes without
 either signal leaves its peer's calls to their deadlines: with timers off,

@@ -34,13 +34,19 @@ server and vice versa.
 - **Message-port adapter** (`@lesomnus/grpc-dgram/transport/port`), the TS twin
   of the Go `transport/jsport` adapter: `PortTransport`/`PortGateway` over
   anything with `postMessage` and a `message` event — a `MessagePort`, a
-  `Worker`, a worker's own `self`. Always reliable, since a port in one process
-  loses nothing, and since nothing dies that a port can report, teardown is
-  spoken: an empty message is the goodbye, and `close(cause)` carries what only
-  the host knows (a wasm instance that exited, a terminated worker). This is
-  what puts a **Go `drpc.Server` compiled to `js/wasm` inside the page** with
-  the UI as its client — `../examples/browser-wasm`, and the cross-language
-  test `test/wasm.test.ts`.
+  `Worker`, a worker's own `self` — plus `connectWorker(worker)`, which
+  transfers a port to a worker of yours and is one independent peer per call.
+  Always reliable, since a port in one process loses nothing, and since nothing
+  dies that a port can report, teardown is spoken: an empty message is the
+  goodbye, and `close(cause)` carries what only the host knows (a wasm instance
+  that exited, a terminated worker).
+- **A Go server in the browser** (`@lesomnus/grpc-dgram/wasm`): `open()` starts
+  a **Go `drpc.Server` compiled to `js/wasm`** — in a Worker this package
+  ships, so a computing handler does not freeze the page — and hands back
+  connections to it. It is the JS half of `jsport.Gateway.Serve`: the readiness
+  publish, the instantiation, one channel per `dial()`, and the §4.5 teardown a
+  dying instance cannot perform for itself. `../examples/browser-wasm` is it
+  running, and `test/wasm.test.ts` drives a real Go server through it.
 - **WebRTC DataChannel adapter** (`@lesomnus/grpc-dgram/transport/webrtc`), the TS twin
   of the Go `transport/pion` adapter: the protocol mode is derived from the
   channel's own configuration — an ordered channel with no retransmit or
@@ -103,6 +109,20 @@ const json = <T>(): PayloadCodec<T> => ({
 
 const Once = unaryMethod<Req, Res>('/echo.Echo/Once', { request: json(), response: json() })
 const Live = bidiMethod<Req, Res>('/echo.Echo/Live', { request: json(), response: json() })
+```
+
+**Against a Go server compiled to wasm.** The page starts it and calls it; the
+Worker, the `wasm_exec.js` load, the readiness handshake and the teardown are
+`open()`'s (`src/wasm`, `../transport/jsport` on the Go side):
+
+```ts
+import { open } from '@lesomnus/grpc-dgram/wasm'
+
+const sock = await open('/app.wasm')
+const conn = sock.dial()   // one connection; call it again for another peer (§6.4)
+
+await conn.invoke(Once, { text: 'hi' })
+sock.close()               // fails every live call, then terminates the worker
 ```
 
 Client over an `RTCDataChannel`:
@@ -184,14 +204,15 @@ calls sharing the channel.
 
 ## Tests
 
-`pnpm test` — 291 tests mirroring the Go suites: the §5 golden wire vectors
+`pnpm test` — 349 tests mirroring the Go suites: the §5 golden wire vectors
 byte-for-byte (including the v1.1 vectors generated from the Go
 implementation), e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,
 probes, liveness), the §6.5 restart walkthroughs, §15 caps and §4.2 drop
 policies, §4.2.1 flow control (advertisement, parking, grants, `T_stall`,
 overrun), compression, size caps and binary metadata, each adapter
-(WebRTC/WebSocket/Port/UDP/protobuf-es/Connect) next to its source, and two
+(WebRTC/WebSocket/Port/UDP/protobuf-es/Connect) next to its source, `open()`
+and the worker it ships against a fake `Go` (`src/wasm/`), and two
 cross-language conformance tests driving a real Go `drpc.Server`: one over
 loopback UDP, one a `js/wasm` build of the server loaded into the test process
 and talked to across a `MessageChannel` — the second being where reliable mode
