@@ -354,11 +354,13 @@ func TestChar_HealthyIdleBidiNotKilled(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// DIVERGENCE from gRPC: rich status details (status.WithDetails) are dropped.
-// Only code + message survive the wire (documented in PROTOCOL.md §5).
+// gRPC parity: rich status details (status.WithDetails) travel — the terminal
+// frame carries google.rpc.Status.details (§5). They are a passenger: a
+// terminal the channel cannot carry is re-sent without them, since every
+// termination path depends on that frame arriving.
 // ---------------------------------------------------------------------------
 
-func TestChar_StatusDetailsDropped(t *testing.T) {
+func TestChar_StatusDetailsTravel(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		client, stop := unreliablePipe(nil, nil).Use(t)
 		defer stop()
@@ -366,18 +368,57 @@ func TestChar_StatusDetailsDropped(t *testing.T) {
 		// Server returns a status carrying details.
 		st := status.New(codes.FailedPrecondition, "nope")
 		withDetails, derr := st.WithDetails(echo.EchoRequest_builder{Message: "detail"}.Build())
-		if derr != nil {
-			withDetails = st // some environments cannot attach; still asserts code+msg
-		}
+		x.NoError(t, derr)
 		client.service.Err = withDetails.Err()
 
 		_, err := client.Once(t.Context(), &echo.EchoRequest{})
 		got, ok := status.FromError(err)
 		x.True(t, ok, "must be a status")
-		x.Equal(t, codes.FailedPrecondition, got.Code()) // code preserved
-		x.Equal(t, "nope", got.Message())                // message preserved
-		x.Equal(t, 0, len(got.Details()))                // details DROPPED (divergence)
+		x.Equal(t, codes.FailedPrecondition, got.Code())
+		x.Equal(t, "nope", got.Message())
+		details := got.Details()
+		x.Len(t, details, 1, "status details must survive the wire")
+		req, ok := details[0].(*echo.EchoRequest)
+		x.True(t, ok, "the detail decodes back to its own type")
+		x.Equal(t, "detail", req.GetMessage())
 	})
+}
+
+// The size guard: a details payload that pushes the terminal past the
+// channel's message limit must cost the details, never the terminal — a lost
+// terminal would strand the call until a timeout (§4.4, §5).
+func TestChar_StatusDetailsDroppedWhenTerminalWouldNotFit(t *testing.T) {
+	// The server's own tx enforces an adapter-style ceiling (§4.4): a bare
+	// terminal fits, one carrying 512 bytes of details does not.
+	const limit = 220
+	svc := &echo.EchoServer{}
+	var conn *drpc.Conn
+	srv := drpc.NewServer(drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
+		if n := proto.Size(f); n > limit {
+			return fmt.Errorf("refused %d bytes: %w", n, drpc.ErrMessageTooLarge)
+		}
+		return conn.Handle(ctx, f)
+	}), drpc.WithReliable(true))
+	defer srv.Stop()
+	echo.RegisterEchoServiceServer(srv, svc)
+	conn = drpc.NewConn(drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
+		return srv.Handle(ctx, f)
+	}), drpc.WithReliable(true))
+	defer conn.Close(nil)
+
+	st := status.New(codes.FailedPrecondition, "nope")
+	withDetails, derr := st.WithDetails(echo.EchoRequest_builder{
+		Message: strings.Repeat("d", 512),
+	}.Build())
+	x.NoError(t, derr)
+	svc.Err = withDetails.Err()
+
+	_, err := echo.NewEchoServiceClient(conn).Once(t.Context(), &echo.EchoRequest{})
+	got, ok := status.FromError(err)
+	x.True(t, ok, "must be a status")
+	x.Equal(t, codes.FailedPrecondition, got.Code(), "the terminal still arrives")
+	x.Equal(t, "nope", got.Message())
+	x.Equal(t, 0, len(got.Details()), "the oversize details are what gets dropped")
 }
 
 // ---------------------------------------------------------------------------

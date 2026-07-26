@@ -1,10 +1,13 @@
 package drpc
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"math/rand/v2"
 
+	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/mem"
@@ -94,7 +97,16 @@ func Unpack(ctx context.Context, e *Envelop, h FrameHandler) error {
 	return errors.Join(errs...)
 }
 
+// Status rebuilds the gRPC status the frame carries, including the rich
+// details of google.rpc.Status when the terminal carried them (§5).
 func (x *Frame) Status() *status.Status {
+	if d := x.GetDetails(); len(d) > 0 {
+		return status.FromProto(&spb.Status{
+			Code:    int32(x.GetCode()),
+			Message: x.GetDesc(),
+			Details: d,
+		})
+	}
 	return status.New(codes.Code(x.GetCode()), x.GetDesc())
 }
 
@@ -105,6 +117,76 @@ func (x *Frame) Err() error {
 func (x *Frame) unmarshal(m any, codec encoding.CodecV2) error {
 	buf := mem.SliceBuffer(x.GetPayload())
 	return codec.Unmarshal(mem.BufferSlice{buf}, m)
+}
+
+// setPayload attaches payload to x, compressing it first when the call has a
+// compressor and there is something to compress. A compressed frame carries
+// FlagCompressed (PROTOCOL.md §7, §12.1); an empty message never does — a
+// 0-byte payload is meaningful (§5) and gains nothing from a codec header.
+// It returns the bytes that actually reached the frame (the wire length).
+func setPayload(f *Frame, comp encoding.Compressor, payload []byte) ([]byte, error) {
+	if comp == nil || len(payload) == 0 {
+		f.SetPayload(payload)
+		return payload, nil
+	}
+	var buf bytes.Buffer
+	w, err := comp.Compress(&buf)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "drpc: compressor: %v", err)
+	}
+	if _, err := w.Write(payload); err != nil {
+		return nil, status.Errorf(codes.Internal, "drpc: compressor: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		return nil, status.Errorf(codes.Internal, "drpc: compressor: %v", err)
+	}
+	out := buf.Bytes()
+	if len(out) >= len(payload) {
+		// Compression that expands (already-compressed or tiny payloads) would
+		// push a message past the channel's ceiling for nothing (§4.4): send
+		// it as-is. The per-frame flag makes that decision invisible to the
+		// receiver.
+		f.SetPayload(payload)
+		return payload, nil
+	}
+	f.SetPayload(out)
+	f.SetFlags(f.GetFlags() | FlagCompressed)
+	return out, nil
+}
+
+// decodePayload returns f's message bytes, decompressing when the frame is
+// marked. The expansion is bounded by maxRecv the way grpc-go bounds it: read
+// one byte past the cap and fail with ResourceExhausted, so a decompression
+// bomb cannot allocate without limit.
+func decodePayload(f *Frame, comp encoding.Compressor, maxRecv int) ([]byte, error) {
+	payload := f.GetPayload()
+	if !f.isCompressed() {
+		return payload, nil
+	}
+	if comp == nil {
+		return nil, status.Error(codes.Internal, "drpc: frame is compressed but the call has no compressor")
+	}
+	r, err := comp.Decompress(bytes.NewReader(payload))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "drpc: decompress: %v", err)
+	}
+	limit := int64(maxRecv)
+	if limit <= 0 {
+		limit = defaultMaxRecvMsgSize
+	}
+	out, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "drpc: decompress: %v", err)
+	}
+	if int64(len(out)) > limit {
+		return nil, status.Errorf(codes.ResourceExhausted, "drpc: received message after decompression larger than max (> %d)", limit)
+	}
+	return out, nil
+}
+
+// unmarshalBytes decodes b into m with codec.
+func unmarshalBytes(b []byte, m any, codec encoding.CodecV2) error {
+	return codec.Unmarshal(mem.BufferSlice{mem.SliceBuffer(b)}, m)
 }
 
 func (x *Frame) getCodec() encoding.CodecV2 {
@@ -121,6 +203,11 @@ func (x *Frame) setError(err error) {
 	if ok {
 		x.SetCode(uint32(st.Code()))
 		x.SetDesc(st.Message())
+		// status.WithDetails travels too (§5). It is a passenger: a terminal
+		// the channel cannot carry is re-sent without it (transmitTerminal).
+		if d := st.Proto().GetDetails(); len(d) > 0 {
+			x.SetDetails(d)
+		}
 	} else {
 		x.SetCode(uint32(codes.Unknown))
 		x.SetDesc(err.Error())

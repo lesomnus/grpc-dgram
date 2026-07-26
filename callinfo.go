@@ -18,8 +18,9 @@ import (
 // acts on, so the option surface generated code and gRPC users already know
 // behaves the same here (PROTOCOL.md §12, §16).
 //
-// Honored: ForceCodecV2, CallContentSubtype, MaxCallRecvMsgSize,
-// MaxCallSendMsgSize, OnFinish, Peer, PerRPCCredentials, Header, Trailer.
+// Honored: ForceCodecV2, CallContentSubtype, UseCompressor,
+// MaxCallRecvMsgSize, MaxCallSendMsgSize, OnFinish, Peer, PerRPCCredentials,
+// Header, Trailer.
 //
 // OnFinish runs on whichever goroutine ends the call — usually the adapter's
 // receive loop — and before the caller observes the result, which is what
@@ -46,8 +47,9 @@ const (
 
 // callInfo is the resolved per-call configuration.
 type callInfo struct {
-	codec     encoding.CodecV2
-	codecName string // "" = proto (the wire default, §12)
+	codec      encoding.CodecV2
+	codecName  string // "" = proto (the wire default, §12)
+	compressor string // "" = none (§12.1)
 
 	maxRecv int
 	maxSend int
@@ -61,10 +63,11 @@ type callInfo struct {
 
 func (c *Conn) newCallInfo() *callInfo {
 	return &callInfo{
-		codec:   defaultCodec,
-		maxRecv: c.maxRecv,
-		maxSend: c.maxSend,
-		creds:   c.creds,
+		codec:      defaultCodec,
+		compressor: c.compressor,
+		maxRecv:    c.maxRecv,
+		maxSend:    c.maxSend,
+		creds:      c.creds,
 	}
 }
 
@@ -85,6 +88,8 @@ func (c *Conn) resolveCallOptions(opts []grpc.CallOption) (*callInfo, error) {
 			ci.codec, ci.codecName, forced = o.CodecV2, strings.ToLower(o.CodecV2.Name()), true
 		case grpc.ContentSubtypeCallOption:
 			subtype = strings.ToLower(o.ContentSubtype)
+		case grpc.CompressorCallOption:
+			ci.compressor = o.CompressorType
 		case grpc.MaxRecvMsgSizeCallOption:
 			ci.maxRecv = o.MaxRecvMsgSize
 		case grpc.MaxSendMsgSizeCallOption:
@@ -115,6 +120,9 @@ func (c *Conn) resolveCallOptions(opts []grpc.CallOption) (*callInfo, error) {
 			ci.codec = codec
 		}
 		ci.codecName = subtype
+	}
+	if ci.compressor != "" && encoding.GetCompressor(ci.compressor) == nil {
+		return nil, status.Errorf(codes.Internal, "drpc: no compressor registered for %q", ci.compressor)
 	}
 	return ci, nil
 }

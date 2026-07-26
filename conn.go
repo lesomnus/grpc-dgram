@@ -26,6 +26,7 @@ type Conn struct {
 
 	// Endpoint-wide call defaults; per-call options override them
 	// (see callinfo.go).
+	compressor   string
 	maxRecv      int
 	maxSend      int
 	creds        []credentials.PerRPCCredentials

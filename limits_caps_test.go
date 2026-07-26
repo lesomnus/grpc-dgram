@@ -210,9 +210,11 @@ func TestLimits_TombstoneEntryCapFloor(t *testing.T) {
 
 func TestLimits_TombstoneByteCapKeyOnly(t *testing.T) {
 	var execs atomic.Int32
-	// Each echoed response is ~45 payload bytes: one fits the 64-byte cap,
-	// two do not — completing the second call degrades the first to key-only.
-	ls := newLcServer(t, drpc.WithLimits(drpc.Limits{MaxTombstoneBytes: 64}), countExecs(&execs))
+	// Each stored terminal is ~72 bytes on the wire (the cap counts the whole
+	// frame — payload, trailer and status details all cost memory, §9.2): one
+	// fits the 100-byte cap, two do not, so completing the second call
+	// degrades the first to key-only.
+	ls := newLcServer(t, drpc.WithLimits(drpc.Limits{MaxTombstoneBytes: 100}), countExecs(&execs))
 	const peer = "peer-bytes"
 	const epoch uint32 = 0x2B
 	msg := strings.Repeat("a", 30)

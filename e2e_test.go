@@ -194,6 +194,17 @@ func (c *Client) firstRxPayload(t *testing.T) *drpc.Frame {
 	return nil
 }
 
+// assertStatusEqual compares two statuses by their wire content. Comparing
+// *status.Status values structurally is unsound: they wrap a proto message
+// whose internal bookkeeping (size caches, lazy state) differs between an
+// instance that has been marshaled and one that has not.
+func assertStatusEqual(t *testing.T, want, got *status.Status) {
+	t.Helper()
+	x.Equal(t, want.Code(), got.Code())
+	x.Equal(t, want.Message(), got.Message())
+	x.True(t, proto.Equal(want.Proto(), got.Proto()), "status protos must match")
+}
+
 func TestE2E(t *testing.T) {
 	pipe := PipeOption{}.Use
 
@@ -329,7 +340,7 @@ func TestE2E(t *testing.T) {
 
 			st_, ok := status.FromError(err)
 			x.True(t, ok)
-			x.Equal(t, st, st_)
+			assertStatusEqual(t, st, st_)
 		})
 		t.Run("Server Streaming", func(t *testing.T) {
 			ctx := t.Context()
@@ -346,7 +357,7 @@ func TestE2E(t *testing.T) {
 
 			st_, ok := status.FromError(err)
 			x.True(t, ok)
-			x.Equal(t, st, st_)
+			assertStatusEqual(t, st, st_)
 		})
 		t.Run("Client Streaming", func(t *testing.T) {
 			ctx := t.Context()
@@ -372,7 +383,7 @@ func TestE2E(t *testing.T) {
 
 			st_, ok := status.FromError(err)
 			x.True(t, ok)
-			x.Equal(t, st, st_)
+			assertStatusEqual(t, st, st_)
 		})
 		t.Run("Bidi Streaming", func(t *testing.T) {
 			ctx := t.Context()
@@ -392,7 +403,7 @@ func TestE2E(t *testing.T) {
 
 			st_, ok := status.FromError(err)
 			x.True(t, ok)
-			x.Equal(t, st, st_)
+			assertStatusEqual(t, st, st_)
 		})
 	})
 	t.Run("unknown service", func(t *testing.T) {

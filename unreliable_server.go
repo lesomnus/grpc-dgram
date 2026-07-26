@@ -7,6 +7,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // This file holds the server-side unreliable-mode machinery: per-incarnation
@@ -90,7 +91,10 @@ func (ps *peerState) addTombLocked(sid uint32, term *Frame, expire time.Time) {
 	}
 	size := 0
 	if term != nil {
-		size = len(term.GetPayload())
+		// The whole frame is what the tombstone retains: status details and
+		// trailer metadata cost memory exactly like a payload does (§9.2,
+		// §15), and details can dwarf it.
+		size = proto.Size(term)
 	}
 	if old := ps.tombs[sid]; old != nil {
 		// Replace in place: keep the order entry, fix the byte accounting.

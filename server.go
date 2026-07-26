@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
@@ -430,6 +431,15 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	if codec == nil {
 		return s.rejectOpen(ctx, f, codes.Unimplemented, "unsupported codec: %s", f.GetCodec())
 	}
+	// The compressor, like the codec, is named on the OPEN and governs the
+	// whole call in both directions (PROTOCOL.md §12.1).
+	var comp encoding.Compressor
+	if name := f.GetCompressor(); name != "" {
+		comp = encoding.GetCompressor(name)
+		if comp == nil {
+			return s.rejectOpen(ctx, f, codes.Unimplemented, "unsupported compressor: %s", name)
+		}
+	}
 
 	// The handler ctx derives from the Server root — never from the
 	// per-datagram rx ctx — with the peer re-attached (PROTOCOL.md §6.4).
@@ -470,6 +480,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	}
 	st := newServerStream(sctx, s, key, desc, codec, rxCfg.withReliableFloor(rel), rel)
 	st.cancelTimeout = cancelTimeout
+	st.comp = comp
 	// The OPEN advertises the client's receive window (§4.2); it precedes
 	// every server frame, so the server never needs the assumed window.
 	if rel {
@@ -608,35 +619,28 @@ func (s *Server) runUnary(st *serverStream, transport *serverTransportUnary, ope
 	if err == nil && st.ctx.Err() != nil {
 		err = context.Cause(st.ctx)
 	}
-
-	st.txMu.Lock()
-	f := st.nextFrameLocked()
-	st.txMu.Unlock()
-	f.SetFlags(FlagClose)
-	header, trailer := transport.snapshot()
-	if header != nil {
-		f.SetHeader(newMd(header))
-	}
-	if trailer != nil {
-		f.SetTrailer(newMd(trailer))
-	}
-	if err != nil {
-		f.setError(toStatusErr(err))
-	} else {
+	if err == nil {
+		// The unary response rides the terminal frame (PROTOCOL.md §8), so it
+		// is marshaled here and terminalFrame carries it — compressed, and
+		// size-capped on the bytes that actually travel (§12.1).
 		buf, merr := st.codec.Marshal(resp)
 		if merr != nil {
-			f.setError(status.Errorf(codes.Internal, "marshal response: %v", merr))
+			err = status.Errorf(codes.Internal, "marshal response: %v", merr)
 		} else {
 			payload := buf.Materialize()
 			buf.Free()
-			if serr := checkSendSize(len(payload), st.maxSend); serr != nil {
-				f.setError(toStatusErr(serr))
-			} else {
-				f.SetPayload(payload)
-				f.SetCode(uint32(codes.OK))
-			}
+			st.setResp(payload)
 		}
 	}
+	header, trailer := transport.snapshot()
+	if header != nil {
+		st.SetHeader(header)
+	}
+	if trailer != nil {
+		st.SetTrailer(trailer)
+	}
+
+	f := st.terminalFrame(err)
 
 	// The terminal is sent even when the handler ctx ended: the client (or
 	// its tombstone) decides what to do with it — unless the peer disowned
@@ -645,7 +649,7 @@ func (s *Server) runUnary(st *serverStream, transport *serverTransportUnary, ope
 		return
 	}
 	term = f
-	st.transmit(context.WithoutCancel(st.ctx), f)
+	st.transmitTerminal(f)
 }
 
 func (s *Server) runStream(st *serverStream) {
@@ -673,7 +677,7 @@ func (s *Server) runStream(st *serverStream) {
 		return
 	}
 	term = f
-	st.transmit(context.WithoutCancel(st.ctx), f)
+	st.transmitTerminal(f)
 }
 
 func (s *Server) finish(st *serverStream, term *Frame) {

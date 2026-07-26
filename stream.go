@@ -139,6 +139,7 @@ type clientStream struct {
 	ci        *callInfo
 	codec     encoding.CodecV2
 	codecName string
+	comp      encoding.Compressor // message compressor, nil = none (§12.1)
 
 	// Per-stream flow control (reliable mode, §4.2): flowTx is credit for
 	// what this side sends, flowRx accounts what the application consumed.
@@ -217,6 +218,9 @@ func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, ci
 		hdrReady: make(chan struct{}),
 		done:     make(chan struct{}),
 	}
+	if ci.compressor != "" {
+		s.comp = encoding.GetCompressor(ci.compressor)
+	}
 	if c.mode.reliable {
 		// Advertise this side's buffer as the server's initial send window
 		// (§4.2); it rides the OPEN. Until the server advertises its own, this
@@ -274,12 +278,17 @@ func (s *clientStream) reportFinish() {
 // (grpc.MaxCallRecvMsgSize), then unmarshaled. A message past the cap fails
 // the call, as it does on gRPC.
 func (s *clientStream) recvInto(f *Frame, m any) error {
-	if err := checkRecvSize(len(f.GetPayload()), s.ci.maxRecv); err != nil {
+	payload, err := decodePayload(f, s.comp, s.ci.maxRecv)
+	if err == nil {
+		err = checkRecvSize(len(payload), s.ci.maxRecv)
+	}
+	if err != nil {
+		// Oversize or undecodable: the RPC fails, as it does on gRPC.
 		s.sendAbort(codes.ResourceExhausted)
 		s.finishLocal(err)
 		return err
 	}
-	return f.unmarshal(m, s.codec)
+	return unmarshalBytes(payload, m, s.codec)
 }
 
 // handleRx processes one server frame for this stream. Called by Conn.Handle;
@@ -428,6 +437,9 @@ func (s *clientStream) openFrame() *Frame {
 	if s.codecName != "" {
 		f.SetCodec(s.codecName)
 	}
+	if s.ci.compressor != "" {
+		f.SetCompressor(s.ci.compressor)
+	}
 	if s.conn.mode.reliable {
 		f.SetWindow(uint32(s.rxCfg.size))
 	}
@@ -503,11 +515,6 @@ func (s *clientStream) send(m any) error {
 	}
 	payload := buf.Materialize()
 	buf.Free()
-	if err := checkSendSize(len(payload), s.ci.maxSend); err != nil {
-		// grpc.MaxCallSendMsgSize: refused locally, nothing reaches the wire.
-		s.txMu.Unlock()
-		return err
-	}
 	opening := !s.txOpened
 	s.txMu.Unlock()
 
@@ -545,7 +552,23 @@ func (s *clientStream) send(m any) error {
 	} else {
 		f = s.nextFrame()
 	}
-	f.SetPayload(payload)
+	wire, cerr := setPayload(f, s.comp, payload)
+	if cerr == nil {
+		// grpc.MaxCallSendMsgSize caps the bytes that would go on the wire,
+		// i.e. after compression, as grpc-go does.
+		cerr = checkSendSize(len(wire), s.ci.maxSend)
+	}
+	if cerr != nil {
+		s.txSeq.undo(f.GetSeq())
+		if opening {
+			s.txOpened, s.txClosed = false, false
+			s.retxOpen = nil
+		} else {
+			s.flowTx.undo() // the message never reached the wire (§4.2)
+		}
+		s.txMu.Unlock()
+		return cerr
+	}
 	s.txMu.Unlock()
 
 	// Transmit outside txMu: a blocking adapter must not stall the whole
@@ -566,7 +589,16 @@ func (s *clientStream) undoRefused(f *Frame, err error) {
 	}
 	s.txMu.Lock()
 	s.txSeq.undo(f.GetSeq())
+	if f.isOpen() {
+		// The OPEN never reached the wire: nothing to retransmit, and the
+		// call was never created at the server.
+		s.txOpened, s.txClosed = false, false
+		s.retxOpen, s.retxAt = nil, time.Time{}
+	}
 	s.txMu.Unlock()
+	if f.isData() {
+		s.flowTx.undo()
+	}
 }
 
 func (s *clientStream) SendMsg(m any) error {
@@ -741,6 +773,14 @@ func (s *clientStream) abortFromCtx() {
 
 func (s *clientStream) sendAbort(code codes.Code) {
 	s.txMu.Lock()
+	if !s.txOpened {
+		// The OPEN never reached the wire (a local refusal): there is no call
+		// at the server to abort, and a bare CLOSE would only draw a delayed
+		// RESET for a sid it has never seen (§9.3).
+		s.txClosed = true
+		s.txMu.Unlock()
+		return
+	}
 	if s.abortFrame != nil {
 		// A ctx AfterFunc and abandon() can both pass the done check; one
 		// abort obligation is enough (§10.3) — the first one stands.
@@ -884,6 +924,7 @@ type serverStream struct {
 
 	desc  *serviceDesc
 	codec encoding.CodecV2
+	comp  encoding.Compressor // message compressor, nil = none (§12.1)
 
 	// Per-stream flow control (reliable mode, §4.2).
 	flowTx flowSender
@@ -1183,9 +1224,6 @@ func (s *serverStream) SendMsg(m any) error {
 	}
 	payload := buf.Materialize()
 	buf.Free()
-	if err := checkSendSize(len(payload), s.maxSend); err != nil {
-		return err
-	}
 
 	if s.desc.stream.ServerStreams {
 		// Flow control (§4.2): park until the client has room, instead of
@@ -1213,7 +1251,16 @@ func (s *serverStream) SendMsg(m any) error {
 		return nil
 	}
 	f := s.nextFrameLocked()
-	f.SetPayload(payload)
+	wire, cerr := setPayload(f, s.comp, payload)
+	if cerr == nil {
+		cerr = checkSendSize(len(wire), s.maxSend)
+	}
+	if cerr != nil {
+		s.txSeq.undo(f.GetSeq())
+		s.flowTx.undo() // the message never reached the wire (§4.2)
+		s.txMu.Unlock()
+		return cerr
+	}
 	s.attachHeaderLocked(f)
 	s.txMu.Unlock()
 
@@ -1239,6 +1286,9 @@ func (s *serverStream) undoRefused(f *Frame, err error) {
 	s.txMu.Lock()
 	s.txSeq.undo(f.GetSeq())
 	s.txMu.Unlock()
+	if f.isData() {
+		s.flowTx.undo()
+	}
 }
 
 func (s *serverStream) RecvMsg(m any) error {
@@ -1265,10 +1315,14 @@ func (s *serverStream) RecvMsg(m any) error {
 // recvInto delivers one received frame to the handler: size-capped
 // (grpc.MaxRecvMsgSize), then unmarshaled.
 func (s *serverStream) recvInto(f *Frame, m any) error {
-	if err := checkRecvSize(len(f.GetPayload()), s.maxRecv); err != nil {
+	payload, err := decodePayload(f, s.comp, s.maxRecv)
+	if err == nil {
+		err = checkRecvSize(len(payload), s.maxRecv)
+	}
+	if err != nil {
 		return err
 	}
-	return f.unmarshal(m, s.codec)
+	return unmarshalBytes(payload, m, s.codec)
 }
 
 // recvBuffered delivers a frame taken out of the rx buffer and returns the
@@ -1299,6 +1353,37 @@ func (s *serverStream) grantWindow(n uint32) {
 	s.transmit(context.WithoutCancel(s.ctx), f)
 }
 
+// transmitTerminal sends the call's terminal frame, shrinking it until the
+// channel accepts it. Every termination path depends on this frame arriving
+// (§10.7), so its passengers are shed in order of expendability: first the
+// status details (§5), then the response payload — which cannot be delivered
+// anyway, so the call ends with ResourceExhausted rather than with silence.
+// The frame is mutated in place and keeps its seq: a refused frame never
+// reached the wire, so no sequence number is burned (§4.4) and what the
+// tombstone stores for replay is exactly what was sent (§9.2).
+func (s *serverStream) transmitTerminal(f *Frame) error {
+	ctx := context.WithoutCancel(s.ctx)
+	err := s.transmit(ctx, f)
+	if err == nil || !errors.Is(err, ErrMessageTooLarge) {
+		return err
+	}
+	if len(f.GetDetails()) > 0 {
+		f.SetDetails(nil)
+		err = s.transmit(ctx, f)
+		if err == nil || !errors.Is(err, ErrMessageTooLarge) {
+			return err
+		}
+	}
+	if !f.HasPayload() && codes.Code(f.GetCode()) == codes.ResourceExhausted {
+		return err // already minimal; the channel simply cannot carry it
+	}
+	f.ClearPayload()
+	f.SetFlags(f.GetFlags() &^ FlagCompressed)
+	f.setError(status.Errorf(codes.ResourceExhausted,
+		"drpc: the terminal frame does not fit the transport: %v", err))
+	return s.transmit(ctx, f)
+}
+
 // setResp stores the unary / SendAndClose response payload, which rides the
 // terminal frame (PROTOCOL.md §8).
 func (s *serverStream) setResp(payload []byte) {
@@ -1314,7 +1399,7 @@ func (s *serverStream) terminalFrame(err error) *Frame {
 	defer s.txMu.Unlock()
 
 	f := s.nextFrameLocked()
-	f.SetFlags(FlagClose)
+	f.SetFlags(f.GetFlags() | FlagClose)
 	if s.txHeader != nil {
 		f.SetHeader(newMd(s.txHeader))
 		s.hdrSent = true
@@ -1327,7 +1412,19 @@ func (s *serverStream) terminalFrame(err error) *Frame {
 		return f
 	}
 	if s.respSet {
-		f.SetPayload(s.resp)
+		wire, cerr := setPayload(f, s.comp, s.resp)
+		if cerr == nil {
+			// The cap measures what the frame carries — after compression, as
+			// grpc-go does, and here rather than at marshal time because the
+			// unary and SendAndClose responses only become wire bytes now.
+			cerr = checkSendSize(len(wire), s.maxSend)
+		}
+		if cerr != nil {
+			f.ClearPayload()
+			f.SetFlags(f.GetFlags() &^ FlagCompressed)
+			f.setError(toStatusErr(cerr))
+			return f
+		}
 	}
 	f.SetCode(uint32(codes.OK))
 	return f
