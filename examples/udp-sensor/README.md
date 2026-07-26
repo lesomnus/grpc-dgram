@@ -47,16 +47,16 @@ go run ./... -connect 127.0.0.1:9000     # terminal 2
 ```
 --- subscription report (2.031s) ---
   stream ended        : rpc error: code = DeadlineExceeded desc = context deadline exceeded
-  readings produced   : 392 (seq 1..392)
-  readings delivered  : 238 (60.7%)
-  missing             : 154
-    lost on the wire  : 24 (the §14 gap counter)
-    evicted, DropOldest: 130 (rx buffer full while this consumer lagged)
-  longest single gap  : 3 readings
+  readings produced   : 400 (seq 1..400)
+  readings delivered  : 243 (60.8%)
+  missing             : 157
+    lost on the wire  : 16 (the §14 gap counter)
+    evicted, DropOldest: 141 (rx buffer full while this consumer lagged)
+  longest single gap  : 2 readings
   out of order        : 0, by construction — gaps are the only distortion
 
 drpc.Counters (client):
-  Skipped 24  Dropped 0  DataLoss 0  OffShape 0
+  Skipped 16  Dropped 141  DataLoss 0  OffShape 0
   ...
 ```
 
@@ -65,15 +65,17 @@ Two different losses, and the difference is the point:
 | | where | counted by |
 |---|---|---|
 | **lost on the wire** | the datagram never arrived | `Counters.Skipped` — the §14 gap counter, taken from the seq window |
-| **evicted** | the datagram arrived, but the consumer was behind and `DropOldest` made room | derived here as `missing - Skipped` |
+| **evicted** | the datagram arrived, but the consumer was behind and `DropOldest` made room | `Counters.Dropped` — the rx buffer's own count |
 
 Both are *gaps*, never reordering or duplication: what the application receives
 is an ordered subsequence of what the handler sent. That is the whole contract
 on an unreliable channel, and `Reading.seq` lets an application see it directly.
 
-> `Counters.Dropped` stays 0: the core counts rx-buffer drops per stream but
-> does not emit `EventDropped` yet, so the report derives the eviction count
-> from the seq numbers instead. Every other counter here is live.
+> The two counters are independent measurements that happen to agree: `Skipped`
+> comes from the seq window (a frame that never arrived), `Dropped` from the rx
+> buffer (a frame that arrived and was evicted). An eviction leaves no gap —
+> the window already accepted it — which is why one counter cannot substitute
+> for the other.
 
 ## Flags
 

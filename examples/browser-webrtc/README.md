@@ -2,7 +2,7 @@
 
 The project's final goal, runnable: **a browser page calling a Go gRPC service
 over a WebRTC DataChannel.** No HTTP/2, no proxy, no gRPC-Web. The page speaks
-the drpc wire protocol directly — using the TypeScript port in
+the dRPC wire protocol directly — using the TypeScript port in
 [`ts/`](../../ts) — and the Go side answers with generated gRPC stubs on
 [`transport/pion`](../../transport/pion). The only HTTP request in the whole
 flow is the SDP exchange that sets the channel up.
@@ -32,7 +32,7 @@ by the import map in `web/index.html`.
 
 - **One wire, two implementations.** The browser runs the TS port
   (`Conn` + `DataChannelTransport`); the server runs the Go core
-  (`drpc.Server` + `pion.Gateway`). Both implement drpc v1.0
+  (`drpc.Server` + `pion.Gateway`). Both implement dRPC v1.0
   (`PROTOCOL.md`), so the call is just a call.
 - **Reliable mode, derived from the channel.** `pc.createDataChannel('rpc')`
   is ordered with no retransmit or lifetime cap, so both adapters report
@@ -72,7 +72,7 @@ package name at `ts/dist`.
 
 | | |
 |---|---|
-| `main.go` | flags, the HTTP server (page, `/ts/dist/`, `POST /offer`), the drpc server |
+| `main.go` | flags, the HTTP server (page, `/ts/dist/`, `POST /offer`), the dRPC server |
 | `sdp.go` | the one-shot SDP exchange and the pion gateway wiring |
 | `service.go` | the `EchoService` handler — ordinary gRPC code |
 | `jsoncodec.go` | the `"json"` wire codec, so the page needs no protobuf runtime |
@@ -99,7 +99,7 @@ buf generate examples/browser-webrtc/proto --template examples/browser-webrtc/bu
 
 - Localhost only, deliberately: no STUN/TURN, no trickle ICE — the answer is
   sent once ICE gathering completes. Across a real network you would add ICE
-  servers and a signaling channel of your own; drpc does not care how the
+  servers and a signaling channel of your own; dRPC does not care how the
   channel is negotiated.
 - WebRTC data channels are DTLS-encrypted, which is the deployment the protocol
   assumes (`PROTOCOL.md` §15). There is still no *authentication* of frames

@@ -1,8 +1,8 @@
 # `@lesomnus/grpc-dgram/transport/node-udp`
 
-drpc over **UDP datagrams on Node.js** — the TS twin of the Go `transport/udp`
+dRPC over **UDP datagrams on Node.js** — the TS twin of the Go `transport/udp`
 adapter, and wire-compatible with it. One datagram carries one marshaled
-`Envelop`; the channel is unreliable (drpc's default mode); nothing is ever
+`Envelop`; the channel is unreliable (dRPC's default mode); nothing is ever
 fragmented — a message over the size limit is refused at send with
 `MessageTooLargeError`, which the core maps to `RESOURCE_EXHAUSTED` on the
 owning call (§4.4).

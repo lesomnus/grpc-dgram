@@ -11,7 +11,7 @@ middleware already implement. It reports **calls**: begin, headers, one event
 per message, trailers, end, with the call's status on `End.Error`. Existing
 instrumentation works unchanged because these are literally the same events.
 
-`WithProtocolStats` takes a drpc `ProtocolStats` observer. It reports what a
+`WithProtocolStats` takes a dRPC `ProtocolStats` observer. It reports what a
 datagram channel does that gRPC has no vocabulary for: a gap in a stream, a
 frame the receive buffer threw away, a RESET, a retransmission, a liveness
 window expiring. None of that reaches a `stats.Handler`, because in gRPC's
@@ -187,7 +187,7 @@ func (h *metrics) HandleConn(context.Context, stats.ConnStats) {}
 The `Client` field on every event says which side produced it, so one handler
 can instrument both endpoints of a process (the examples run both in one).
 
-## The drpc surface: `ProtocolStats`
+## The dRPC surface: `ProtocolStats`
 
 ```go
 type ProtocolStats interface {
@@ -360,7 +360,7 @@ table above (`skipped`, `dropped`, `off-shape`, `reset-sent`,
 
 ## Limits
 
-- **No tracing spans.** drpc emits no spans of its own; a `stats.Handler` that
+- **No tracing spans.** dRPC emits no spans of its own; a `stats.Handler` that
   builds them from `Begin`/`End` (as `otelgrpc` does) works, but there is no
   trace context propagated on the wire beyond the metadata you put there
   yourself (§11).

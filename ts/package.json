@@ -3,7 +3,7 @@
   "type": "module",
   "version": "0.0.0",
   "private": true,
-  "description": "gRPC over unreliable datagram channels — TypeScript port of grpc-dgram (wire protocol v1.0)",
+  "description": "gRPC over unreliable datagram channels — TypeScript port of gRPC-dgram (dRPC wire protocol v1.1)",
   "exports": {
     ".": "./dist/index.mjs",
     "./transport/webrtc": "./dist/transport/webrtc.mjs",

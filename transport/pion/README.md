@@ -1,6 +1,6 @@
 # transport/pion
 
-drpc over WebRTC DataChannels ([pion/webrtc](https://github.com/pion/webrtc)):
+dRPC over WebRTC DataChannels ([pion/webrtc](https://github.com/pion/webrtc)):
 **one channel message carries one marshaled `Envelop`**, and the protocol
 mode is derived from the channel's own configuration:
 

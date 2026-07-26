@@ -4,7 +4,7 @@ Read this before continuing the port.
 
 ## TL;DR
 
-The TypeScript port of drpc **v1.1** (`../docs/PROTOCOL.md`) is **functionally
+The TypeScript port of dRPC **v1.1** (`../docs/PROTOCOL.md`) is **functionally
 complete, green, and adversarially audited**. Cross-language interop with the
 Go server is verified at runtime over UDP — including the v1.1 surface, where
 a Go/TS split would be silent: binary metadata, status details and the
@@ -41,7 +41,7 @@ mirroring Go's `transport/{udp,pion,gorilla}/` layout (dir + README each).
 | `transport/websocket/` | `WebSocketTransport` (client) + gateway/`servePeer` (server), reliable | `transport/gorilla/*.go` |
 | `transport/node-udp/` | `UdpTransport`/`UdpGateway` + `dialUdp`/`listenUdp` (Node `dgram`) | `transport/udp/*.go` |
 | `transport/protobuf-es/` | `fromService`/`fromMethod` — derive descriptors from generated protobuf-es | grpc-go codegen (G2) |
-| `transport/connect/` | `createDrpcTransport` — a Connect-ES `Transport` over a drpc `Conn` | — (Connect interop) |
+| `transport/connect/` | `createDrpcTransport` — a Connect-ES `Transport` over a dRPC `Conn` | — (Connect interop) |
 
 Verified at this commit:
 
@@ -115,7 +115,7 @@ and unhandled-rejection/leak review.
 
 The Connect-ES transport got its own review (streaming contract, error/metadata
 mapping, cancellation/leak). One finding, fixed: `transport/connect/index.ts`
-fed raw drpc metadata straight into the WHATWG `Headers` API, which throws a `TypeError` on
+fed raw dRPC metadata straight into the WHATWG `Headers` API, which throws a `TypeError` on
 a value with a newline/control char or a non-latin1 codepoint (emoji) or a
 non-token key — so a spec-legal server response (§11 imposes no character
 limit) crashed the call with a raw `TypeError` instead of returning the message

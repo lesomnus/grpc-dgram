@@ -126,7 +126,7 @@ the wire, with `Internal` naming the key. The reason is diagnostic: without
 the gate the same bug surfaces as a proto marshal failure deep inside an
 adapter — a bare `UNKNOWN` naming no key at all. Credential-produced metadata
 goes through the same gate (§11, §15). Upper-case keys are *not* rejected:
-grpc-go lower-cases outgoing keys in `FromOutgoingContext` before drpc ever
+grpc-go lower-cases outgoing keys in `FromOutgoingContext` before dRPC ever
 sees them, so rejecting the mixed-case form would fail calls grpc-go accepts.
 
 Receiving is deliberately lenient. A hostile peer must not be able to kill a
@@ -313,7 +313,7 @@ implementing `drpc.TransportPeer`; a gateway does it per frame, attaching a
 other, so over UDP `p.Addr` and `p.LocalAddr` are real socket addresses on
 both sides.
 
-Two things a port should not assume. **`p.AuthInfo` is always nil**: drpc
+Two things a port should not assume. **`p.AuthInfo` is always nil**: dRPC
 terminates no TLS and inspects no channel, so code that read it to recover a
 client certificate must get that from the layer that did the handshake. And
 **`p.Addr` need not be an IP** — `transport/pion` names a DataChannel by its
@@ -324,7 +324,7 @@ never hands a handler a nil peer.
 
 ## Per-RPC credentials
 
-`PerRPCCredentials` are a metadata producer and nothing more — drpc
+`PerRPCCredentials` are a metadata producer and nothing more — dRPC
 authenticates nothing itself (§15) — and that has two consequences.
 
 ```go
@@ -336,7 +336,7 @@ conn := drpc.NewConn(tx,
 ```
 
 Credentials that report `RequireTransportSecurity()` are **refused** with
-`Unauthenticated` before the call exists, because drpc cannot attest a channel
+`Unauthenticated` before the call exists, because dRPC cannot attest a channel
 it does not own; `WithAssumeTransportSecurity()` is the explicit override for
 when the channel really is DTLS/WSS/WebRTC. And the audience handed to the
 provider is grpc-go's `createAudience` string,
@@ -344,7 +344,7 @@ provider is grpc-go's `createAudience` string,
 because providers mint the JWT `aud` claim from it and a `drpc://` scheme
 would produce tokens no audience-checking server accepts. Without
 `WithAuthority` the audience degrades to `https:///pkg.Service`, and unlike
-grpc-go drpc does not strip a trailing `:443`, so pass the bare host when the
+grpc-go dRPC does not strip a trailing `:443`, so pass the bare host when the
 audience has to match.
 
 A provider that returns a status error in one of gRFC A54's control-plane-
@@ -364,7 +364,7 @@ reflection.Register(srv) // *drpc.Server satisfies reflection.GRPCServer
 ```
 
 Be clear about what that buys. The reflection service is an ordinary bidi RPC,
-so it answers a peer that speaks the **drpc wire**; `grpcurl`, `grpc_cli` and
+so it answers a peer that speaks the **dRPC wire**; `grpcurl`, `grpc_cli` and
 every other tool in the HTTP/2 ecosystem cannot reach it, because there is no
 HTTP/2 to reach it over. And its responses carry `FileDescriptorProto` blobs
 that routinely exceed a 1200-byte datagram, so over `transport/udp` such a
@@ -404,7 +404,7 @@ A server that does not trust client-asserted timeouts clamps them with
 ## Observability
 
 `drpc.WithStatsHandler` takes a `google.golang.org/grpc/stats.Handler` on
-either role, so existing gRPC instrumentation observes drpc calls unchanged:
+either role, so existing gRPC instrumentation observes dRPC calls unchanged:
 `Begin`, `OutHeader`, `OutPayload`, `InPayload`, `InTrailer`, `End` on the
 client and `Begin`, `InHeader`, `InPayload`, `OutPayload`, `OutTrailer`, `End`
 on the server, with `Client` and `End.Error` set as grpc-go sets them and
@@ -426,7 +426,7 @@ surface, `WithProtocolStats` (§14), with `drpc.Counters` as a ready-made sink.
   transport you already opened, and `GetState`/`WaitForStateChange`/`Connect`
   belong to that same absent model. Picking a backend and watching DNS live
   above this library.
-- **No HTTP/2 wire compatibility.** The framing is drpc's own (§5). No
+- **No HTTP/2 wire compatibility.** The framing is dRPC's own (§5). No
   existing proxy, sidecar, gateway or CLI speaks it. If interop with gRPC
   infrastructure matters, this is the wrong transport — that is the trade the
   whole project is built on.
@@ -434,7 +434,7 @@ surface, `WithProtocolStats` (§14), with `drpc.Counters` as a ready-made sink.
   not a security token; deploy over DTLS, WSS or WebRTC.
 
 One capacity difference is easy to miss. gRPC's `MaxConcurrentStreams` makes a
-client *queue* new streams; drpc's `Limits.MaxLiveCalls` (4096 per transport
+client *queue* new streams; dRPC's `Limits.MaxLiveCalls` (4096 per transport
 peer, §15) makes the server **reject** the OPEN with `RESOURCE_EXHAUSTED`,
 tombstoned so a retransmit gets the same answer. A port that relied on
 queueing to absorb a burst sees failed calls instead.

@@ -1,4 +1,4 @@
-# grpc-dgram
+# gRPC-dgram
 
 **gRPC programming model over unreliable datagram channels (UDP, WebRTC data
 channels) — built for real-time sensor streams.**
@@ -18,13 +18,13 @@ generated stubs ──> drpc.Conn ──(FrameHandler)──> adapter (1 Envelop
 generated impls <── drpc.Server <──(per frame)──── adapter (unpacks Envelop) <──────── channel
 ```
 
-- Package: `github.com/lesomnus/grpc-dgram` (import name `drpc`)
+- Package: `github.com/lesomnus/grpc-dgram` (import name `drpc`); the wire
+  protocol is **dRPC**, specified in [`docs/PROTOCOL.md`](./docs/PROTOCOL.md)
 - Status: **core + protocol complete and characterized** (unary / server- /
   client- / bidi-streaming, metadata, interceptors, codecs, timeouts,
   liveness), **transport adapters shipped** (UDP, WebSocket, pion/webrtc), and
   a **TypeScript port** of the same wire protocol ([`ts/`](./ts) — browser and
   Node, verified against a real Go server).
-  Wire protocol: [`docs/PROTOCOL.md`](./docs/PROTOCOL.md).
 
 ---
 
@@ -51,7 +51,7 @@ subsequence** instead of stalling.
 | Rich status details (`status.WithDetails`) | ✅ travel on the terminal frame (dropped only if it would not fit the channel) |
 | Binary metadata (`-bin` keys) | ✅ arbitrary bytes, gRPC's own validation rules |
 | Per-call size limits, `OnFinish`, `Peer`, `PerRPCCredentials`, `GetServiceInfo` (reflection) | ✅ gRPC-parity option surface |
-| `stats.Handler` + drpc protocol counters (gaps, drops, RESETs, stalls) | ✅ [`stats.go`](./stats.go) |
+| `stats.Handler` + dRPC protocol counters (gaps, drops, RESETs, stalls) | ✅ [`stats.go`](./stats.go) |
 | Client & server deadlines | ✅ propagated on the wire, enforced both ends |
 | Default timeout / liveness so lost frames never hang a call | ✅ core design (see [Guarantees](#guarantees)) |
 | Reliable transports: loss machinery off, violations fail loud (`INTERNAL` on a seq gap/duplicate) | ✅ auto-detected per transport / per peer — see [Reliable transports](#reliable-transports) |
@@ -220,7 +220,8 @@ bugs — a lost reading is superseded by the next.
 
 - **Ordered subsequence, not the exact sequence.** Any dropped, reordered, or
   over-buffered data frame in unreliable mode is a silent gap with no error
-  until the terminal (a skipped-count is exposed via stats, planned). *Need
+  until the terminal — the skipped-message count is reported through the stats
+  surface ([`docs/observability.md`](./docs/observability.md)). *Need
   every message?* Use `WithReliable(true)` over a reliable adapter, or make the
   stream idempotent/superseding.
 - **At-most-once is per server incarnation.** A server restart (new epoch)
@@ -242,7 +243,7 @@ bugs — a lost reading is superseded by the next.
 - **Best-effort, single-datagram messages.** No `WaitForReady`, no transparent
   retry, no load balancing — those need a connectivity model a datagram
   channel does not have. The transport's message-size limit is **your
-  adapter's, not drpc's**: the core is size-agnostic and never fragments; an
+  adapter's, not dRPC's**: the core is size-agnostic and never fragments; an
   unreliable adapter rejects a message that doesn't fit its datagram at send
   (`ResourceExhausted`), while a reliable transport carries any size. The
   per-call `MaxCallRecvMsgSize`/`MaxCallSendMsgSize` guards are a separate
@@ -277,6 +278,8 @@ go test -run '^$' -fuzz FuzzServerHandle -fuzztime 20s .   # fuzz the frame entr
 (cd ts && pnpm install && pnpm test)   # TypeScript port, incl. the Go↔TS conformance test
 ```
 
+- Documentation: [`docs/`](./docs) — getting started, the transports, the two
+  modes, gRPC compatibility, observability, and the TypeScript port
 - Wire protocol & design rationale: [`docs/PROTOCOL.md`](./docs/PROTOCOL.md)
 - Runnable examples: [`examples/`](./examples) — a UDP sensor stream with the
   gap/drop counters printed, a reliable WebSocket echo with graceful shutdown,

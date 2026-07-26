@@ -1,7 +1,7 @@
 # @lesomnus/grpc-dgram
 
-TypeScript port of [grpc-dgram](../): gRPC-style RPC over unreliable datagram
-channels, implementing the **drpc wire protocol v1.1** (`../docs/PROTOCOL.md`).
+TypeScript port of [gRPC-dgram](../): gRPC-style RPC over unreliable datagram
+channels, implementing the **dRPC wire protocol v1.1** (`../docs/PROTOCOL.md`).
 Wire-compatible with the Go implementation — the §5 golden byte vectors are
 shared between the two test suites — so a TS client interoperates with a Go
 server and vice versa.
@@ -46,7 +46,7 @@ server and vice versa.
 - **Connect-ES transport** (`@lesomnus/grpc-dgram/transport/connect`, optional peer dep
   on `@connectrpc/connect`): use the standard `createClient(Service, transport)`
   ergonomics while the traffic runs over drpc. `createDrpcTransport(conn)`
-  turns a drpc `Conn` into a Connect `Transport` — the conformance suite drives
+  turns a dRPC `Conn` into a Connect `Transport` — the conformance suite drives
   a **real Go `drpc.Server` through a Connect client** end to end.
 
 ## Usage

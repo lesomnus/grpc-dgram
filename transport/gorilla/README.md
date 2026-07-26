@@ -1,6 +1,6 @@
 # transport/gorilla
 
-drpc over WebSocket ([gorilla/websocket](https://github.com/gorilla/websocket)):
+dRPC over WebSocket ([gorilla/websocket](https://github.com/gorilla/websocket)):
 **one binary message carries one marshaled `Envelop`**. The transport is
 reliable and ordered, so the core auto-detects reliable mode and runs with
 every protocol timer off — plain gRPC semantics over a WebSocket.

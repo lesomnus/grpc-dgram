@@ -58,7 +58,7 @@ calling Echo again, on a server that has already stopped:
   afterwards is refused immediately with a RESET (§9.4) instead of hanging.
 - **Order of teardown.** RPC layer first (`GracefulStop`), HTTP second. An
   upgraded WebSocket is a hijacked connection, so `http.Server.Shutdown`
-  neither waits for it nor closes it — the drpc gateway owns it from the
+  neither waits for it nor closes it — the dRPC gateway owns it from the
   `Upgrade` on.
 
 ## Files

@@ -1,4 +1,4 @@
-# drpc Wire Protocol — v1.0
+# dRPC Wire Protocol — v1.1
 
 > **Status: v1.1 (2026-07-25), pre-release.** The wire format — frame fields,
 > flags, seq/epoch rules, and the OPEN/CLOSE/RESET/PING/WINDOW state machines —
@@ -1146,13 +1146,13 @@ at all must use a reliable transport. This is the documented, intentional
 difference from gRPC.
 
 Endpoints additionally accept a **gRPC `stats.Handler`** (`WithStatsHandler`),
-so existing gRPC instrumentation observes drpc calls unchanged: `Begin`,
+so existing gRPC instrumentation observes dRPC calls unchanged: `Begin`,
 `In/OutHeader`, `In/OutPayload`, `In/OutTrailer`, `End`, with the payload
 lengths split into message size and wire size (§12.1).
 
 ## 15. Security & resource bounds
 
-- drpc provides **no** authentication, integrity, or confidentiality. Deploy
+- dRPC provides **no** authentication, integrity, or confidentiality. Deploy
   over DTLS / WSS / WebRTC (always encrypted). Raw UDP is spoofable: anyone
   who can inject datagrams can reset or poison calls. epoch is a correctness
   device, not a defense.
@@ -1196,7 +1196,7 @@ transport.
 
 | # | Limitation | Condition | Effect | Mitigation |
 |---|---|---|---|---|
-| L1 | **Ordered subsequence, not the exact sequence** | any dropped / reordered / over-buffered data frame, unreliable mode | silent gap, no error until the terminal (skip count via the planned stats surface, §14) | the sensor trade; move to a reliable transport (the mode changes at both ends, §10.6) or an idempotent/superseding stream if every message matters |
+| L1 | **Ordered subsequence, not the exact sequence** | any dropped / reordered / over-buffered data frame, unreliable mode | silent gap, no error until the terminal (the skip count is reported through the stats surface, §14) | the sensor trade; move to a reliable transport (the mode changes at both ends, §10.6) or an idempotent/superseding stream if every message matters |
 | L2 | **At-most-once is per server incarnation** | server restart (new epoch) mid-call, or a whole epoch container evicted under the §15 container cap before a > `TTL_tomb`-delayed duplicate arrives | handler may run a second time — dedup state did not survive | bounded to the incarnation; make handlers idempotent if cross-restart duplicates are unacceptable. (Tombstone *entry*-cap pressure no longer opens this window: the container floor keeps dedup, §9.2 — cap pressure costs replays only.) |
 | L3 | **No wire authentication** (§15) | raw-UDP attacker who can sniff a live `(epoch, sid, seq)` and inject datagrams | a forged same-epoch RESET kills a call; a forged `K_loud` run forces `DATA_LOSS` | deploy over DTLS / WSS / WebRTC (encrypted → unreachable). Incarnation isolation is closed in both directions (§6.1: server keying c→s, `peer_epoch` echo s→c, the server-epoch stream lock); same-epoch injection is the transport's job |
 | L6 | **Status details are a passenger** | a terminal frame that would not fit the channel (§4.4) | `code`+`desc` always travel; the details are dropped to keep the terminal sendable, and a still-oversize terminal degrades to a bare `RESOURCE_EXHAUSTED` | keep details small; the terminal is what every termination bound depends on (§10.7) |

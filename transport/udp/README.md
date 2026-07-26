@@ -1,7 +1,7 @@
 # transport/udp
 
-drpc over UDP datagrams: **one datagram carries one marshaled `Envelop`**, the
-channel is unreliable (drpc's default mode, timers on), and nothing is ever
+dRPC over UDP datagrams: **one datagram carries one marshaled `Envelop`**, the
+channel is unreliable (dRPC's default mode, timers on), and nothing is ever
 fragmented. This is the sensor-stream path.
 
 Part of the core module — importing it pulls no third-party dependencies.

@@ -1,6 +1,6 @@
 # `@lesomnus/grpc-dgram/transport/protobuf-es`
 
-Derive a drpc method descriptor straight from a **protobuf-es** service, so RPC
+Derive a dRPC method descriptor straight from a **protobuf-es** service, so RPC
 types are never re-declared by hand — the generated `*_pb.ts` (from
 `protoc-gen-es`) is the single source of truth for the method path, the
 streaming kind, and the payload codec. This is the TS analog of the Go core
@@ -36,7 +36,7 @@ derives them all, keyed by the generated localName.
 
 ## What it derives
 
-| drpc `MethodDesc` field | from the protobuf-es descriptor |
+| dRPC `MethodDesc` field | from the protobuf-es descriptor |
 |---|---|
 | `path` | `/<service typeName>/<proto method name>` (the **proto** name, so a TS client and a Go server address the same method, §13) |
 | `clientStreams` / `serverStreams` | `methodKind` (`unary` / `server_streaming` / `client_streaming` / `bidi_streaming`) |
