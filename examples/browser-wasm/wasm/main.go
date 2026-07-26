@@ -11,10 +11,11 @@
 //	globalThis.drpcServe(port) // hand over one end of a MessageChannel
 //
 // Gateway.Serve publishes it — that publish IS the readiness signal, there is
-// no ready callback — and the page waits for the property to appear
-// (startWasmServer does both halves; see web/main.js). One port is one peer
-// (PROTOCOL.md §6.4), so calling it again with a second port serves another
-// client — a Worker, another tab's channel — off the same handlers.
+// no ready callback — and the page waits for the property to appear (open()
+// does both halves, in the Worker it starts this instance in; see web/main.js).
+// One port is one peer (PROTOCOL.md §6.4), so calling it again with a second
+// port serves another client off the same handlers, which is what a second
+// sock.dial() does.
 //
 //	GOOS=js GOARCH=wasm go build -o web/app.wasm ./wasm
 package main
@@ -42,7 +43,7 @@ func main() {
 			"Reload the page — this server restarts with it",
 			"Switch to ?server=ws — the UI code does not change",
 		),
-		"in-page (wasm)",
+		"the js/wasm build",
 	))
 
 	// Last, and blocking: publishing the entry point says "I can serve now", so

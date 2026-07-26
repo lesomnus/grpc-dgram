@@ -31,8 +31,8 @@ message ListRequest {}
 
 message ListResponse {
   repeated Task tasks = 1;
-  // Which process answered: "in-page (wasm)" or the server's address. The page
-  // shows it, so switching transports is visible rather than assumed.
+  // Which server answered: "the js/wasm build" or the process's address. The
+  // page shows it, so switching transports is visible rather than assumed.
   string served_by = 2;
 }
 

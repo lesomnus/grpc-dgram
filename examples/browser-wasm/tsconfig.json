@@ -21,9 +21,8 @@
     "types": [],
     "paths": {
       "@lesomnus/grpc-dgram": ["../../ts/dist/index.d.mts"],
-      "@lesomnus/grpc-dgram/transport/port": ["../../ts/dist/transport/port.d.mts"],
-      "@lesomnus/grpc-dgram/transport/port/wasm": ["../../ts/dist/transport/port/wasm.d.mts"],
-      "@lesomnus/grpc-dgram/transport/websocket": ["../../ts/dist/transport/websocket.d.mts"]
+      "@lesomnus/grpc-dgram/transport/websocket": ["../../ts/dist/transport/websocket.d.mts"],
+      "@lesomnus/grpc-dgram/wasm": ["../../ts/dist/wasm.d.mts"]
     }
   },
   "include": ["web"]

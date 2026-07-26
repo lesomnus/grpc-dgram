@@ -1,18 +1,17 @@
 // @ts-check
 // The browser half of the demo: a todo UI driven by a real Go gRPC service,
-// which by default runs *in this page* as a wasm instance the page starts
-// itself. Plain ES modules — no build step, no bundler, no framework. The
-// import map in index.html points the package entries at the port's build
-// output (ts/dist).
+// which by default runs in a Worker this page starts as a wasm instance. Plain
+// ES modules — no build step, no bundler, no framework. The import map in
+// index.html points the package entries at the port's build output (ts/dist).
 //
 // Everything past `connect()` — the descriptors, the calls, the Watch loop,
-// the error rendering — is written once: the same code drives the in-page
-// server and the server process behind ?server=ws. Only the link that switches
+// the error rendering — is written once: the same code drives the wasm server
+// and the server process behind ?server=ws. Only the link that switches
 // between the two, and the status line that names them, know which is which.
 
 import { Code, Conn, serverStreamingMethod, StatusError, unaryMethod } from '@lesomnus/grpc-dgram'
-import { startWasmServer } from '@lesomnus/grpc-dgram/transport/port/wasm'
 import { dialWebSocket } from '@lesomnus/grpc-dgram/transport/websocket'
+import { open } from '@lesomnus/grpc-dgram/wasm'
 
 // The messages, as protojson writes them (see jsoncodec/). Every field is
 // optional because protojson omits zero values: a task that is not done
@@ -65,24 +64,29 @@ const connOptions = { defaultCallOptions: { codec: wireCodec } }
 // ---------------------------------------------------------------------------
 
 /**
- * Starts the Go server inside this page and returns a client on a
- * MessageChannel to it. The instance is fetched fresh on every load, so this
- * *is* a server restart — new store, new state, no leftovers.
+ * Starts the Go server in a Worker and returns a client connected to it. The
+ * module is fetched fresh on every load, so this *is* a server restart — new
+ * instance, new store, no leftovers.
  *
- * The channel never appears here. startWasmServer makes it, keeps one end for
- * the transport it returns and hands the other to `globalThis.drpcServe`, the
- * entry point wasm/main.go publishes — which is also how it knows the server
- * is up, since publishing it IS the readiness signal. It wires go.run()'s
- * promise to transport.close(cause) too, so an in-page server that exits or
- * panics fails the calls in flight instead of hanging this UI forever: with
- * every protocol timer off (§10.6), the adapter's §4.5 teardown is the only
- * thing that ever unblocks a call.
+ * These two lines are the whole page-side wiring. `open()` spawns the worker
+ * the package ships, loads `/wasm_exec.js` in it, and waits for
+ * `wasm/main.go`'s `Gateway.Serve` to publish its entry point — publishing it
+ * IS the readiness signal, so there is no ready callback anywhere. It also
+ * wires the death: an instance that exits or panics fails every call in flight
+ * with a cause instead of hanging this UI, and with every protocol timer off
+ * (§10.6) that §4.5 teardown is the only thing that ever unblocks a call here.
+ *
+ * `dial()` is synchronous because the `MessagePort` it transfers queues
+ * everything posted into it until the Go side binds it — the `List` below
+ * cannot be too early — and calling it again would open a second, independent
+ * peer (§6.4). Nothing holds the sock: `sock.close()` would end the
+ * connections and terminate the worker, and a page that is being reloaded is
+ * doing exactly that anyway.
  * @returns {Promise<Session>}
  */
-async function connectInPage() {
-  await loadWasmExec()
-  const transport = await startWasmServer('/app.wasm')
-  return { conn: new Conn(transport, connOptions), label: 'in-page (wasm), started by this page' }
+async function connectWasm() {
+  const sock = await open('/app.wasm')
+  return { conn: sock.dial(connOptions), label: 'in a Worker (wasm)' }
 }
 
 /**
@@ -102,25 +106,7 @@ async function connectWebSocket() {
  * @returns {Promise<Session>}
  */
 function connect() {
-  return new URLSearchParams(location.search).get('server') === 'ws' ? connectWebSocket() : connectInPage()
-}
-
-/**
- * Loads wasm_exec.js, the JS half of the Go runtime — the one thing
- * startWasmServer cannot do for the page, because it is a classic script and
- * not an import. The dev server serves it from the toolchain's GOROOT because
- * it is version-coupled to the compiler that built the module: a copy
- * committed next to this file would rot on the next Go upgrade.
- * @returns {Promise<void>}
- */
-function loadWasmExec() {
-  return new Promise((resolve, reject) => {
-    const el = document.createElement('script')
-    el.src = '/wasm_exec.js'
-    el.addEventListener('load', () => resolve())
-    el.addEventListener('error', () => reject(new Error('failed to load /wasm_exec.js')))
-    document.head.append(el)
-  })
+  return new URLSearchParams(location.search).get('server') === 'ws' ? connectWebSocket() : connectWasm()
 }
 
 // ---------------------------------------------------------------------------
@@ -139,8 +125,8 @@ const log = /** @type {HTMLElement} */ (document.getElementById('log'))
 
 const onWebSocket = new URLSearchParams(location.search).get('server') === 'ws'
 switchLink.href = onWebSocket ? '?' : '?server=ws'
-switchLink.textContent = onWebSocket ? 'Back to the in-page server' : 'Talk to the server process instead'
-state.textContent = onWebSocket ? 'connecting to the server process…' : 'starting the in-page server…'
+switchLink.textContent = onWebSocket ? 'Back to the wasm server' : 'Talk to the server process instead'
+state.textContent = onWebSocket ? 'connecting to the server process…' : 'starting the server in a Worker…'
 
 /**
  * @param {string} line
@@ -270,8 +256,8 @@ watch().catch((err) => {
   fail(err)
   // In reliable mode nothing times a call out, so this stream ends only
   // because the server ended it: the adapter's §4.5 teardown — the goodbye
-  // from a server that stopped, or transport.close() from the host watching
-  // go.run() settle — or a status from the handler itself, RESOURCE_EXHAUSTED
+  // from a server that stopped, or the cause open() reports when the wasm
+  // instance dies — or a status from the handler itself, RESOURCE_EXHAUSTED
   // when the store dropped this watcher for falling behind (todo/store.go).
   // Either way the list has stopped tracking the store, so it is stale from
   // here on and the buttons that would mutate it go away with it.

@@ -3,21 +3,24 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>a Go gRPC server running in the page</title>
+    <title>a Go gRPC server running in the browser</title>
 
     <!--
       @lesomnus/grpc-dgram is not published, so the entries are mapped to the
       build output this server mounts at /ts/dist/ (build it with
       `cd ts && pnpm install && pnpm build`). A bundler would do the same thing
       with an alias; nothing else about the page changes.
+
+      The worker that runs the wasm server needs no entry of its own: open()
+      loads it from a URL relative to /ts/dist/wasm.mjs, and a URL is not a
+      bare specifier for an import map to resolve.
     -->
     <script type="importmap">
       {
         "imports": {
           "@lesomnus/grpc-dgram": "/ts/dist/index.mjs",
-          "@lesomnus/grpc-dgram/transport/port": "/ts/dist/transport/port.mjs",
-          "@lesomnus/grpc-dgram/transport/port/wasm": "/ts/dist/transport/port/wasm.mjs",
-          "@lesomnus/grpc-dgram/transport/websocket": "/ts/dist/transport/websocket.mjs"
+          "@lesomnus/grpc-dgram/transport/websocket": "/ts/dist/transport/websocket.mjs",
+          "@lesomnus/grpc-dgram/wasm": "/ts/dist/wasm.mjs"
         }
       }
     </script>
@@ -57,15 +60,15 @@
   </head>
 
   <body>
-    <h1>a Go gRPC server running in the page</h1>
+    <h1>a Go gRPC server running in the browser</h1>
     <p class="sub">
       The same <code>todo.TodoService</code> handlers, reachable two ways: a Go
-      <code>drpc.Server</code> compiled to wasm and started by this page — so a
-      reload restarts it — or the server process, over a WebSocket. The UI code
-      below does not know which.
+      <code>drpc.Server</code> compiled to wasm, which this page starts in a
+      Worker — so a reload restarts it — or the server process, over a
+      WebSocket. The UI code below does not know which.
     </p>
 
-    <div id="state">starting the in-page server…</div>
+    <div id="state">starting the server in a Worker…</div>
 
     <form id="form">
       <input id="title" placeholder="what needs doing" autocomplete="off" />

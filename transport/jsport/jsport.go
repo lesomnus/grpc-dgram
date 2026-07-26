@@ -81,9 +81,9 @@ const DefaultMaxMessageSize = 0
 const DefaultLabel = "port"
 
 // DefaultEntryPoint is the global (*Gateway).Serve publishes its entry point
-// as, and the name ts/src/transport/port's startWasmServer waits for. Both
-// sides default to it, so a server started with Serve and a host started with
-// that helper need no configuration at all.
+// as, and the name ts/src/wasm's open() waits for. Both sides default to it,
+// so a server started with Serve and a page started with that entry need no
+// configuration at all.
 const DefaultEntryPoint = "drpcServe"
 
 type options struct {
@@ -329,7 +329,7 @@ func (g *Gateway) ServePeer(ctx context.Context, srv *drpc.Server, port js.Value
 // js.Global().Set reaches JS as Reflect.set(globalThis, name, fn), which
 // triggers an accessor property, so a host that defines one before go.run() is
 // woken by the assignment itself — no ready callback, no second name, nothing
-// to poll (ts/src/transport/port's startWasmServer is that host). Which is why
+// to poll (ts/src/wasm's open() is that host). Which is why
 // nothing may be published before the server can serve: call Serve after every
 // service is registered (PROTOCOL.md §13), and the host may open a call on the
 // very tick it hands the port over.
@@ -357,8 +357,8 @@ func (g *Gateway) ServePeer(ctx context.Context, srv *drpc.Server, port js.Value
 //
 // Unpublishing removes the property only while it still holds what this Serve
 // put there. Catching the publish is what a host does WITH the name, not a
-// lease on it: startWasmServer takes the property straight back off globalThis
-// and puts whatever the page had under it back — so deleting the name
+// lease on it: open() takes the property straight back off globalThis and puts
+// whatever the page had under it back — so deleting the name
 // unconditionally here would destroy something that is no longer ours, and the
 // symptom (a page global, or another instance's accessor, gone) would point
 // nowhere near this line.

@@ -1,17 +1,30 @@
 # browser-wasm
 
-**A Go server whose UI you develop by running the real server inside the
-page.** `GET /app.wasm` compiles `./wasm` — the same `todo.TodoService` this
-process serves — and the page starts it on a `MessageChannel`, so a browser
-reload restarts the whole server and, with `-rebuild`, recompiles it first
-(about half a second). The Go side is [`transport/jsport`](../../transport/jsport),
-the page is the TypeScript port's [`transport/port`](../../ts/src/transport/port),
-and the wire between them is dRPC v1.1 — the same bytes the WebSocket endpoint
-at `/rpc` carries.
+**A Go server whose UI you develop by running the real server in the browser.**
+The page-side half of that is two lines:
 
-That endpoint is the second half of the argument: `?server=ws` points the page
-at the server *process* instead, and not a line of the UI code changes. The
-in-page server is not a mock of the server; it is the server.
+```js
+const sock = await open('/app.wasm')      // a Go drpc.Server, in a Worker
+const conn = sock.dial(connOptions)       // ready to call
+```
+
+`GET /app.wasm` compiles `./wasm` — the same `todo.TodoService` this process
+serves — and [`open()`](../../ts/src/wasm) starts it in the Worker the package
+ships, so a browser reload restarts the whole server and, with `-rebuild`,
+recompiles it first (about half a second). The Go side is
+[`transport/jsport`](../../transport/jsport), and it is the same length:
+
+```go
+gw := jsport.NewGateway()
+srv := drpc.NewServer(gw)
+todopb.RegisterTodoServiceServer(srv, impl)
+log.Fatal(gw.Serve(context.Background(), srv))
+```
+
+The wire between them is dRPC v1.1 — the same bytes the WebSocket endpoint at
+`/rpc` carries. That endpoint is the second half of the argument: `?server=ws`
+points the page at the server *process* instead, and not a line of the UI code
+changes. The wasm server is not a mock of the server; it is the server.
 
 ## Run it
 
@@ -19,7 +32,7 @@ in-page server is not a mock of the server; it is the server.
 # 1. build the TypeScript port (the page imports its dist/ output)
 cd ts && pnpm install && pnpm build
 
-# 2. serve the page, build the in-page server on demand, and answer /rpc
+# 2. serve the page, build the wasm server on demand, and answer /rpc
 cd ../examples/browser-wasm && go run .
 
 # 3. open http://127.0.0.1:8080
@@ -28,8 +41,10 @@ cd ../examples/browser-wasm && go run .
 Add a task, tick it, remove it: every mutation comes back over the `Watch`
 server stream, which is what the list renders from. Add with an empty title for
 `INVALID_ARGUMENT`, press **Toggle #999** for `NOT_FOUND` — real statuses from a
-real handler. The line under the heading names whoever answered `List`
-(`in-page (wasm)`, or the process and its pid).
+real handler. The line under the heading names whoever answered `List` and how
+the page reached it: `served by the js/wasm build — in a Worker (wasm)`, or the
+process and its pid over the WebSocket. The server names itself; where it runs
+is the page's half of the sentence, because that is the half that decided it.
 
 Then reload the page: the seeded list is back, because that is a new server.
 Follow **Talk to the server process instead** and the same UI runs against
@@ -40,14 +55,27 @@ between tabs.
 page imports the build output, mounted by this server at `/ts/dist/` and named
 by the import map in `web/index.html`.
 
+## The two modes
+
+| | the wasm server (default) | the server process (`?server=ws`) |
+|---|---|---|
+| where it runs | a Worker this page started | this `go run .`, reached over `ws://…/rpc` |
+| how the page gets a `Conn` | `open('/app.wasm')`, then `sock.dial()` | `dialWebSocket(url)` |
+| lifetime | one page load | until you stop it; shared between tabs |
+| the Go side | `jsport.NewGateway()` + `Serve` | `gorilla.NewGateway()` + `ServePeer` |
+
+Both adapters report `reliable`, so both cores run with every protocol timer
+off (§10.6) and the page never sees a datagram caveat. `connect()` in
+`web/main.js` is the only place that knows which is which.
+
 ## What it demonstrates
 
 - **A reload is a server restart.** Starting it is two lines, one on each side:
 
   ```js
-  // web/main.js — a client on a channel to the server this page just started
-  const transport = await startWasmServer('/app.wasm')
-  const conn = new Conn(transport, connOptions)
+  // web/main.js — a client on a connection to the server this page just started
+  const sock = await open('/app.wasm')
+  const conn = sock.dial(connOptions)
   ```
 
   ```go
@@ -61,38 +89,31 @@ by the import map in `web/index.html`.
   `GET /app.wasm` runs `GOOS=js GOARCH=wasm go build ./wasm` and logs how long
   it took: measured here, 0.45 s for the first request, 0.5–0.7 s after editing
   a handler, 0.09 s when nothing changed (the Go build cache does the work — a
-  cold cache pays for grpc-go once). A build failure is answered as a 500 carrying the
-  compiler output, so a handler that stopped compiling shows up in the browser
-  rather than as silence.
+  cold cache pays for grpc-go once). A build failure is answered as a 500
+  carrying the compiler output, and `open()` rejects with that text rather than
+  with the MIME-type complaint streaming instantiation would produce — so a
+  handler that stopped compiling shows up in the browser rather than as
+  silence.
 - **One wire, two channels, one UI.** `connect()` is the only place in
-  `web/main.js` that decides anything: it returns a `Conn` over a
-  `PortTransport` or over `dialWebSocket`, and everything after it —
-  descriptors, calls, the `Watch` loop, the error rendering — is written once.
-  The only other mentions of `?server=ws` are the link that toggles it and the
-  status line that names who answered. Both adapters report
-  `reliable`, so both cores run with every protocol timer off (§10.6) and the
-  page never sees a datagram caveat.
+  `web/main.js` that decides anything: it returns a `Conn` from `sock.dial()`
+  or one over `dialWebSocket`, and everything after it — descriptors, calls,
+  the `Watch` loop, the error rendering — is written once. The only other
+  mentions of `?server=ws` are the link that toggles it and the status line
+  that names who answered.
 - **The teardown wiring, and why it is mandatory.** A message port has no death
   to detect: with timers off, the *only* thing that can fail a live call is the
-  adapter's §4.5 teardown. So the host tells the transport what only the host
-  knows, which is what `startWasmServer` is doing on the page's behalf —
-
-  ```js
-  run.then(
-    () => transport.close(new Error('the wasm instance exited')),
-    (err) => transport.close(err),
-  )
-  ```
-
-  — and a server that exits or panics fails the calls in flight instead of
-  hanging the UI forever. In the other direction the goodbye (an empty message)
-  does the same job for a peer that leaves cleanly. Nothing in `web/main.js`
-  has to remember this; anything on the manual path below does.
-- **What does not follow a server into the page.** Sockets, files, databases.
-  `todo.Store` is that seam, and it is the only thing the two builds could
-  differ in: the handlers, their validation, their statuses and their streaming
-  are the real code either way. In a real project this is where you pay —
-  IndexedDB, a stub, or a fixture — and the bill stops there.
+  adapter's §4.5 teardown. The page cannot perform it — from where it stands
+  there is no `go.run()` promise to watch, only a Worker that has gone quiet —
+  so the shipped worker posts the goodbye (an empty message) on every port it
+  holds the moment its instance dies, and `open()` fails every `Conn` dialled
+  through the sock with the cause. A server that exits or panics therefore
+  fails the calls in flight instead of hanging the UI forever. Nothing in
+  `web/main.js` has to remember this; anything on the manual path below does.
+- **What does not follow a server into the browser.** Sockets, files,
+  databases. `todo.Store` is that seam, and it is the only thing the two builds
+  could differ in: the handlers, their validation, their statuses and their
+  streaming are the real code either way. In a real project this is where you
+  pay — IndexedDB, a stub, or a fixture — and the bill stops there.
 - **A page with no build step.** `web/main.js` is plain ES modules with
   `// @ts-check` and JSDoc types — no bundler, no framework. It has no protobuf
   runtime, so it names the `"json"` codec on its OPEN frame (§12) and both
@@ -100,59 +121,47 @@ by the import map in `web/index.html`.
   stubs. Note what that costs the page: protojson omits zero values, so every
   field arrives optional.
 
-## What the helper does, and the channel it hides
+## Three things those two lines settle
 
-Those two lines hide exactly one thing, a `MessageChannel`, and it is worth
-spelling out because it is what everyone asks about. A channel has **two ends,
-entangled and symmetric**: what you post into one comes out of the other, and
-nothing distinguishes `port1` from `port2` except which one you give away. You
-keep one and hand the server the other —
+**Why a Worker.** Go's scheduler shares whatever thread it runs on, so a
+handler that computes for 50 ms freezes the page for 50 ms if that thread is
+the main one — and this one is a server, with a stream fanning every mutation
+out to every watcher. Off the main thread the UI stays live and the only thing
+crossing the boundary is bytes. `open(app, { worker: false })` runs the
+instance in this realm instead, which is what node and `ts/test/wasm.test.ts`
+do; nothing else about the API changes.
 
-```js
-const channel = new MessageChannel()
-const transport = new PortTransport(channel.port1) // the end you keep
-globalThis.drpcServe(channel.port2)                // the end you give away
+**Why `/wasm_exec.js` comes from `go env GOROOT`.** It is the JS half of the Go
+runtime and is version-coupled to the compiler that built the module, so
+neither this example nor the package vendors a copy — a vendored one would pin
+the wrong compiler. The dev server serves the toolchain's, and the worker
+fetches it from `/wasm_exec.js`. In a real deployment that is one line of your
+build:
+
+```sh
+cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" ./public/
 ```
 
-— and since that is the same three lines every time, `startWasmServer` makes
-the channel itself: `port1`/`port2` never appear in `web/main.js`. Around it,
-it does the four things the hand-written version has to get right — reading a
-non-ok response's body, so a broken build reports the compiler output instead
-of a MIME-type complaint; installing an accessor on `globalThis.drpcServe`
-*before* `go.run`, so the publish that `Gateway.Serve` performs cannot be
-missed; racing that publish against the instance dying on the way up (a Go
-panic *resolves* `go.run()`, so a settled run is a failure, not a success); and
-the teardown wiring above. The
-[adapter's README](../../ts/src/transport/port/README.md#the-wasm-page--startwasmserver)
-is the long version.
+Serve it elsewhere and say so: `open(app, { wasmExec: '/vendor/wasm_exec.js' })`.
 
-You hold the ports yourself as soon as the server is not a wasm instance in
-this page. For a `Worker` there is no channel to make at all — a `Worker` and
-the `self` inside it are already the two ends of one:
+**Why `dial()` returns the connection and `open()` does not.** One port is one
+peer (`PROTOCOL.md` §6.4), so a second `dial()` is a second *independent* peer
+of the same server — its own epoch, sid space, flow-control windows and
+per-peer caps, and a teardown that reaches only it. This page needs one; a page
+with a second component, or one handing a port on to a worker of its own, calls
+it again. It is synchronous because a transferred `MessagePort` queues
+everything posted into it until the far side binds it, so the `List` on the
+next line cannot be too early.
 
-```js
-// the page
-const conn = new Conn(new PortTransport(new Worker('./server.js', { type: 'module' })))
-```
-
-```js
-// inside the worker
-const gw = new PortGateway()
-const server = new Server(gw)
-// server.register(…)
-gw.bind(self)
-void gw.servePeer(server, self)
-```
-
-For an iframe, `window.postMessage` is not a port — its second argument is a
-`targetOrigin`, not a transfer list — so make a `MessageChannel`, transfer one
-end through the window, and hand *that* port to the same two APIs. Either way
-the wire is unchanged; only who creates the channel moves.
+Every other shape — a `Worker` you wrote, an iframe, two TS endpoints — is the
+manual path in the [adapter's README](../../ts/src/transport/port/README.md),
+unchanged: `new PortTransport(port)` on one side, `PortGateway` on the other,
+and the §4.5 wiring above is then yours to write.
 
 ## The size of the thing
 
-The in-page server is a whole Go runtime plus grpc-go. Measured on this
-checkout with go1.26.4:
+The wasm server is a whole Go runtime plus grpc-go. Measured on this checkout
+with go1.26.4:
 
 | build | raw | `gzip -9` |
 |---|---|---|
@@ -162,8 +171,8 @@ checkout with go1.26.4:
 On localhost that is a non-issue — it is the 0.09 s at the end of the numbers
 above. Shipping it to users is a real decision, and one this example does not
 pretend to make for you: strip it, serve it compressed, cache it across
-reloads, or keep the in-page server for development and deploy only the
-WebSocket path. Nothing in the page changes either way.
+reloads, or keep the wasm server for development and deploy only the WebSocket
+path. Nothing in the page changes either way.
 
 ## Type-checking the page
 
@@ -182,7 +191,7 @@ package name at `ts/dist`.
 | | |
 |---|---|
 | `main.go` | the dev server: the page, `/ts/dist/`, `/wasm_exec.js`, `/app.wasm` built on demand, and the `/rpc` WebSocket |
-| `wasm/main.go` | the same service compiled for the page: a `jsport.Gateway`, and `Serve` for the whole of its JS surface |
+| `wasm/main.go` | the same service compiled for the browser: a `jsport.Gateway`, and `Serve` for the whole of its JS surface |
 | `todo/service.go` | the `TodoService` handlers — ordinary gRPC code |
 | `todo/store.go` | the `Store` seam and its in-memory implementation |
 | `jsoncodec/jsoncodec.go` | the `"json"` wire codec, imported by both mains, so the page needs no protobuf runtime |
@@ -196,7 +205,7 @@ and named by neither side's source (`jsport.DefaultEntryPoint` on one,
 
 | | |
 |---|---|
-| `globalThis.drpcServe(port)` | hand over one end of a `MessageChannel`. Its *appearance* is the readiness signal — the page waits for the property, so there is no ready callback anywhere — and one port is one peer, so calling it again serves another client (a Worker, another tab's channel) off the same handlers |
+| `globalThis.drpcServe(port)` | hand over one end of a `MessageChannel`. Its *appearance* is the readiness signal — `open()` waits for the property, so there is no ready callback anywhere — and one port is one peer, so calling it again serves another client off the same handlers, which is exactly what a second `dial()` does |
 
 Regenerate the bindings (needs [buf](https://buf.build); the generated files
 are committed, so running the example does not):
@@ -214,16 +223,16 @@ buf generate examples/browser-wasm/proto --template examples/browser-wasm/buf.ge
 
 ## Notes
 
-- `wasm_exec.js` is served from `go env GOROOT`, not committed here: it is the
-  JS half of the Go runtime and is version-coupled to the compiler that built
-  the module, so a copy next to the page would keep working right up until the
-  toolchain is upgraded.
 - Everything is answered `Cache-Control: no-store`. A cached `app.wasm` or a
   cached `ts/dist` would quietly break the one claim the example makes.
-- An in-page server is a server with no trust boundary in front of it:
+- A server in the browser is a server with no trust boundary in front of it:
   the port is exactly as trustworthy as the code holding its other end, and the
   page holds both (`PROTOCOL.md` §15). The `/rpc` endpoint is plain `ws://` on
   loopback for the same reason the other examples are — deploy `wss://`.
 - Serving the port's `dist/` over HTTP is what an unpublished package costs.
   Once it is published the import map disappears and the page imports
-  `@lesomnus/grpc-dgram` from a CDN or a bundle like any other dependency.
+  `@lesomnus/grpc-dgram` from a CDN or a bundle like any other dependency. The
+  worker needs no entry of its own either way — `open()` loads it from a URL
+  relative to its own module — except under a bundler, which rewrites workers
+  by matching a literal `new Worker(new URL(…))` that `open()` deliberately is
+  not: hand it the URL it produced, with `open(app, { workerUrl })`.

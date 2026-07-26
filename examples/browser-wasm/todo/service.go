@@ -22,9 +22,11 @@ type Service struct {
 }
 
 // NewService returns the service backed by store. servedBy is what List
-// reports — "in-page (wasm)" for the build that runs in the browser, the
+// reports — "the js/wasm build" for the one that runs in the browser, the
 // listen address for the server process — so the page can show which of the
-// two answered instead of assuming.
+// two answered instead of assuming. Where that build runs is the host's
+// choice and not this server's to claim: it is a Worker by default, and the
+// page's own half of the status line is what says so.
 func NewService(store Store, servedBy string) *Service {
 	return &Service{store: store, servedBy: servedBy}
 }

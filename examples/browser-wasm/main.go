@@ -1,16 +1,17 @@
 //go:build !js
 
 // Command browser-wasm is a Go server whose UI is developed by running the
-// real server inside the browser page.
+// real server inside the browser.
 //
 // GET /app.wasm builds ./wasm — the same todo.Service this process serves,
-// compiled for js/wasm — and the page starts it over a MessageChannel. So a
-// reload restarts the server, and with -rebuild it recompiles it first: the
-// UI loop is a browser reload, against real handlers, real gRPC statuses and a
-// real server stream. The same handlers also answer at /rpc over a WebSocket,
-// and the page switches to that with ?server=ws without a line of its UI code
-// changing — which is the argument the example makes: the in-page server is
-// not a mock of the server, it is the server.
+// compiled for js/wasm — and the page starts it in a Worker, on a
+// MessageChannel. So a reload restarts the server, and with -rebuild it
+// recompiles it first: the UI loop is a browser reload, against real handlers,
+// real gRPC statuses and a real server stream. The same handlers also answer
+// at /rpc over a WebSocket, and the page switches to that with ?server=ws
+// without a line of its UI code changing — which is the argument the example
+// makes: the server in the browser is not a mock of the server, it is the
+// server.
 //
 //	cd ts && pnpm install && pnpm build   # build the TS port once
 //	cd examples/browser-wasm && go run .  # then open http://127.0.0.1:8080
@@ -86,12 +87,12 @@ func run(ctx context.Context) error {
 	// One Gateway serves every WebSocket, one drpc peer each. It advertises
 	// Reliable() == true, so NewServer turns the timer machinery off and
 	// requires the exact sequence on the wire (PROTOCOL.md §10.6) — the same
-	// mode the in-page server runs in behind jsport.
+	// mode the wasm server runs in behind jsport.
 	gw := gorilla.NewGateway()
 	srv := drpc.NewServer(gw)
 	todopb.RegisterTodoServiceServer(srv, todo.NewService(
 		todo.NewMemStore(
-			"Reload the page — the in-page server restarts with it",
+			"Reload the page — the wasm server restarts with it",
 			"This task lives in the server process, not the tab",
 		),
 		fmt.Sprintf("%s (pid %d)", *addr, os.Getpid()),
@@ -121,6 +122,8 @@ func run(ctx context.Context) error {
 	// every reload fetches a freshly built binary and starts a fresh instance.
 	mux.HandleFunc("GET /app.wasm", app)
 	// The JS half of the Go runtime, from the toolchain that built the module.
+	// The worker fetches it, not the page — open() loads it in whichever realm
+	// runs the instance — so this route stays even though no <script> names it.
 	mux.HandleFunc("GET /wasm_exec.js", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, wasmExec)
 	})
@@ -137,7 +140,7 @@ func run(ctx context.Context) error {
 		_ = hs.Shutdown(sctx)
 	}()
 
-	log.Printf("serving todo.TodoService in the page and at ws://%s/rpc — open http://%s", *addr, *addr)
+	log.Printf("serving todo.TodoService in the browser and at ws://%s/rpc — open http://%s", *addr, *addr)
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -219,8 +222,9 @@ func took(since time.Time) time.Duration { return time.Since(since).Round(time.M
 
 // wasmExecPath locates wasm_exec.js in the active toolchain. It is the JS half
 // of the Go runtime and is version-coupled to the compiler that built the
-// module, so it is served from GOROOT rather than committed here: a copy in
-// web/ would keep working right up until the day the toolchain is upgraded.
+// module, so it is served from GOROOT rather than committed here — and for the
+// same reason the TypeScript package does not vendor it either: a copy in web/
+// would keep working right up until the day the toolchain is upgraded.
 func wasmExecPath() (string, error) {
 	out, err := exec.Command("go", "env", "GOROOT").Output()
 	if err != nil {

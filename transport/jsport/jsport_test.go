@@ -617,7 +617,7 @@ func TestBindBuffersBeforeServe(t *testing.T) {
 // protocol in full: js.Global().Set reaches JS as Reflect.set(globalThis, ...),
 // which triggers the setter, so the assignment itself is what wakes the host —
 // there is no ready callback and nothing to poll. The JS below is what
-// ts/src/transport/port's startWasmServer installs for the same purpose.
+// ts/src/wasm's open() installs for the same purpose.
 func entryPoint(t *testing.T, name string) <-chan js.Value {
 	t.Helper()
 	// Resolved through a promise rather than from the setter directly: the
@@ -838,9 +838,9 @@ func TestServeRefusesATakenEntryPoint(t *testing.T) {
 }
 
 // The name belongs to whoever holds the property, and catching the publish is
-// what a host does with it rather than a lease on it: startWasmServer deletes
-// the property the moment it has the entry point, and puts back whatever the
-// page had under it. So Serve must unpublish only what is still its own — a
+// what a host does with it rather than a lease on it: open() deletes the
+// property the moment it has the entry point, and puts back whatever the page
+// had under it. So Serve must unpublish only what is still its own — a
 // blanket Delete here destroys a page global, or the accessor a second host is
 // waiting on, and the symptom appears nowhere near this package.
 func TestServeLeavesAReclaimedEntryPointAlone(t *testing.T) {
@@ -859,7 +859,7 @@ func TestServeLeavesAReclaimedEntryPointAlone(t *testing.T) {
 	awaitEntryPoint(t, published)
 
 	// The host has the entry point; the name goes back to the page, exactly as
-	// startWasmServer's release() restores what it found.
+	// open()'s release() restores what it found.
 	sentinel := js.Global().Call("eval", `(() => () => {})()`)
 	js.Global().Set(name, sentinel)
 

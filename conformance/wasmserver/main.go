@@ -25,9 +25,9 @@
 //	drpcServe(port)  Gateway.Serve's own entry point: bind the port and serve
 //	                 it as one peer (§6.4). Publishing it is also the readiness
 //	                 signal — there is no drpcReady, because the property
-//	                 appearing is the event the host awaits (startWasmServer is
-//	                 that host, and the two teardown globals below are set
-//	                 before Serve so they exist by the time it fires)
+//	                 appearing is the event the host awaits (ts/src/wasm's
+//	                 open() is that host, and the two teardown globals below are
+//	                 set before Serve so they exist by the time it fires)
 //	drpcStop()       Gateway.Close: the empty-envelop goodbye on every served
 //	                 port, so the TS side can prove that a peer which says
 //	                 goodbye tears its peer's calls down (§4.5)

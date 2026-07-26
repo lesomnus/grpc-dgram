@@ -28,11 +28,13 @@ TypeScript.
 
 ## The deployment this exists for
 
-A Go `drpc.Server` compiled to `GOOS=js GOARCH=wasm` **running inside the
-page**, with the browser UI as its client. The service is real gRPC — generated
+A Go `drpc.Server` compiled to `GOOS=js GOARCH=wasm` **running in the
+browser**, with the UI as its client. The service is real gRPC — generated
 stubs, interceptors, streaming, deadlines — but nothing leaves the tab, and a
-page reload restarts the whole server. The same wiring serves a Worker: it is a
-port, and both ends could equally be two TypeScript endpoints.
+page reload restarts the whole server. Where the instance runs is the host's
+choice and changes nothing here: the TypeScript entry starts it in a Worker, so
+that a handler which computes does not freeze the page, and both ends could
+equally be two TypeScript endpoints.
 
 ## Server
 
@@ -55,8 +57,17 @@ woken by the assignment itself: no `drpcReady` callback, no second name, nothing
 to poll. Which is why nothing may be published before the server can serve:
 register every service first (`PROTOCOL.md` §13), then call `Serve`.
 
-The host's half, which [`ts/src/transport/port`](../../ts/src/transport/port)'s
-`startWasmServer` does for you:
+The host's half is [`ts/src/wasm`](../../ts/src/wasm)'s `open()`, and from the
+page it is two lines — the worker it runs in comes with the package:
+
+```js
+import { open } from '@lesomnus/grpc-dgram/wasm'
+
+const sock = await open('/app.wasm')  // resolves when this Serve publishes
+const conn = sock.dial()              // one port, one peer
+```
+
+What that hides, for a host writing its own:
 
 ```js
 const ready = new Promise((resolve) => {
@@ -85,10 +96,9 @@ exactly as long as it blocks. One port is one peer (§6.4), so calling the entry
 point again with another port serves a second peer — a Worker, another tab's
 channel — off the same handlers, each with its own epoch, sid space, windows
 and per-peer caps (§15), and a teardown that reaches only it. On the page that
-second call is `wasmServer().connect()`, or `openPort()` for an end to transfer
-to a Worker. A call carrying no port is ignored rather than
-fatal: `args[0]` unguarded panics, and a panic takes the whole instance down
-over what is only unreadable input (§4.2). What counts as a port is the duck
+second call is a second `sock.dial()`. A call carrying no port is ignored
+rather than fatal: `args[0]` unguarded panics, and a panic takes the whole
+instance down over what is only unreadable input (§4.2). What counts as a port is the duck
 type the adapter needs — an object with a callable `postMessage` — so
 `drpcServe(ev)` in place of `drpcServe(ev.data.port)` is dropped too, instead of
 becoming a peer that can never receive anything.
@@ -98,8 +108,8 @@ already set rather than steal another server's entry point, and on ctx
 cancellation it unpublishes the global, releases the `js.Func` and closes the
 gateway — so every peer gets the goodbye and its §4.5 teardown. It unpublishes
 only while the property still holds what it published: catching the publish is
-what a host does with the name, not a lease on it, and `startWasmServer` takes
-the property straight back off `globalThis` once it has caught it.
+what a host does with the name, not a lease on it, and `open()` takes the
+property straight back off `globalThis` once it has caught it.
 
 ### When the host hands ports over some other way
 
@@ -179,9 +189,12 @@ go.run(instance).then(
 globalThis.drpcAttach(ch.port2)
 ```
 
-`startWasmServer` wires that `then` for you — it is the whole reason a live call
-on this channel ever fails when the instance dies — so the code above is only
-what you write when you own the instantiation yourself.
+`open()` wires that `then` for you — it is the whole reason a live call on this
+channel ever fails when the instance dies — and where the instance runs in a
+worker it is the only half that can: `go.run()`'s promise is not visible from
+the page, so the worker says the goodbye on every port it holds and reports the
+death, and every `Conn` dialled through the sock fails with the cause. The code
+above is what you write when you own the instantiation yourself.
 
 On the Go side the same hook is `Transport.Close` and `Gateway.Close`; the
 latter says goodbye to every bound port at once, which is what a server about
