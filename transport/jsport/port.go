@@ -144,8 +144,14 @@ func (p *msgPort) listen(typ string, fn func(js.Value)) {
 // still reach it turns every later call into a console error and a silently
 // lost message — so nothing is released until the port can no longer reach it.
 //
-// close() detaches a MessagePort; on a dedicated worker's global scope it ends
-// the worker — which is what "this endpoint is going away" means there.
+// close() hands a MessagePort back to the runtime, and is skipped for one port
+// only: a dedicated worker's own global scope, where close() TERMINATES the
+// worker. A server hosted in a worker serves its page over exactly that port
+// (and may serve more over ports transferred to it), so calling it would let
+// one peer's §4.5 teardown kill the whole instance — every other peer, and
+// whatever it was still doing. Ending a worker is the host's decision, taken
+// after its endpoints have torn down; detaching is all this endpoint owes such
+// a port. The TypeScript twin makes the same exception, for the same reason.
 func (p *msgPort) detach() {
 	rm := p.v.Get("removeEventListener").Type() == js.TypeFunction
 	for _, l := range p.listeners {
@@ -156,7 +162,7 @@ func (p *msgPort) detach() {
 			p.v.Set("on"+l.typ, js.Null())
 		}
 	}
-	if p.v.Get("close").Type() == js.TypeFunction {
+	if !p.v.Equal(js.Global()) && p.v.Get("close").Type() == js.TypeFunction {
 		_ = p.call("close")
 	}
 	for _, l := range p.listeners {

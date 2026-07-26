@@ -1191,3 +1191,47 @@ func TestCloseIsIdempotent(t *testing.T) {
 		t.Fatalf("call on a closed conn: got %v (%v), want Unavailable", got, err)
 	}
 }
+
+// TestGlobalScopeIsNeverClosed pins the one port whose close() must not be
+// called: a dedicated worker's own global scope, where close() terminates the
+// worker. A server hosted in a worker serves its page over exactly that port,
+// so a peer that goes away would otherwise take the whole instance with it —
+// including every other peer it was serving. The TypeScript twin makes the
+// same exception (ts/src/transport/port/index.ts, Port.close).
+//
+// node's globalThis has no close(), so the test installs one and asserts it is
+// not reached; the listeners must still come off.
+func TestGlobalScopeIsNeverClosed(t *testing.T) {
+	closed := false
+	stop := js.FuncOf(func(js.Value, []js.Value) any {
+		closed = true
+		return nil
+	})
+	defer stop.Release()
+	js.Global().Set("close", stop)
+	defer js.Global().Delete("close")
+
+	tp := jsport.New(js.Global())
+	if err := tp.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if closed {
+		t.Fatal("Close called close() on the worker global scope: one peer's teardown would terminate the whole instance")
+	}
+	// Detaching is what it does owe: nothing may still be delivered here, and
+	// a send past the teardown fails rather than reaching a dead endpoint.
+	if v := js.Global().Get("onmessage"); !v.IsNull() && !v.IsUndefined() {
+		t.Fatalf("message listener left on the global scope: %v", v.Type())
+	}
+	f := &drpc.Frame{}
+	f.SetEpoch(1)
+	f.SetSid(1)
+	f.SetSeq(1)
+	if err := tp.Handle(context.Background(), f); status.Code(err) != codes.Unavailable {
+		t.Fatalf("send after close: want Unavailable, got %v", err)
+	}
+	for _, typ := range []string{"onmessage", "onmessageerror", "onclose"} {
+		js.Global().Delete(typ)
+	}
+}
