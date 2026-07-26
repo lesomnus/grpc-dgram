@@ -152,6 +152,18 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 		return c.sendReset(ctx, f)
 	}
 
+	if f.shape() == FlagWindow {
+		// A flow-control grant is advisory and stateless: for a live call it
+		// credits the sender, for anything else it is dropped in silence — a
+		// grant legitimately races the call's end, and answering it with a
+		// RESET would turn every well-behaved stream into a RESET exchange
+		// (§4.2, §9.3).
+		if s := c.lookup(sid); s != nil {
+			s.handleRx(ctx, f)
+		}
+		return nil
+	}
+
 	if f.isPing() {
 		// Well-formed PINGs are validated: refresh peer liveness
 		// (PROTOCOL.md §9.1, §10.4).

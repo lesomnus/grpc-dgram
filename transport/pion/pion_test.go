@@ -573,16 +573,25 @@ func TestBlockedDeliveryDeath(t *testing.T) {
 	}
 	<-hit
 
-	// Flood past the rx buffer (default 32): the server's serve loop is now
-	// blocked inside Handle delivering the overflow frame.
-	for range 40 {
-		if err := stream.Send(echo.EchoRequest_builder{Message: "x"}.Build()); err != nil {
-			t.Fatal(err)
+	// Flow control (§4.2) moved the back-pressure to the sender: the server's
+	// read loop is no longer the thing that blocks, the client's Send is. Push
+	// the burst from a goroutine so the parked sender can be observed, and
+	// assert BOTH duties — the pump stays free, and transport death unparks
+	// the sender instead of stranding it until T_stall.
+	sendErr := make(chan error, 1)
+	go func() {
+		for range 40 {
+			if err := stream.Send(echo.EchoRequest_builder{Message: "x"}.Build()); err != nil {
+				sendErr <- err
+				return
+			}
 		}
-	}
+		sendErr <- nil
+	}()
+	time.Sleep(300 * time.Millisecond) // the sender is parked on credit by now
 
 	// The client vanishes. Only the OnClose→dead→delivery-ctx link can reach
-	// the blocked serve loop.
+	// a blocked serve loop — and the parked sender must come back too.
 	if err := e.clientDC.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -596,6 +605,21 @@ func TestBlockedDeliveryDeath(t *testing.T) {
 	case <-stopped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("blocked delivery wedged: channel death was never delivered (§4.5)")
+	}
+
+	select {
+	case err := <-sendErr:
+		if err == nil {
+			t.Fatal("the burst should not have completed: the handler never drains")
+		}
+		// gRPC's contract: a send racing the call's end reports io.EOF and
+		// the status comes from Recv. Either way it must return at once —
+		// never sit until T_stall.
+		if err != io.EOF && status.Code(err) != codes.Unavailable {
+			t.Fatalf("a parked sender must report the call's end, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a sender parked on flow control was not unparked by channel death (§4.2, §4.5)")
 	}
 }
 

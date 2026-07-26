@@ -80,7 +80,7 @@ func (w *sweeper) stop() {
 // accepted or dedup-dropped (PROTOCOL.md §9.1). It refreshes the idle clocks
 // and clears the OPEN retransmission obligation — any server frame for the
 // sid is the "first server frame" of §10.3.
-func (s *clientStream) noteValidatedRx() {
+func (s *clientStream) noteValidatedRx(f *Frame) {
 	n := nowNano()
 	s.lastRx.Store(n)
 	s.conn.lastRx.Store(n)

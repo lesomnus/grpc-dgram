@@ -34,6 +34,13 @@ type Timing struct {
 	// Hold is T_hold: the delayed-RESET grace for unknown-sid frames whose
 	// OPEN may merely be late.
 	Hold time.Duration
+	// Stall is T_stall: how long a send may wait for flow-control credit
+	// before the call fails with UNAVAILABLE (PROTOCOL.md §4.2). Unlike the
+	// others this one runs in RELIABLE mode too — that is the mode flow
+	// control exists in, and a park there has no other bound: the protocol
+	// timers are off and the park happens before the adapter's write path,
+	// so nothing else could ever break it.
+	Stall time.Duration
 }
 
 func (t Timing) withDefaults() Timing {
@@ -55,6 +62,9 @@ func (t Timing) withDefaults() Timing {
 	}
 	if t.Hold == 0 {
 		t.Hold = t.Retransmit
+	}
+	if t.Stall == 0 {
+		t.Stall = 30 * time.Second
 	}
 	return t
 }

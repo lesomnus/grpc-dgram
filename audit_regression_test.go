@@ -61,9 +61,14 @@ func TestReliableRxOverflowBlocks(t *testing.T) {
 
 // The server-side twin: a client-streaming burst through a 2-frame server
 // buffer must reach the handler complete and in order. The handler is gated
-// shut until the whole burst is on the wire, so the pump provably has to
-// block — the old code, with nothing draining, deterministically dropped 98
-// of the 100 frames here.
+// shut until the burst is under way, so the buffer provably fills — the old
+// code, with nothing draining, deterministically dropped 98 of the 100 frames
+// here.
+//
+// Since v1.1 the back-pressure lands on the SENDER instead of the receiver's
+// Handle (§4.2 flow control): the client parks in Send once it has used the
+// window the creation ack advertised, which is why the burst runs in its own
+// goroutine here. The exact-sequence guarantee is what both versions pin.
 func TestReliableRxOverflowBlocksServer(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		gate := make(chan struct{})
@@ -82,15 +87,29 @@ func TestReliableRxOverflowBlocksServer(t *testing.T) {
 
 		stream, err := client.Buff(t.Context())
 		x.NoError(t, err)
-		for range 100 {
-			x.NoError(t, stream.Send(echo.EchoRequest_builder{Message: "m", Repeat: 1}.Build()))
-		}
-		x.NoError(t, stream.CloseSend())
-		// Let the wire push as far as it can with the handler not consuming:
-		// the c2s pump is now blocked on the full 2-frame buffer.
+
+		sent := make(chan error, 1)
+		go func() {
+			for range 100 {
+				if err := stream.Send(echo.EchoRequest_builder{Message: "m", Repeat: 1}.Build()); err != nil {
+					sent <- err
+					return
+				}
+			}
+			sent <- nil
+		}()
+
+		// With the handler gated shut nothing drains the 2-frame buffer, so
+		// the sender is parked on credit — and the c2s pump is NOT blocked.
 		synctest.Wait()
+		select {
+		case err := <-sent:
+			t.Fatalf("the burst must not finish while the handler drains nothing: %v", err)
+		default: // parked on credit, as intended
+		}
 		close(gate)
 
+		x.NoError(t, <-sent)
 		res, err := stream.CloseAndRecv()
 		x.NoError(t, err)
 		x.Equal(t, 100, len(res.GetItems()))

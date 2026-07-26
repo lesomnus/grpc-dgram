@@ -253,6 +253,12 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 		st.handleRx(ctx, f)
 		return nil
 	}
+	if f.shape() == FlagWindow {
+		// See Conn.Handle: a grant for a call this side has already finished
+		// is dropped in silence, never answered with a RESET (§4.2, §9.3).
+		s.mu.Unlock()
+		return nil
+	}
 
 	// Tombstoned call: validated; replay the stored terminal, rate-limited
 	// (PROTOCOL.md §9.2).
@@ -462,8 +468,13 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	if c, ok := s.methodRx[desc.fullname]; ok {
 		rxCfg = c
 	}
-	st := newServerStream(sctx, s, key, desc, codec, rxCfg.withDefaults(), rel)
+	st := newServerStream(sctx, s, key, desc, codec, rxCfg.withReliableFloor(rel), rel)
 	st.cancelTimeout = cancelTimeout
+	// The OPEN advertises the client's receive window (§4.2); it precedes
+	// every server frame, so the server never needs the assumed window.
+	if rel {
+		st.flowTx.observe(f.GetWindow())
+	}
 
 	var transport *serverTransportUnary
 	if desc.IsUnary() {
@@ -689,6 +700,7 @@ func (s *Server) finish(st *serverStream, term *Frame) {
 		}
 	}
 	s.mu.Unlock()
+	st.flowTx.release()
 	st.cancel(status.Error(codes.Canceled, "call finished"))
 	if st.cancelTimeout != nil {
 		st.cancelTimeout()

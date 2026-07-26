@@ -42,6 +42,19 @@ func (c rxConfig) withDefaults() rxConfig {
 	return c
 }
 
+// withReliableFloor raises the buffer to the protocol's initial flow-control
+// window (PROTOCOL.md §4.2): in reliable mode a sender paces itself by that
+// window until the peer advertises its own, so a receiver that buffers less
+// would be overrun before its advertisement could arrive. Unreliable mode is
+// untouched — there a full buffer drops by policy.
+func (c rxConfig) withReliableFloor(reliable bool) rxConfig {
+	c = c.withDefaults()
+	if reliable && c.size < int(wInit) {
+		c.size = int(wInit)
+	}
+	return c
+}
+
 // Limits bounds the server's per-peer bookkeeping (PROTOCOL.md §15). Zero
 // fields keep their defaults. On a Conn only MaxPendingResets applies.
 type Limits struct {

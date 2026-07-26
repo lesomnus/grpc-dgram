@@ -25,6 +25,10 @@ var (
 	_ grpc.ServerTransportStream = serverTransportStream{}
 )
 
+// errCallEnded unparks a flow-controlled sender when its call ends; callers
+// map it to the contract's own end-of-call error (io.EOF on the client).
+var errCallEnded = errors.New("drpc: call ended")
+
 // toStatusErr converts err to a gRPC status error, mapping context errors to
 // their canonical codes and honoring a status cause if one was attached via
 // context.CancelCause.
@@ -54,6 +58,20 @@ func toStatusErr(err error) error {
 func ctxErr(ctx context.Context) error {
 	cause := context.Cause(ctx)
 	return toStatusErr(cause)
+}
+
+// enqueueRxFlow delivers f into a flow-controlled stream's buffer without
+// blocking. A conforming peer never exceeds the window it was granted, so a
+// full buffer here is a contract violation — and blocking on it would be the
+// deadlock flow control exists to remove: the grant that would unpark the
+// peer travels the very read loop this would stall (PROTOCOL.md §4.2).
+func enqueueRxFlow(rx chan *Frame, f *Frame) bool {
+	select {
+	case rx <- f:
+		return true
+	default:
+		return false
+	}
 }
 
 // enqueueRxReliable delivers f into the per-stream buffer, blocking until
@@ -122,6 +140,11 @@ type clientStream struct {
 	codec     encoding.CodecV2
 	codecName string
 
+	// Per-stream flow control (reliable mode, §4.2): flowTx is credit for
+	// what this side sends, flowRx accounts what the application consumed.
+	flowTx flowSender
+	flowRx flowReceiver
+
 	ctx       context.Context
 	cancel    context.CancelFunc
 	callerCtx context.Context
@@ -174,7 +197,7 @@ type clientStream struct {
 }
 
 func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, ci *callInfo, openHdr metadata.MD, clientStreams, serverStreams bool) *clientStream {
-	rxCfg := c.rx.withDefaults()
+	rxCfg := c.rx.withReliableFloor(c.mode.reliable)
 	s := &clientStream{
 		conn: c,
 		sid:  sid,
@@ -193,6 +216,13 @@ func newClientStream(ctx context.Context, c *Conn, sid uint32, method string, ci
 		rxCfg:    rxCfg,
 		hdrReady: make(chan struct{}),
 		done:     make(chan struct{}),
+	}
+	if c.mode.reliable {
+		// Advertise this side's buffer as the server's initial send window
+		// (§4.2); it rides the OPEN. Until the server advertises its own, this
+		// side paces itself by the protocol's initial window.
+		s.flowRx.enable(uint32(rxCfg.size))
+		s.flowTx.assume(wInit)
 	}
 	s.rxWin.strict = c.mode.reliable
 	if c.peer != nil {
@@ -262,6 +292,17 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 	default:
 	}
 
+	if f.hasUnknownFlags() || !legalShape(f.shape()) {
+		// A modifier bit from a newer peer changes something about this frame
+		// that we cannot honor, and an illegal shape combination is not a
+		// frame we can route: delivering either would be a silent corruption,
+		// dropping it a silent gap (§7.1, §8).
+		err := status.Errorf(codes.Internal, "drpc: frame carries unsupported flags %#x", f.GetFlags())
+		s.sendAbort(codes.Internal)
+		s.finishLocal(err)
+		return
+	}
+
 	s.rxMu.Lock()
 	if s.srvEpochSet && f.GetEpoch() != s.srvEpoch {
 		// A frame from a different server incarnation (stale straggler after
@@ -270,6 +311,19 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 		s.rxDropped.Add(1)
 		return
 	}
+	s.rxMu.Unlock()
+
+	if f.shape() == FlagWindow {
+		// Stateless flow-control grant: no seq, no delivery, and only where
+		// flow control exists at all — a stray or injected WINDOW must never
+		// park an unreliable-mode sender (§4.2, §7, §15).
+		if s.conn.mode.reliable {
+			s.flowTx.grant(f.GetWindow())
+		}
+		return
+	}
+
+	s.rxMu.Lock()
 	v := s.rxWin.check(f.GetSeq())
 	if v == rxAccept && !s.srvEpochSet {
 		s.srvEpoch = f.GetEpoch()
@@ -281,7 +335,7 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 	case rxDup:
 		// Validated: any server frame for the sid clears the OPEN
 		// retransmission obligation (PROTOCOL.md §10.3).
-		s.noteValidatedRx()
+		s.noteValidatedRx(f)
 		return
 	case rxBeyond:
 		return
@@ -299,7 +353,13 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 		s.finishLocal(err)
 		return
 	}
-	s.noteValidatedRx()
+	s.noteValidatedRx(f)
+	if s.conn.mode.reliable {
+		// The first server frame — the creation ack for a streaming call —
+		// advertises the server's receive window and replaces the assumed one
+		// (§4.2). Absent means the peer does no flow control.
+		s.flowTx.observe(f.GetWindow())
+	}
 
 	switch {
 	case f.isTerminal():
@@ -320,7 +380,15 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 		}
 		s.latchHeader(f)
 		if s.conn.mode.reliable {
-			if !enqueueRxReliable(ctx, s.rx, f, s.done) {
+			if s.flowRx.active() {
+				if !enqueueRxFlow(s.rx, f) {
+					// The peer sent past its window: fail loud instead of
+					// stalling the channel for every other call (§4.2).
+					err := status.Error(codes.Internal, "drpc: peer exceeded the advertised flow-control window")
+					s.sendAbort(codes.Internal)
+					s.finishLocal(err)
+				}
+			} else if !enqueueRxReliable(ctx, s.rx, f, s.done) {
 				// The rx ctx died mid-delivery: the transport is tearing down
 				// (§4.5). The frame is gone and the window advanced — end the
 				// call rather than leave a silent gap (§14).
@@ -355,10 +423,13 @@ func (s *clientStream) openFrame() *Frame {
 	f.SetEpoch(s.conn.epoch)
 	f.SetSid(s.sid)
 	f.SetSeq(s.txSeq.next()) // 1
-	f.SetFlags(FlagOpen)
+	f.SetFlags(f.GetFlags() | FlagOpen)
 	f.SetMethod(s.method)
 	if s.codecName != "" {
 		f.SetCodec(s.codecName)
+	}
+	if s.conn.mode.reliable {
+		f.SetWindow(uint32(s.rxCfg.size))
 	}
 	if s.openHdr != nil {
 		f.SetHeader(newMd(s.openHdr))
@@ -436,6 +507,30 @@ func (s *clientStream) send(m any) error {
 		// grpc.MaxCallSendMsgSize: refused locally, nothing reaches the wire.
 		s.txMu.Unlock()
 		return err
+	}
+	opening := !s.txOpened
+	s.txMu.Unlock()
+
+	// Flow control (§4.2): the OPEN creates the call and is never credited;
+	// every later message waits for the peer's window. Parking here — not in
+	// the receiver's Handle — is what keeps one slow consumer from stalling
+	// the whole channel.
+	if !opening {
+		_, ferr := s.flowTx.acquire(s.ctx, s.done, s.conn.mode.timing.Stall, nil)
+		if ferr != nil {
+			if ferr == errCallEnded {
+				return io.EOF
+			}
+			return ferr
+		}
+	}
+
+	s.txMu.Lock()
+	select {
+	case <-s.done:
+		s.txMu.Unlock()
+		return io.EOF
+	default:
 	}
 
 	var f *Frame
@@ -529,12 +624,12 @@ func (s *clientStream) RecvMsg(m any) error {
 	// delivered in order even after done closes.
 	select {
 	case f := <-s.rx:
-		return s.recvInto(f, m)
+		return s.recvBuffered(f, m)
 	default:
 	}
 	select {
 	case f := <-s.rx:
-		return s.recvInto(f, m)
+		return s.recvBuffered(f, m)
 	case <-s.done:
 	case <-s.ctx.Done():
 		// The stream ctx is cancelled as part of finishing; prefer the
@@ -547,10 +642,43 @@ func (s *clientStream) RecvMsg(m any) error {
 	}
 	select {
 	case f := <-s.rx:
-		return s.recvInto(f, m)
+		return s.recvBuffered(f, m)
 	default:
 	}
 	return s.terminalRecv(m)
+}
+
+// recvBuffered delivers a frame taken out of the rx buffer and returns the
+// slot to the peer as flow-control credit.
+func (s *clientStream) recvBuffered(f *Frame, m any) error {
+	if err := s.recvInto(f, m); err != nil {
+		// A failed delivery ended the call; granting now would only draw a
+		// RESET for a sid the peer has already forgotten (§4.2).
+		return err
+	}
+	s.grantWindow(1)
+	return nil
+}
+
+// grantWindow reports messages the application consumed and sends the
+// resulting credit (§4.2). Called only for buffered data frames — a terminal
+// payload never occupied a buffer slot.
+func (s *clientStream) grantWindow(n uint32) {
+	select {
+	case <-s.done:
+		return // the peer has forgotten this sid; a grant would draw a RESET
+	default:
+	}
+	g := s.flowRx.consumed(n)
+	if g == 0 {
+		return
+	}
+	f := &Frame{}
+	f.SetEpoch(s.conn.epoch)
+	f.SetSid(s.sid)
+	f.SetFlags(FlagWindow)
+	f.SetWindow(g)
+	s.transmit(context.WithoutCancel(s.ctx), f)
 }
 
 func (s *clientStream) terminalRecv(m any) error {
@@ -689,6 +817,7 @@ func (s *clientStream) finishReset() {
 }
 
 func (s *clientStream) release() {
+	s.flowTx.release()
 	s.stopAfter()
 	s.conn.retire(s)
 	s.hdrOnce.Do(func() { close(s.hdrReady) })
@@ -756,6 +885,10 @@ type serverStream struct {
 	desc  *serviceDesc
 	codec encoding.CodecV2
 
+	// Per-stream flow control (reliable mode, §4.2).
+	flowTx flowSender
+	flowRx flowReceiver
+
 	ctx           context.Context
 	cancel        context.CancelCauseFunc
 	cancelTimeout context.CancelFunc // releases the handler-deadline timer
@@ -811,6 +944,11 @@ func newServerStream(ctx context.Context, srv *Server, key callKey, desc *servic
 	}
 	s.maxRecv = srv.maxRecv
 	s.maxSend = srv.maxSend
+	if reliable {
+		// Advertise this side's buffer as the client's initial send window;
+		// it rides the creation ack H (§4.2).
+		s.flowRx.enable(uint32(rxCfg.size))
+	}
 	s.rxWin.l = 1 // the accepted OPEN
 	s.rxWin.strict = reliable
 	n := nowNano()
@@ -825,6 +963,20 @@ func newServerStream(ctx context.Context, srv *Server, key callKey, desc *servic
 // reliable mode it may block on a full buffer, bounded by the rx ctx
 // (PROTOCOL.md §4.2).
 func (s *serverStream) handleRx(ctx context.Context, f *Frame) {
+	if f.hasUnknownFlags() || !legalShape(f.shape()) {
+		// See the client twin: an unimplemented modifier bit or an illegal
+		// shape fails the call rather than corrupting or gapping it (§7.1).
+		s.cancel(status.Errorf(codes.Internal, "drpc: frame carries unsupported flags %#x", f.GetFlags()))
+		return
+	}
+	if f.shape() == FlagWindow {
+		// Stateless flow-control grant: no seq, no delivery, reliable only
+		// (§4.2, §7).
+		if s.reliable {
+			s.flowTx.grant(f.GetWindow())
+		}
+		return
+	}
 	if f.isOpen() {
 		if f.GetSeq() != 1 {
 			// Off-shape: an OPEN's seq MUST be 1 (PROTOCOL.md §8).
@@ -879,7 +1031,11 @@ func (s *serverStream) handleRx(ctx context.Context, f *Frame) {
 			return
 		}
 		if s.reliable {
-			if !enqueueRxReliable(ctx, s.rx, f, s.ctx.Done()) {
+			if s.flowRx.active() {
+				if !enqueueRxFlow(s.rx, f) {
+					s.cancel(status.Error(codes.Internal, "drpc: peer exceeded the advertised flow-control window"))
+				}
+			} else if !enqueueRxReliable(ctx, s.rx, f, s.ctx.Done()) {
 				// See the client twin: teardown ate the frame — fail loud
 				// rather than leave a silent gap on a reliable channel (§14).
 				s.rxDropped.Add(1)
@@ -919,6 +1075,9 @@ func (s *serverStream) transmit(ctx context.Context, f *Frame) error {
 func (s *serverStream) sendH() {
 	s.txMu.Lock()
 	f := s.nextFrameLocked()
+	if s.reliable {
+		f.SetWindow(uint32(s.rxCfg.size))
+	}
 	s.attachHeaderLocked(f)
 	if s.hdrFrame == nil {
 		s.hdrFrame = f
@@ -1028,6 +1187,18 @@ func (s *serverStream) SendMsg(m any) error {
 		return err
 	}
 
+	if s.desc.stream.ServerStreams {
+		// Flow control (§4.2): park until the client has room, instead of
+		// letting its full buffer stall every call on the channel.
+		_, ferr := s.flowTx.acquire(s.ctx, s.ctx.Done(), s.server.mode.timing.Stall, nil)
+		if ferr != nil {
+			if ferr == errCallEnded {
+				return ctxErr(s.ctx)
+			}
+			return ferr
+		}
+	}
+
 	s.txMu.Lock()
 	if !s.desc.stream.ServerStreams {
 		// Client-streaming: SendAndClose's message rides the terminal frame
@@ -1073,16 +1244,16 @@ func (s *serverStream) undoRefused(f *Frame, err error) {
 func (s *serverStream) RecvMsg(m any) error {
 	select {
 	case f := <-s.rx:
-		return s.recvInto(f, m)
+		return s.recvBuffered(f, m)
 	default:
 	}
 	select {
 	case f := <-s.rx:
-		return s.recvInto(f, m)
+		return s.recvBuffered(f, m)
 	case <-s.rxEOF:
 		select {
 		case f := <-s.rx:
-			return s.recvInto(f, m)
+			return s.recvBuffered(f, m)
 		default:
 		}
 		return io.EOF
@@ -1098,6 +1269,34 @@ func (s *serverStream) recvInto(f *Frame, m any) error {
 		return err
 	}
 	return f.unmarshal(m, s.codec)
+}
+
+// recvBuffered delivers a frame taken out of the rx buffer and returns the
+// slot to the client as flow-control credit (§4.2).
+func (s *serverStream) recvBuffered(f *Frame, m any) error {
+	if err := s.recvInto(f, m); err != nil {
+		return err
+	}
+	s.grantWindow(1)
+	return nil
+}
+
+// grantWindow sends flow-control credit for consumed messages.
+func (s *serverStream) grantWindow(n uint32) {
+	if s.ctx.Err() != nil {
+		return // the call is over; a grant would draw a RESET
+	}
+	g := s.flowRx.consumed(n)
+	if g == 0 {
+		return
+	}
+	f := &Frame{}
+	f.SetEpoch(s.server.epoch)
+	f.SetSid(s.key.sid)
+	f.SetPeerEpoch(s.key.epoch)
+	f.SetFlags(FlagWindow)
+	f.SetWindow(g)
+	s.transmit(context.WithoutCancel(s.ctx), f)
 }
 
 // setResp stores the unary / SendAndClose response payload, which rides the
