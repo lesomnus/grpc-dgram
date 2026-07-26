@@ -487,10 +487,8 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		st.flowTx.observe(f.GetWindow())
 	}
 
-	var transport *serverTransportUnary
 	if desc.IsUnary() {
-		transport = &serverTransportUnary{method: desc.fullname}
-		st.ctx = grpc.NewContextWithServerTransportStream(st.ctx, transport)
+		st.ctx = grpc.NewContextWithServerTransportStream(st.ctx, serverTransportUnary{st})
 	} else {
 		st.ctx = grpc.NewContextWithServerTransportStream(st.ctx, serverTransportStream{st})
 	}
@@ -550,7 +548,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	s.kickSweep()
 
 	if desc.IsUnary() {
-		go s.runUnary(st, transport, f)
+		go s.runUnary(st, f)
 	} else if !desc.stream.ClientStreams {
 		// A server-streaming OPEN piggybacks the request message and the
 		// half-close (PROTOCOL.md §8); generated handlers read the request
@@ -607,7 +605,7 @@ func (s *Server) rejectOpen(ctx context.Context, f *Frame, code codes.Code, msg 
 	return s.tx.Handle(ctx, t)
 }
 
-func (s *Server) runUnary(st *serverStream, transport *serverTransportUnary, open *Frame) {
+func (s *Server) runUnary(st *serverStream, open *Frame) {
 	defer s.wg.Done()
 	var term *Frame
 	defer func() { s.finish(st, term) }()
@@ -632,14 +630,6 @@ func (s *Server) runUnary(st *serverStream, transport *serverTransportUnary, ope
 			st.setResp(payload)
 		}
 	}
-	header, trailer := transport.snapshot()
-	if header != nil {
-		st.SetHeader(header)
-	}
-	if trailer != nil {
-		st.SetTrailer(trailer)
-	}
-
 	f := st.terminalFrame(err)
 
 	// The terminal is sent even when the handler ctx ended: the client (or

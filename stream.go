@@ -21,7 +21,7 @@ var (
 	_ grpc.ClientStream = &clientStream{}
 	_ grpc.ServerStream = &serverStream{}
 
-	_ grpc.ServerTransportStream = &serverTransportUnary{}
+	_ grpc.ServerTransportStream = serverTransportUnary{}
 	_ grpc.ServerTransportStream = serverTransportStream{}
 )
 
@@ -729,17 +729,16 @@ func (s *clientStream) terminalRecv(m any) error {
 	return io.EOF
 }
 
+// Header blocks until the server's header metadata is latched or the call
+// ends, then returns it (nil if the call ended without one). It never returns
+// the call's status — grpc-go swallows it too, leaving RecvMsg to deliver it —
+// and never returns a context error: a cancelled caller ctx ends the call
+// through the abort path, which closes both channels below, so the outcome is
+// the same whichever of the two the scheduler runs first (PROTOCOL.md §11).
 func (s *clientStream) Header() (metadata.MD, error) {
 	select {
 	case <-s.hdrReady:
 	case <-s.done:
-	case <-s.ctx.Done():
-		select {
-		case <-s.hdrReady:
-		case <-s.done:
-		default:
-			return nil, ctxErr(s.ctx)
-		}
 	}
 	s.stMu.Lock()
 	defer s.stMu.Unlock()
@@ -868,39 +867,25 @@ func (s *clientStream) release() {
 // server stream
 // ---------------------------------------------------------------------------
 
-type serverTransportUnary struct {
-	method string
+// serverTransportUnary bridges grpc.SetHeader / grpc.SendHeader /
+// grpc.SetTrailer — which reach a handler through its ctx — to the unary
+// call's own stream, so a unary handler flushes headers exactly like a
+// streaming one (PROTOCOL.md §8, §11).
+type serverTransportUnary struct{ *serverStream }
 
-	mu      sync.Mutex
-	header  metadata.MD
-	trailer metadata.MD
+func (t serverTransportUnary) Method() string { return t.desc.fullname }
+
+func (t serverTransportUnary) SetHeader(md metadata.MD) error {
+	return t.serverStream.SetHeader(md)
 }
 
-func (t *serverTransportUnary) Method() string { return t.method }
+func (t serverTransportUnary) SendHeader(md metadata.MD) error {
+	return t.serverStream.SendHeader(md)
+}
 
-func (t *serverTransportUnary) SetHeader(md metadata.MD) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.header = metadata.Join(t.header, md)
+func (t serverTransportUnary) SetTrailer(md metadata.MD) error {
+	t.serverStream.SetTrailer(md)
 	return nil
-}
-
-func (t *serverTransportUnary) SendHeader(md metadata.MD) error {
-	// A unary call has a single response frame; the header rides it.
-	return t.SetHeader(md)
-}
-
-func (t *serverTransportUnary) SetTrailer(md metadata.MD) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.trailer = metadata.Join(t.trailer, md)
-	return nil
-}
-
-func (t *serverTransportUnary) snapshot() (header, trailer metadata.MD) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.header, t.trailer
 }
 
 type serverTransportStream struct{ *serverStream }
@@ -945,14 +930,15 @@ type serverStream struct {
 	suppressTerm atomic.Bool
 
 	// tx state, guarded by txMu.
-	txMu     sync.Mutex
-	txSeq    txSeq
-	txHeader metadata.MD // set via SetHeader/SendHeader
-	hdrSent  bool        // header MD already rode some frame
-	hdrFrame *Frame      // stored creation ack for byte-identical replay (§8)
-	trailer  metadata.MD
-	resp     []byte // captured SendAndClose payload (client-streaming)
-	respSet  bool
+	txMu       sync.Mutex
+	txSeq      txSeq
+	txHeader   metadata.MD // set via SetHeader/SendHeader
+	hdrSent    bool        // header MD already rode some frame
+	hdrFlushed bool        // the HANDLER flushed a header (SendHeader), §11
+	hdrFrame   *Frame      // stored creation ack for byte-identical replay (§8)
+	trailer    metadata.MD
+	resp       []byte // captured SendAndClose payload (client-streaming)
+	respSet    bool
 
 	// rx sequencing, guarded by rxMu (transport side). The server enforces
 	// incarnation isolation structurally — calls are keyed by
@@ -1034,7 +1020,10 @@ func (s *serverStream) handleRx(ctx context.Context, f *Frame) {
 		// it re-elicits the creation ack (PROTOCOL.md §8 ack recovery);
 		// unary is deadline-bounded and sends no ack.
 		s.noteValidatedRx()
-		if !s.desc.IsUnary() {
+		if !s.desc.IsUnary() || s.storedH() != nil {
+			// Streaming calls always owe an ack; a unary call owes one only if
+			// its handler flushed a header, which the client is now blocked
+			// on (§8 ack recovery, §11).
 			s.replayH()
 		}
 		return
@@ -1119,12 +1108,19 @@ func (s *serverStream) sendH() {
 	if s.reliable {
 		f.SetWindow(uint32(s.rxCfg.size))
 	}
-	s.attachHeaderLocked(f)
+	s.attachHeaderLocked(f, false)
 	if s.hdrFrame == nil {
 		s.hdrFrame = f
 	}
 	s.txMu.Unlock()
 	s.transmit(s.ctx, f)
+}
+
+// storedH returns the H frame kept for byte-identical replay, if any.
+func (s *serverStream) storedH() *Frame {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+	return s.hdrFrame
 }
 
 // replayH answers a duplicate OPEN with the creation ack, rate-limited to
@@ -1147,7 +1143,7 @@ func (s *serverStream) replayH() {
 	f := s.hdrFrame
 	if f == nil {
 		f = s.nextFrameLocked()
-		s.attachHeaderLocked(f)
+		s.attachHeaderLocked(f, false)
 	}
 	s.txMu.Unlock()
 	s.transmit(context.WithoutCancel(s.ctx), f)
@@ -1182,34 +1178,90 @@ func (s *serverStream) nextFrameLocked() *Frame {
 }
 
 // attachHeaderLocked piggybacks the pending header MD once (PROTOCOL.md §11).
-func (s *serverStream) attachHeaderLocked(f *Frame) {
-	if s.txHeader != nil && !s.hdrSent {
+// force makes the field present even when the handler set no metadata: an
+// explicit SendHeader must unblock the client's Header(), while a creation
+// ack must not pin the header to nil (§8).
+func (s *serverStream) attachHeaderLocked(f *Frame, force bool) {
+	if s.hdrSent {
+		return
+	}
+	if s.txHeader != nil {
 		f.SetHeader(newMd(s.txHeader))
+		s.hdrSent = true
+		return
+	}
+	if force {
+		f.SetHeader(newMd(nil))
 		s.hdrSent = true
 	}
 }
 
+// errIllegalHeaderWrite mirrors grpc-go's transport.ErrIllegalHeaderWrite.
+var errIllegalHeaderWrite = status.Error(codes.Internal, "drpc: SendHeader called multiple times")
+
 func (s *serverStream) SetHeader(md metadata.MD) error {
+	if md.Len() == 0 {
+		return nil
+	}
+	if err := validateMD(md); err != nil {
+		return mdStatusErr(err)
+	}
 	s.txMu.Lock()
 	defer s.txMu.Unlock()
+	if s.hdrFlushed || s.hdrSent {
+		// The header is already on the wire; joining more would silently lose
+		// it (§11 first-wins). grpc-go returns the same error here.
+		return errIllegalHeaderWrite
+	}
 	s.txHeader = metadata.Join(s.txHeader, md)
 	return nil
 }
 
+// SendHeader flushes the header metadata as an H frame at once — including on
+// unary calls, so a client's Header() returns before the response exists, as
+// it does on gRPC (PROTOCOL.md §8, §11). Calling it twice is an error, as in
+// grpc-go; the core's own creation ack is not a flush.
 func (s *serverStream) SendHeader(md metadata.MD) error {
+	if err := validateMD(md); err != nil {
+		return mdStatusErr(err)
+	}
 	s.txMu.Lock()
+	if s.hdrFlushed || s.hdrSent {
+		// Flushed twice, or after the header already rode a data frame:
+		// grpc-go's ErrIllegalHeaderWrite, and refusing is what keeps the
+		// metadata from being silently dropped (§11).
+		s.txMu.Unlock()
+		return errIllegalHeaderWrite
+	}
+	s.hdrFlushed = true
 	s.txHeader = metadata.Join(s.txHeader, md)
+	sent := s.txHeader
 	f := s.nextFrameLocked()
-	s.attachHeaderLocked(f)
+	s.attachHeaderLocked(f, true)
+	if s.hdrFrame == nil {
+		// Keep it for byte-identical replay: on a unary call this H is the
+		// only thing a client's Header() is waiting for (§8 ack recovery).
+		s.hdrFrame = f
+	}
 	s.txMu.Unlock()
 	if err := s.transmit(s.ctx, f); err != nil {
 		s.undoRefused(f, err)
-		return err
+		return toStatusErr(err)
 	}
+	_ = sent
 	return nil
 }
 
+// SetTrailer records trailer metadata. Invalid metadata is dropped, as
+// grpc-go does (the signature has no error to return) — validating here is
+// what keeps it from failing the terminal frame's marshal (§11).
 func (s *serverStream) SetTrailer(md metadata.MD) {
+	if md.Len() == 0 {
+		return
+	}
+	if err := validateMD(md); err != nil {
+		return
+	}
 	s.txMu.Lock()
 	defer s.txMu.Unlock()
 	s.trailer = metadata.Join(s.trailer, md)
@@ -1261,7 +1313,7 @@ func (s *serverStream) SendMsg(m any) error {
 		s.txMu.Unlock()
 		return cerr
 	}
-	s.attachHeaderLocked(f)
+	s.attachHeaderLocked(f, false)
 	s.txMu.Unlock()
 
 	if s.ctx.Err() != nil {

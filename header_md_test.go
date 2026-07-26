@@ -16,11 +16,11 @@ import (
 )
 
 // These tests pin the server-header metadata rules of PROTOCOL.md §11 against
-// the wire shapes of §8: the SendHeader immediate-H flush on streaming calls,
-// the SetHeader defer-to-next-frame path, the unary SendHeader-as-SetHeader
-// coalescing into T, the T header re-carry that survives first-frame loss
-// (§10.3 recovers the call, T recovers the header), and the first-wins latch
-// shared with trailers (§7).
+// the wire shapes of §8: the SendHeader immediate-H flush (on streaming calls
+// and, since v1.1, on unary ones too — gRPC parity, so Header() returns before
+// the response), the SetHeader defer-to-next-frame path, the T header re-carry
+// that survives first-frame loss (§10.3 recovers the call, T recovers the
+// header), and the first-wins latch shared with trailers (§7).
 
 // rxFrames snapshots the recorded server->client frames.
 func (c *Client) rxFrames() []*drpc.Frame {
@@ -183,10 +183,11 @@ func TestSetHeaderDefersToNextFrame(t *testing.T) {
 	x.Equal(t, wantHdr, term.GetHeader().MD())
 }
 
-// TestUnarySendHeaderRidesTerminal pins PROTOCOL.md §11/§8: a unary call has
-// a single response frame, so SendHeader behaves as SetHeader and the header
-// MD rides T only — the server must not flush a standalone H.
-func TestUnarySendHeaderRidesTerminal(t *testing.T) {
+// TestUnarySendHeaderFlushesH pins PROTOCOL.md §11/§8: SendHeader flushes an H
+// at once on a unary call too, so a client blocked in Header() is released
+// before the handler produces its response — what gRPC does with its separate
+// HEADERS frame. T still re-carries the header (§11).
+func TestUnarySendHeaderFlushesH(t *testing.T) {
 	client, stop := PipeOption{}.Use(t)
 	defer stop()
 
@@ -197,8 +198,9 @@ func TestUnarySendHeaderRidesTerminal(t *testing.T) {
 
 	header := metadata.MD{}
 	trailer := metadata.MD{}
-	// handleMd calls SendHeader (LazyHeader=false): on the unary transport it
-	// must coalesce, not flush.
+	// handleMd calls SendHeader (LazyHeader=false): on a unary call it flushes
+	// an H at once, exactly as gRPC does — a client's Header() must not have
+	// to wait for the response (PROTOCOL.md §8, §11).
 	res, err := client.Once(ctx, echo.EchoRequest_builder{
 		Message:       "abc",
 		CircularShift: 1,
@@ -209,12 +211,47 @@ func TestUnarySendHeaderRidesTerminal(t *testing.T) {
 	x.Equal(t, wantTrl, trailer)
 
 	frames := client.rxFrames()
-	x.Len(t, frames, 1, "unary shape is a single server frame: the T (§8)")
+	x.Len(t, frames, 2, "SendHeader flushes an H, then the T (§8)")
+	h := frames[0]
+	x.True(t, isAckH(h), "the flushed header frame carries no payload")
+	x.True(t, h.HasHeader(), "and carries the header MD")
+	x.Equal(t, wantHdr, h.GetHeader().MD())
+	x.Equal(t, uint32(1), h.GetSeq())
+
+	term := frames[1]
+	x.True(t, isTerminal(term))
+	x.Equal(t, uint32(2), term.GetSeq())
+	x.True(t, term.HasHeader(), "the T re-carries the header (§11)")
+	x.Equal(t, wantHdr, term.GetHeader().MD())
+	x.Equal(t, wantTrl, term.GetTrailer().MD())
+	x.True(t, term.HasPayload(), "the unary response rides the T")
+}
+
+// The lazy twin: SetHeader alone defers to the next outgoing frame, so a
+// unary call still answers with a single T carrying both header and response.
+func TestUnarySetHeaderRidesTerminal(t *testing.T) {
+	client, stop := PipeOption{}.Use(t)
+	defer stop()
+	client.service.LazyHeader = true
+
+	md := metadata.Pairs("foo", "bar")
+	ctx := metadata.NewOutgoingContext(t.Context(), md)
+	wantHdr := metadata.Pairs("foo", "bar", "timing", "header")
+
+	header := metadata.MD{}
+	res, err := client.Once(ctx, echo.EchoRequest_builder{
+		Message:       "abc",
+		CircularShift: 1,
+	}.Build(), grpc.Header(&header))
+	x.NoError(t, err)
+	x.Equal(t, "bca", res.GetMessage())
+	x.Equal(t, wantHdr, header)
+
+	frames := client.rxFrames()
+	x.Len(t, frames, 1, "unary shape without a flush is a single server frame (§8)")
 	term := frames[0]
 	x.True(t, isTerminal(term))
 	x.True(t, term.HasHeader(), "the header rides the T")
-	x.Equal(t, wantHdr, term.GetHeader().MD())
-	x.Equal(t, wantTrl, term.GetTrailer().MD())
 	x.True(t, term.HasPayload(), "the unary response rides the same T")
 }
 
