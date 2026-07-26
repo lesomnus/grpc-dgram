@@ -8,7 +8,6 @@ on:
       - ".github/workflows/ci.yaml"
       - "**/go.mod"
       - "**/go.sum"
-      - "go.work"
       - "buf.yaml"
       - "buf.gen.yaml"
       - "ts/**"
@@ -54,9 +53,9 @@ jobs:
 
   bench:
     runs-on: ubuntu-latest
-    # The old commit is checked out INSIDE the current tree; without this,
-    # Go's walk-up finds the new top-level go.work, which does not `use` old/,
-    # and the old benchmark fails at setup.
+    # The old commit is checked out INSIDE the current tree, so Go's walk-up
+    # would find a workspace file left in the working directory. go.work is
+    # untracked, but a self-hosted or cached runner can still have one.
     env:
       GOWORK: off
 

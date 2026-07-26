@@ -1,2 +1,9 @@
 .pnpm-store
 node_modules
+
+# Workspace file: a local developer convenience, not a property of the repo.
+# Every module already resolves the others through its own replace directive,
+# so a checkout builds without one — and committing it forced GOWORK=off on
+# the benchmark job, whose nested checkout the tree-root workspace captured.
+go.work
+go.work.sum
