@@ -85,6 +85,25 @@ instance has exited or the sock is closed — a connection to a corpse would han
 forever rather than fail (§10.6 leaves no timer to end it), so it is refused
 out loud.
 
+What a second `dial()` does **not** give you is a second server. Every
+connection reaches the same handlers, the same application state and the same
+thread: an instance is one Go program, and its goroutines interleave
+cooperatively on whichever realm it runs in, so one connection's slow handler
+delays the others (a Worker keeps that off the page's thread, not off its
+own). The split is worth stating plainly, because it is the whole basis for
+deciding how many to open:
+
+| per connection | shared by all of them |
+|---|---|
+| epoch, sid space, seq, flow-control windows, rx buffers | the service registry and every handler behind it |
+| per-peer resource caps (`MaxLiveCalls`, tombstones — §15) | whatever state those handlers hold |
+| teardown: closing one leaves the others running | the instance's single thread, and its death |
+
+So the reason to dial twice is *isolation of the connection*, not of the
+server: a part of the page you want to tear down on its own, or a `Worker` or
+iframe that should hold its own peer rather than share yours. Two servers —
+separate state, separate everything — is two `open()` calls.
+
 `exited` resolves — never rejects — with the cause when the instance is gone.
 `close()` resolves it too: after that this sock has stopped watching, and a
 promise that could only hang would be worse than one that answers.
