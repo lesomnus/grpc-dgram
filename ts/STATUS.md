@@ -45,15 +45,15 @@ each).
 | `conn.ts` | `Conn` + `ClientStream`, client unreliable-mode machinery | `conn.go`, `stream.go`, `unreliable.go` |
 | `server.ts` | `Server` + server stream, per-peer state, sweep, caps | `server.go`, `stream.go`, `unreliable_server.go` |
 | `transport/webrtc/` | `DataChannelTransport` (client) + `DataChannelGateway` (server, mixed-mode) | `transport/pion/*.go` |
-| `transport/websocket/` | `WebSocketTransport` (client) + gateway/`servePeer` (server), reliable | `transport/gorilla/*.go` |
-| `transport/port/` | `PortTransport` + `PortGateway` over `postMessage`, reliable; teardown is the empty-message goodbye plus `close(cause)` | `transport/jsport/*.go` |
-| `transport/node-udp/` | `UdpTransport`/`UdpGateway` + `dialUdp`/`listenUdp` (Node `dgram`) | `transport/udp/*.go` |
+| `transport/websocket/` | `WebSocketTransport` + `dialWebSocket` → `Conn` (client), gateway/`servePeer` (server), reliable | `transport/gorilla/*.go` |
+| `transport/port/` | `PortTransport` + `dialWorker` → `Conn`, `PortGateway` over `postMessage`, reliable; teardown is the empty-message goodbye plus `close(cause)` | `transport/jsport/*.go` |
+| `transport/node-udp/` | `UdpTransport`/`UdpGateway` + `dialUdp` → `Conn` / `listenUdp` (Node `dgram`) | `transport/udp/*.go` |
 | `transport/protobuf-es/` | `fromService`/`fromMethod` — derive descriptors from generated protobuf-es | grpc-go codegen (G2) |
 | `transport/connect/` | `createDrpcTransport` — a Connect-ES `Transport` over a dRPC `Conn` | — (Connect interop) |
 
 Verified at this commit:
 
-- `pnpm test` → **291 passing** (19 files). Unit and per-adapter tests are
+- `pnpm test` → **353 passing** (21 files). Unit and per-adapter tests are
   co-located next to their source (`src/wire.test.ts`,
   `src/transport/connect/index.test.ts`, …); cross-cutting integration tests
   (e2e, timeout, restart, limits, conformance, wasm, protobufes-gen) stay in
@@ -70,14 +70,21 @@ Verified at this commit:
   DATA_LOSS, §9.4 watermark, per-peer mode),
   `src/transport/webrtc/index.test.ts` (adapter against a mock RTCDataChannel
   pair, incl. the reliable-datachannel echo — the project's final-goal demo
-  shape), `protobufes*.test.ts` (the binding, verified
+  shape), `src/transport/{websocket,port}/index.test.ts` (their adapters
+  against mock pairs and a real `MessageChannel`, incl. the goodbye and the
+  §4.5 teardown), `src/wasm/{index,worker}.test.ts` (`open()` against a fake
+  `Go`: the ordering rules a dropped frame would otherwise hide),
+  `protobufes*.test.ts` (the binding, verified
   against real `protoc-gen-es` output), and the two cross-language suites —
   **`conformance.test.ts`** (a TS client driving a **real Go `drpc.Server`**
   over UDP) and **`wasm.test.ts`** (the same server built `GOOS=js GOARCH=wasm`
   and driven over a `MessageChannel`) — see below.
 - `pnpm check` (`tsc --noEmit`, strict) → clean.
-- `pnpm build` (tsdown) → clean; emits `dist/index.mjs` plus one
-  `dist/transport/*.mjs` per adapter entry, with `.d.mts`. `dist/` is
+- `pnpm build` (tsdown) → clean; emits `dist/index.mjs`, one
+  `dist/transport/*.mjs` per adapter entry, and `dist/wasm.mjs` +
+  `dist/wasm/worker.mjs` — the last one is shipped code rather than an API
+  surface: it is the worker `open()` starts, resolved relative to `wasm.mjs`,
+  so the two must stay in that layout. All with `.d.mts`. `dist/` is
   gitignored.
 
 ## Adversarial audit — done (4 findings fixed)
