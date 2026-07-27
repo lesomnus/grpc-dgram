@@ -1,16 +1,14 @@
 // @ts-check
 // The browser half of the demo: a todo UI driven by a real Go gRPC service,
-// which by default runs in a Worker this page starts as a wasm instance. Plain
-// ES modules — no build step, no bundler, no framework. The import map in
+// which runs in a Worker this page starts as a wasm instance. Plain ES
+// modules — no build step, no bundler, no framework. The import map in
 // index.html points the package entries at the port's build output (ts/dist).
 //
 // Everything past `connect()` — the descriptors, the calls, the Watch loop,
-// the error rendering — is written once: the same code drives the wasm server
-// and the server process behind ?server=ws. Only the link that switches
-// between the two, and the status line that names them, know which is which.
+// the error rendering — is ordinary gRPC client code, written against a
+// `Conn` and knowing nothing about where the server it reaches came from.
 
-import { Code, Conn, serverStreamingMethod, StatusError, unaryMethod } from '@lesomnus/grpc-dgram'
-import { dialWebSocket } from '@lesomnus/grpc-dgram/transport/websocket'
+import { Code, serverStreamingMethod, StatusError, unaryMethod } from '@lesomnus/grpc-dgram'
 import { open } from '@lesomnus/grpc-dgram/wasm'
 
 // The messages, as protojson writes them (see jsoncodec/). Every field is
@@ -57,10 +55,8 @@ const Watch = serverStreamingMethod('/todo.TodoService/Watch', { request: json, 
 /** @type {import('@lesomnus/grpc-dgram').ConnOptions} */
 const connOptions = { defaultCallOptions: { codec: wireCodec } }
 
-/** @typedef {{ conn: Conn, label: string }} Session */
-
 // ---------------------------------------------------------------------------
-// the two servers
+// the server
 // ---------------------------------------------------------------------------
 
 /**
@@ -82,31 +78,11 @@ const connOptions = { defaultCallOptions: { codec: wireCodec } }
  * peer (§6.4). Nothing holds the sock: `sock.close()` would end the
  * connections and terminate the worker, and a page that is being reloaded is
  * doing exactly that anyway.
- * @returns {Promise<Session>}
+ * @returns {Promise<import('@lesomnus/grpc-dgram').Conn>}
  */
-async function connectWasm() {
+async function connect() {
   const sock = await open('/app.wasm')
-  return { conn: sock.dial(connOptions), label: 'in a Worker (wasm)' }
-}
-
-/**
- * Connects to the server process at /rpc instead. Same handlers, same wire,
- * a WebSocket in place of the message port.
- * @returns {Promise<Session>}
- */
-async function connectWebSocket() {
-  const url = new URL('/rpc', location.href)
-  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-  return { conn: new Conn(dialWebSocket(url.href), connOptions), label: `WebSocket to ${url.href}` }
-}
-
-/**
- * Returns a client on whichever server the URL selects. Everything after this
- * point is written once and runs against either.
- * @returns {Promise<Session>}
- */
-function connect() {
-  return new URLSearchParams(location.search).get('server') === 'ws' ? connectWebSocket() : connectWasm()
+  return sock.dial(connOptions)
 }
 
 // ---------------------------------------------------------------------------
@@ -120,13 +96,7 @@ const addButton = /** @type {HTMLButtonElement} */ (document.getElementById('add
 const missingButton = /** @type {HTMLButtonElement} */ (document.getElementById('missing'))
 const taskList = /** @type {HTMLElement} */ (document.getElementById('tasks'))
 const errorLine = /** @type {HTMLElement} */ (document.getElementById('error'))
-const switchLink = /** @type {HTMLAnchorElement} */ (document.getElementById('switch'))
 const log = /** @type {HTMLElement} */ (document.getElementById('log'))
-
-const onWebSocket = new URLSearchParams(location.search).get('server') === 'ws'
-switchLink.href = onWebSocket ? '?' : '?server=ws'
-switchLink.textContent = onWebSocket ? 'Back to the wasm server' : 'Talk to the server process instead'
-state.textContent = onWebSocket ? 'connecting to the server process…' : 'starting the server in a Worker…'
 
 /**
  * @param {string} line
@@ -230,23 +200,29 @@ async function watch() {
   write('the Watch stream ended')
 }
 
-let session
+/** @type {import('@lesomnus/grpc-dgram').Conn} */
+let conn
 try {
-  session = await connect()
+  conn = await connect()
 } catch (err) {
   state.textContent = 'no server'
   fail(err)
   write(`✗ ${String(err)}`, 'err')
   throw err
 }
-const { conn } = session
 
-// The first call is also the connection check: an unreachable WebSocket, or a
-// server that never came up, fails here rather than looking idle.
+// The first call is also the connection check: a server that published its
+// entry point but cannot answer fails here rather than looking idle. A build
+// that failed, or an instance that died on the way up, already failed above —
+// open() rejects with the compiler output the 500 carried.
 const listed = await call(List, {})
 tasks = listed?.tasks ?? []
 render()
-state.textContent = listed === undefined ? `no answer from ${session.label}` : `served by ${listed.servedBy ?? '?'} — ${session.label}, reliable mode`
+// servedBy is the server's own word for which build answered ("the js/wasm
+// build"), not for how the page reached it — so the page prints what it was
+// told, and adds only its own half: where it started that build.
+state.textContent =
+  listed === undefined ? 'no answer from the server' : `served by ${listed.servedBy ?? '?'} — in a Worker, reliable mode`
 addButton.disabled = false
 missingButton.disabled = false
 
@@ -279,5 +255,5 @@ form.addEventListener('submit', (ev) => {
 missingButton.addEventListener('click', () => void call(Toggle, { id: 999 }))
 
 // One close says goodbye to the server, fails anything still in flight, and
-// releases the channel — the same call whichever transport is underneath.
+// releases the channel.
 globalThis.addEventListener('beforeunload', () => conn.close())

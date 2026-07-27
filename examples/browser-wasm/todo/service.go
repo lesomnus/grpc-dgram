@@ -12,8 +12,8 @@ import (
 
 // Service is an ordinary gRPC service implementation: generated stubs, request
 // validation, real statuses, one server-streaming method. Nothing in it knows
-// whether its client is across a WebSocket or on the other end of a
-// MessageChannel in the same tab.
+// what carries its calls — a socket, or the other end of a MessageChannel in
+// the same tab.
 type Service struct {
 	todopb.UnimplementedTodoServiceServer
 
@@ -22,11 +22,10 @@ type Service struct {
 }
 
 // NewService returns the service backed by store. servedBy is what List
-// reports — "the js/wasm build" for the one that runs in the browser, the
-// listen address for the server process — so the page can show which of the
-// two answered instead of assuming. Where that build runs is the host's
-// choice and not this server's to claim: it is a Worker by default, and the
-// page's own half of the status line is what says so.
+// reports — "the js/wasm build" for the one that runs in the browser — so the
+// status line names which build answered instead of assuming it: the page
+// renders what the server told it. Where that build runs is the host's choice
+// and not this server's to claim; the page's own half of the line says so.
 func NewService(store Store, servedBy string) *Service {
 	return &Service{store: store, servedBy: servedBy}
 }

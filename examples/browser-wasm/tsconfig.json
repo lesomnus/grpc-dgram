@@ -21,7 +21,6 @@
     "types": [],
     "paths": {
       "@lesomnus/grpc-dgram": ["../../ts/dist/index.d.mts"],
-      "@lesomnus/grpc-dgram/transport/websocket": ["../../ts/dist/transport/websocket.d.mts"],
       "@lesomnus/grpc-dgram/wasm": ["../../ts/dist/wasm.d.mts"]
     }
   },

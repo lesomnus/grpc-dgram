@@ -3,9 +3,7 @@ module github.com/lesomnus/grpc-dgram/examples/browser-wasm
 go 1.26.1
 
 require (
-	github.com/gorilla/websocket v1.5.3
 	github.com/lesomnus/grpc-dgram v0.0.0
-	github.com/lesomnus/grpc-dgram/transport/gorilla v0.0.0
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
 )
@@ -18,5 +16,3 @@ require (
 )
 
 replace github.com/lesomnus/grpc-dgram => ../..
-
-replace github.com/lesomnus/grpc-dgram/transport/gorilla => ../../transport/gorilla

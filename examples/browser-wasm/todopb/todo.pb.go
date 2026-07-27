@@ -172,8 +172,9 @@ func (*ListRequest) Descriptor() ([]byte, []int) {
 type ListResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Tasks []*Task                `protobuf:"bytes,1,rep,name=tasks,proto3" json:"tasks,omitempty"`
-	// Which server answered: "the js/wasm build" or the process's address. The
-	// page shows it, so switching transports is visible rather than assumed.
+	// The server's own name for itself — "the js/wasm build". It says which
+	// build answered, not how the caller reached it, and the page renders what
+	// it was told rather than what it assumes about the server it started.
 	ServedBy      string `protobuf:"bytes,2,opt,name=served_by,json=servedBy,proto3" json:"served_by,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

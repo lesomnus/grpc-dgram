@@ -1,7 +1,7 @@
 //go:build js && wasm
 
-// Command wasm is the server, compiled for the page: the same todo.Service the
-// dev server registers, behind a jsport.Gateway instead of a WebSocket. It is
+// Command wasm is the server, compiled for the page: todo.Service — ordinary
+// gRPC handler code — behind a jsport.Gateway instead of a socket. It is
 // built on demand by the dev server (GET /app.wasm) and started by the page,
 // so a browser reload restarts the whole server — new instance, new store,
 // new everything.
@@ -32,16 +32,16 @@ import (
 )
 
 func main() {
-	// The same three lines the dev server runs, with jsport.NewGateway in
-	// place of gorilla.NewGateway. Both advertise Reliable() == true, so this
-	// server runs with every protocol timer off (PROTOCOL.md §10.6) exactly as
-	// the other one does.
+	// The three lines any drpc server is, with jsport.NewGateway where a
+	// process would put gorilla.NewGateway (examples/websocket-echo). It
+	// advertises Reliable() == true, so this server runs with every protocol
+	// timer off (PROTOCOL.md §10.6), exactly as the WebSocket one does.
 	gw := jsport.NewGateway()
 	srv := drpc.NewServer(gw)
 	todopb.RegisterTodoServiceServer(srv, todo.NewService(
 		todo.NewMemStore(
 			"Reload the page — this server restarts with it",
-			"Switch to ?server=ws — the UI code does not change",
+			"Tick this box: the change reaches the list over the Watch stream",
 		),
 		"the js/wasm build",
 	))

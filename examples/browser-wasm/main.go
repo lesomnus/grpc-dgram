@@ -1,17 +1,18 @@
 //go:build !js
 
-// Command browser-wasm is a Go server whose UI is developed by running the
-// real server inside the browser.
+// Command browser-wasm is the dev server for a Go gRPC server that runs in the
+// browser: it serves the page, and builds the server the page starts.
 //
-// GET /app.wasm builds ./wasm — the same todo.Service this process serves,
-// compiled for js/wasm — and the page starts it in a Worker, on a
-// MessageChannel. So a reload restarts the server, and with -rebuild it
-// recompiles it first: the UI loop is a browser reload, against real handlers,
-// real gRPC statuses and a real server stream. The same handlers also answer
-// at /rpc over a WebSocket, and the page switches to that with ?server=ws
-// without a line of its UI code changing — which is the argument the example
-// makes: the server in the browser is not a mock of the server, it is the
-// server.
+// GET /app.wasm builds ./wasm — todo.Service, compiled for js/wasm — and the
+// page starts it in a Worker, on a MessageChannel. So a reload restarts the
+// server, and with -rebuild it recompiles it first: the UI loop is a browser
+// reload, against real handlers, real gRPC statuses and a real server stream.
+//
+// This process serves files; it does not serve the service. That the server in
+// the page is a real one is a source-level fact rather than something to
+// demonstrate here — todo/ is ordinary gRPC handler code implementing
+// todopb.TodoServiceServer — and serving handlers like it from a process, over
+// a socket, is examples/websocket-echo.
 //
 //	cd ts && pnpm install && pnpm build   # build the TS port once
 //	cd examples/browser-wasm && go run .  # then open http://127.0.0.1:8080
@@ -32,17 +33,10 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/gorilla/websocket"
-	drpc "github.com/lesomnus/grpc-dgram"
-	_ "github.com/lesomnus/grpc-dgram/examples/browser-wasm/jsoncodec" // the "json" codec the page names on OPEN (§12)
-	"github.com/lesomnus/grpc-dgram/examples/browser-wasm/todo"
-	"github.com/lesomnus/grpc-dgram/examples/browser-wasm/todopb"
-	"github.com/lesomnus/grpc-dgram/transport/gorilla"
 )
 
 var (
-	addr    = flag.String("addr", "127.0.0.1:8080", "address for the HTTP server (the page, /app.wasm and the WebSocket endpoint)")
+	addr    = flag.String("addr", "127.0.0.1:8080", "address for the HTTP server (the page and /app.wasm)")
 	rebuild = flag.Bool("rebuild", true, "rebuild ./wasm on every GET /app.wasm; with -rebuild=false the prebuilt web/app.wasm is served instead")
 )
 
@@ -84,40 +78,7 @@ func run(ctx context.Context) error {
 	}
 	defer cleanup()
 
-	// One Gateway serves every WebSocket, one drpc peer each. It advertises
-	// Reliable() == true, so NewServer turns the timer machinery off and
-	// requires the exact sequence on the wire (PROTOCOL.md §10.6) — the same
-	// mode the wasm server runs in behind jsport.
-	gw := gorilla.NewGateway()
-	srv := drpc.NewServer(gw)
-	todopb.RegisterTodoServiceServer(srv, todo.NewService(
-		todo.NewMemStore(
-			"Reload the page — the wasm server restarts with it",
-			"This task lives in the server process, not the tab",
-		),
-		fmt.Sprintf("%s (pid %d)", *addr, os.Getpid()),
-	))
-	defer srv.Stop()
-
-	up := websocket.Upgrader{}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/rpc", func(w http.ResponseWriter, r *http.Request) {
-		c, err := up.Upgrade(w, r, nil)
-		if err != nil {
-			return // Upgrade already wrote the error response
-		}
-		log.Printf("websocket peer %s connected", c.RemoteAddr())
-		go func() {
-			// ServePeer blocks until the socket dies — hence the goroutine —
-			// and on every exit performs the §4.5 teardown, srv.DisconnectPeer,
-			// which fails that peer's live calls. With protocol timers off,
-			// nothing else would. The context has to outlive this handler:
-			// r.Context() is cancelled the moment it returns, which would tear
-			// the fresh peer down at once.
-			err := gw.ServePeer(ctx, srv, c)
-			log.Printf("websocket peer gone: %v", err)
-		}()
-	})
 	// The server compiled for the page. This is the point of the example:
 	// every reload fetches a freshly built binary and starts a fresh instance.
 	mux.HandleFunc("GET /app.wasm", app)
@@ -140,7 +101,7 @@ func run(ctx context.Context) error {
 		_ = hs.Shutdown(sctx)
 	}()
 
-	log.Printf("serving todo.TodoService in the browser and at ws://%s/rpc — open http://%s", *addr, *addr)
+	log.Printf("building todo.TodoService for the browser to run — open http://%s", *addr)
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

@@ -379,10 +379,9 @@ cd examples/browser-wasm   && go run .     # same prerequisite
   off, every response in order, `GracefulStop` draining a live stream.
 - [`browser-webrtc`](../examples/browser-webrtc) — a browser page on the
   TypeScript port calling a Go service over a WebRTC data channel.
-- [`browser-wasm`](../examples/browser-wasm) — the same service compiled to
-  `js/wasm` and served *to the page it answers*, so reloading the browser
-  restarts (and rebuilds) the server; the identical UI code talks to the
-  process over WebSocket with a query parameter.
+- [`browser-wasm`](../examples/browser-wasm) — an ordinary gRPC service
+  compiled to `js/wasm` and served *to the page it answers*, so reloading the
+  browser restarts (and rebuilds) the server.
 
 ## Where to go next
 

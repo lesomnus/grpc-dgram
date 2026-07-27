@@ -8,10 +8,10 @@ const sock = await open('/app.wasm')      // a Go drpc.Server, in a Worker
 const conn = sock.dial(connOptions)       // ready to call
 ```
 
-`GET /app.wasm` compiles `./wasm` — the same `todo.TodoService` this process
-serves — and [`open()`](../../ts/src/wasm) starts it in the Worker the package
-ships, so a browser reload restarts the whole server and, with `-rebuild`,
-recompiles it first (about half a second). The Go side is
+`GET /app.wasm` compiles `./wasm` — a `todo.TodoService` server — and
+[`open()`](../../ts/src/wasm) starts it in the Worker the package ships, so a
+browser reload restarts the whole server and, with `-rebuild`, recompiles it
+first (about half a second). The Go side is
 [`transport/jsport`](../../transport/jsport), and it is the same length:
 
 ```go
@@ -21,10 +21,13 @@ todopb.RegisterTodoServiceServer(srv, impl)
 log.Fatal(gw.Serve(context.Background(), srv))
 ```
 
-The wire between them is dRPC v1.1 — the same bytes the WebSocket endpoint at
-`/rpc` carries. That endpoint is the second half of the argument: `?server=ws`
-points the page at the server *process* instead, and not a line of the UI code
-changes. The wasm server is not a mock of the server; it is the server.
+The wire between them is dRPC v1.1 — the same bytes a WebSocket carries, one
+marshaled `Envelop` per posted message (§4.1). And the server is not a mock of
+the server: `todo/` implements `todopb.TodoServiceServer` with generated stubs,
+request validation, real statuses and a server-streaming method, and nothing in
+it is browser-specific — `GOOS=js GOARCH=wasm` is the entire difference between
+this and a process. Serving handlers like these from a process, over a socket,
+is [`websocket-echo`](../websocket-echo); this example does not repeat it.
 
 ## Run it
 
@@ -32,7 +35,7 @@ changes. The wasm server is not a mock of the server; it is the server.
 # 1. build the TypeScript port (the page imports its dist/ output)
 cd ts && pnpm install && pnpm build
 
-# 2. serve the page, build the wasm server on demand, and answer /rpc
+# 2. serve the page, and build the wasm server on demand
 cd ../examples/browser-wasm && go run .
 
 # 3. open http://127.0.0.1:8080
@@ -41,32 +44,17 @@ cd ../examples/browser-wasm && go run .
 Add a task, tick it, remove it: every mutation comes back over the `Watch`
 server stream, which is what the list renders from. Add with an empty title for
 `INVALID_ARGUMENT`, press **Toggle #999** for `NOT_FOUND` — real statuses from a
-real handler. The line under the heading names whoever answered `List` and how
-the page reached it: `served by the js/wasm build — in a Worker (wasm)`, or the
-process and its pid over the WebSocket. The server names itself; where it runs
-is the page's half of the sentence, because that is the half that decided it.
+real handler. The line under the heading reads `served by the js/wasm build —
+in a Worker, reliable mode`. Its first half is the server's own answer to
+`List` (`served_by` in `proto/todo.proto`): which *build* answered, observed
+rather than assumed, and the page renders what it was told. The second half is
+the page's, because where that build runs is the page's own doing.
 
 Then reload the page: the seeded list is back, because that is a new server.
-Follow **Talk to the server process instead** and the same UI runs against
-`ws://127.0.0.1:8080/rpc`, where the state survives the reload and is shared
-between tabs.
 
 `pnpm build` is required because `@lesomnus/grpc-dgram` is not published: the
 page imports the build output, mounted by this server at `/ts/dist/` and named
 by the import map in `web/index.html`.
-
-## The two modes
-
-| | the wasm server (default) | the server process (`?server=ws`) |
-|---|---|---|
-| where it runs | a Worker this page started | this `go run .`, reached over `ws://…/rpc` |
-| how the page gets a `Conn` | `open('/app.wasm')`, then `sock.dial()` | `dialWebSocket(url)` |
-| lifetime | one page load | until you stop it; shared between tabs |
-| the Go side | `jsport.NewGateway()` + `Serve` | `gorilla.NewGateway()` + `ServePeer` |
-
-Both adapters report `reliable`, so both cores run with every protocol timer
-off (§10.6) and the page never sees a datagram caveat. `connect()` in
-`web/main.js` is the only place that knows which is which.
 
 ## What it demonstrates
 
@@ -94,12 +82,6 @@ off (§10.6) and the page never sees a datagram caveat. `connect()` in
   with the MIME-type complaint streaming instantiation would produce — so a
   handler that stopped compiling shows up in the browser rather than as
   silence.
-- **One wire, two channels, one UI.** `connect()` is the only place in
-  `web/main.js` that decides anything: it returns a `Conn` from `sock.dial()`
-  or one over `dialWebSocket`, and everything after it — descriptors, calls,
-  the `Watch` loop, the error rendering — is written once. The only other
-  mentions of `?server=ws` are the link that toggles it and the status line
-  that names who answered.
 - **The teardown wiring, and why it is mandatory.** A message port has no death
   to detect: with timers off, the *only* thing that can fail a live call is the
   adapter's §4.5 teardown. The page cannot perform it — from where it stands
@@ -110,16 +92,16 @@ off (§10.6) and the page never sees a datagram caveat. `connect()` in
   fails the calls in flight instead of hanging the UI forever. Nothing in
   `web/main.js` has to remember this; anything on the manual path below does.
 - **What does not follow a server into the browser.** Sockets, files,
-  databases. `todo.Store` is that seam, and it is the only thing the two builds
-  could differ in: the handlers, their validation, their statuses and their
-  streaming are the real code either way. In a real project this is where you
-  pay — IndexedDB, a stub, or a fixture — and the bill stops there.
+  databases. `todo.Store` is that seam, and it is the only thing an in-page
+  build could differ in: the handlers, their validation, their statuses and
+  their streaming are the real code either way. In a real project this is where
+  you pay — IndexedDB, a stub, or a fixture — and the bill stops there.
 - **A page with no build step.** `web/main.js` is plain ES modules with
   `// @ts-check` and JSDoc types — no bundler, no framework. It has no protobuf
-  runtime, so it names the `"json"` codec on its OPEN frame (§12) and both
-  servers marshal with `protojson` (`jsoncodec/`), keeping their generated
-  stubs. Note what that costs the page: protojson omits zero values, so every
-  field arrives optional.
+  runtime, so it names the `"json"` codec on its OPEN frame (§12) and the
+  server marshals with `protojson` (`jsoncodec/`), keeping its generated stubs.
+  Note what that costs the page: protojson omits zero values, so every field
+  arrives optional.
 
 ## Three things those two lines settle
 
@@ -171,8 +153,8 @@ with go1.26.4:
 On localhost that is a non-issue — it is the 0.09 s at the end of the numbers
 above. Shipping it to users is a real decision, and one this example does not
 pretend to make for you: strip it, serve it compressed, cache it across
-reloads, or keep the wasm server for development and deploy only the WebSocket
-path. Nothing in the page changes either way.
+reloads, or conclude that this service belongs on a machine after all. Only
+`connect()` would change — everything past it is written against a `Conn`.
 
 ## Type-checking the page
 
@@ -190,13 +172,13 @@ package name at `ts/dist`.
 
 | | |
 |---|---|
-| `main.go` | the dev server: the page, `/ts/dist/`, `/wasm_exec.js`, `/app.wasm` built on demand, and the `/rpc` WebSocket |
+| `main.go` | the dev server: the page, `/ts/dist/`, `/wasm_exec.js`, and `/app.wasm` built on demand. It serves files; it does not serve the service |
 | `wasm/main.go` | the same service compiled for the browser: a `jsport.Gateway`, and `Serve` for the whole of its JS surface |
 | `todo/service.go` | the `TodoService` handlers — ordinary gRPC code |
 | `todo/store.go` | the `Store` seam and its in-memory implementation |
-| `jsoncodec/jsoncodec.go` | the `"json"` wire codec, imported by both mains, so the page needs no protobuf runtime |
+| `jsoncodec/jsoncodec.go` | the `"json"` wire codec, so the page needs no protobuf runtime |
 | `web/index.html` | the page, the import map, and the styling |
-| `web/main.js` | the browser client: descriptors, the two `connect()` paths, the UI |
+| `web/main.js` | the browser client: `connect()`, the descriptors, the calls, the `Watch` loop, the UI |
 | `proto/todo.proto`, `todopb/` | the service and its checked-in bindings |
 
 The JS surface of the wasm build is one global, published by `Gateway.Serve`
@@ -218,7 +200,7 @@ buf generate examples/browser-wasm/proto --template examples/browser-wasm/buf.ge
 
 | Flag | Default | |
 |---|---|---|
-| `-addr` | `127.0.0.1:8080` | HTTP address for the page, `/app.wasm` and the WebSocket endpoint |
+| `-addr` | `127.0.0.1:8080` | HTTP address for the page and `/app.wasm` |
 | `-rebuild` | `true` | rebuild `./wasm` on every `GET /app.wasm`. With `-rebuild=false` the prebuilt `web/app.wasm` is served instead — build it with `GOOS=js GOARCH=wasm go build -o web/app.wasm ./wasm` |
 
 ## Notes
@@ -227,8 +209,7 @@ buf generate examples/browser-wasm/proto --template examples/browser-wasm/buf.ge
   cached `ts/dist` would quietly break the one claim the example makes.
 - A server in the browser is a server with no trust boundary in front of it:
   the port is exactly as trustworthy as the code holding its other end, and the
-  page holds both (`PROTOCOL.md` §15). The `/rpc` endpoint is plain `ws://` on
-  loopback for the same reason the other examples are — deploy `wss://`.
+  page holds both (`PROTOCOL.md` §15).
 - Serving the port's `dist/` over HTTP is what an unpublished package costs.
   Once it is published the import map disappears and the page imports
   `@lesomnus/grpc-dgram` from a CDN or a bundle like any other dependency. The

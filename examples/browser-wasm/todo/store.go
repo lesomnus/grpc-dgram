@@ -1,7 +1,8 @@
 // Package todo is the service this example builds a UI against: an ordinary
 // gRPC implementation of todopb.TodoService and the in-memory store behind it.
-// Nothing here knows whether it was compiled for a server process or for the
-// page (GOOS=js GOARCH=wasm) — that is the whole claim the example makes.
+// Nothing here is browser-specific — it is the code a server process would
+// run, and GOOS=js GOARCH=wasm is the only difference. That is the whole claim
+// the example makes.
 package todo
 
 import (

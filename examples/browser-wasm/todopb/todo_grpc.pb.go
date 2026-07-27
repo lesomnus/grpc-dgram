@@ -31,9 +31,9 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // TodoService is an ordinary gRPC service — the kind a project's UI is built
-// against. It is served twice from the same handlers: over a WebSocket by a
-// real server process, and inside the browser page by the same code compiled
-// to js/wasm, where a reload restarts it.
+// against, and nothing in its implementation is browser-specific. That is what
+// lets it be compiled to js/wasm and served inside the page it answers, where
+// a reload restarts it.
 type TodoServiceClient interface {
 	List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
 	Add(ctx context.Context, in *AddRequest, opts ...grpc.CallOption) (*Task, error)
@@ -118,9 +118,9 @@ type TodoService_WatchClient = grpc.ServerStreamingClient[Event]
 // for forward compatibility.
 //
 // TodoService is an ordinary gRPC service — the kind a project's UI is built
-// against. It is served twice from the same handlers: over a WebSocket by a
-// real server process, and inside the browser page by the same code compiled
-// to js/wasm, where a reload restarts it.
+// against, and nothing in its implementation is browser-specific. That is what
+// lets it be compiled to js/wasm and served inside the page it answers, where
+// a reload restarts it.
 type TodoServiceServer interface {
 	List(context.Context, *ListRequest) (*ListResponse, error)
 	Add(context.Context, *AddRequest) (*Task, error)

@@ -19,7 +19,6 @@
       {
         "imports": {
           "@lesomnus/grpc-dgram": "/ts/dist/index.mjs",
-          "@lesomnus/grpc-dgram/transport/websocket": "/ts/dist/transport/websocket.mjs",
           "@lesomnus/grpc-dgram/wasm": "/ts/dist/wasm.mjs"
         }
       }
@@ -62,10 +61,9 @@
   <body>
     <h1>a Go gRPC server running in the browser</h1>
     <p class="sub">
-      The same <code>todo.TodoService</code> handlers, reachable two ways: a Go
-      <code>drpc.Server</code> compiled to wasm, which this page starts in a
-      Worker — so a reload restarts it — or the server process, over a
-      WebSocket. The UI code below does not know which.
+      A Go <code>drpc.Server</code> compiled to wasm, serving
+      <code>todo.TodoService</code> — the same handler code a server process
+      would run. This page starts it in a Worker, so a reload restarts it.
     </p>
 
     <div id="state">starting the server in a Worker…</div>
@@ -83,7 +81,6 @@
       Add with an empty title for <code>INVALID_ARGUMENT</code>;
       <button id="missing" type="button" disabled>Toggle #999</button>
       for <code>NOT_FOUND</code> — real gRPC statuses from a real handler.
-      <a id="switch" href="?server=ws"></a>
     </p>
 
     <pre id="log"></pre>

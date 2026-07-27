@@ -5,9 +5,9 @@ package todo;
 option go_package = "github.com/lesomnus/grpc-dgram/examples/browser-wasm/todopb";
 
 // TodoService is an ordinary gRPC service — the kind a project's UI is built
-// against. It is served twice from the same handlers: over a WebSocket by a
-// real server process, and inside the browser page by the same code compiled
-// to js/wasm, where a reload restarts it.
+// against, and nothing in its implementation is browser-specific. That is what
+// lets it be compiled to js/wasm and served inside the page it answers, where
+// a reload restarts it.
 service TodoService {
   rpc List(ListRequest) returns (ListResponse) {}
   rpc Add(AddRequest) returns (Task) {}
@@ -31,8 +31,9 @@ message ListRequest {}
 
 message ListResponse {
   repeated Task tasks = 1;
-  // Which server answered: "the js/wasm build" or the process's address. The
-  // page shows it, so switching transports is visible rather than assumed.
+  // The server's own name for itself — "the js/wasm build". It says which
+  // build answered, not how the caller reached it, and the page renders what
+  // it was told rather than what it assumes about the server it started.
   string served_by = 2;
 }
 
