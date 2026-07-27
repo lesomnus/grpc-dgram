@@ -43,7 +43,7 @@ conn.close() // says goodbye, closes the port, fails every live call
 Construct it promptly after the port exists: a `MessagePort` queues what
 arrives until someone starts it, but a `Worker` — or a worker's own `self` —
 drops every message posted before a listener is registered, which is why
-`connectWorker` below transfers a port instead of wrapping the worker.
+`dialWorker` below transfers a port instead of wrapping the worker.
 
 When the host knows *why* the endpoint died — the classic case being a wasm
 instance that exited or panicked — say so, and every hanging call reports it:
@@ -57,18 +57,25 @@ void go.run(inst.instance).finally(() => transport.close('the wasm instance exit
 For a wasm instance, [`open()`](../../wasm) does that wiring — and the rest of
 the handshake around it — for you.
 
-## A worker — `connectWorker`
+## A worker — `dialWorker`
 
-One connection to a worker: a fresh `MessageChannel`, one end transferred, a
-`PortTransport` over the other.
+One connection to a worker that is already running: a fresh `MessageChannel`,
+one end transferred, a **`Conn`** over the other. `dial`, because the peer
+exists — what starts one is [`open()`](../../wasm), below.
 
 ```ts
-import { Conn } from '@lesomnus/grpc-dgram'
-import { connectWorker } from '@lesomnus/grpc-dgram/transport/port'
+import { dialWorker } from '@lesomnus/grpc-dgram/transport/port'
 
 const worker = new Worker('./server.js', { type: 'module' })
-const conn = new Conn(connectWorker(worker))     // call again for another peer
+const conn = dialWorker(worker)                  // call again for another peer
 ```
+
+Its options are one bag with no key in common between the halves:
+`maxMessageSize`, `transfer` and `message` are the adapter's, everything
+`ConnOptions` declares is the core's. When you need the transport itself, or
+the port reaches the peer by some other road, build the pair explicitly — a
+`MessageChannel`, `new PortTransport(ch.port1, opts)`, the transfer, `new
+Conn(tx, opts)` — which is exactly what this one line does.
 
 Why a transferred port rather than `new PortTransport(worker)`: a `MessagePort`
 **queues** everything posted into it until the far side binds it, so a call

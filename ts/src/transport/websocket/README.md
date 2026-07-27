@@ -11,26 +11,42 @@ browser, Deno, Node ≥22, and node's `ws` package all fit (`WebSocketLike` is
 structural, so test mocks do too). The adapter sets `binaryType =
 'arraybuffer'` itself.
 
-## Client — `WebSocketTransport` / `dialWebSocket`
-
-The `Conn` attaches the transport (`ConnAttacher`): the receive pump and the
-keepalive start by themselves — nothing to manage — and the transport owns the
-socket from then on. Sends are gated on the handshake, so calls made
-immediately just queue.
+## Client — `dialWebSocket` / `WebSocketTransport`
 
 ```ts
-import { Conn } from '@lesomnus/grpc-dgram'
 import { dialWebSocket } from '@lesomnus/grpc-dgram/transport/websocket'
 
-const conn = new Conn(dialWebSocket('wss://host/rpc')) // reliable mode auto-detected
+const conn = dialWebSocket('wss://host/rpc') // reliable mode auto-detected
 await conn.invoke(Once, req)
 
 conn.close() // one call closes the Conn, the transport, and the socket
 ```
 
-Wrap a socket you built yourself with `new WebSocketTransport(ws)` — do it on
-the same tick as `new WebSocket(url)`, since the stack drops messages that
-arrive before a listener is registered.
+`dialWebSocket` opens a socket with the runtime's global `WebSocket` and hands
+back a **`Conn`** — the endpoint you make calls on, the way `net.Dial` hands
+back a `net.Conn`. It is synchronous and returns *before* the handshake: sends
+are gated on open, so a call made on this very tick queues rather than fails.
+The `Conn` attaches the transport (`ConnAttacher`), so the receive pump and the
+keepalive start by themselves — nothing to manage — and the transport owns the
+socket from then on.
+
+Options are one bag with no key in common between the halves: `protocols` goes
+to the socket, `maxMessageSize`/`maxBufferedAmount`/`sendStallTimeoutMs`/the
+keepalive knobs to the adapter, everything `ConnOptions` declares to the core.
+
+Bring your own socket — node's `ws` package, a runtime with no global
+`WebSocket`, constructor options this does not expose, or a test that needs the
+transport itself — with the explicit pair:
+
+```ts
+import { Conn } from '@lesomnus/grpc-dgram'
+import { WebSocketTransport } from '@lesomnus/grpc-dgram/transport/websocket'
+
+const conn = new Conn(new WebSocketTransport(ws, wsOpts), connOpts)
+```
+
+Do that on the same tick as `new WebSocket(url)`, since the stack drops
+messages that arrive before a listener is registered.
 
 ## Server — `WebSocketGateway`
 

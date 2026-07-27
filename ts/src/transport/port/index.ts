@@ -52,7 +52,7 @@
 // No npm dependency, no node builtin, browser-safe: PortLike is structural,
 // so a browser MessagePort, a node one, a Worker and a test mock all fit.
 
-import type { Conn } from '../../conn'
+import { Conn, type ConnOptions } from '../../conn'
 import type { Server } from '../../server'
 import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '../../seam'
 import { unpack } from '../../seam'
@@ -426,26 +426,30 @@ export class PortTransport implements FrameHandler, TransportInfo, ConnAttacher 
 // ---------------------------------------------------------------------------
 
 // WorkerLike is a Worker seen from the thread that made it, reduced to the one
-// thing connectWorker needs: a postMessage that takes a transfer list. It is
+// thing dialWorker needs: a postMessage that takes a transfer list. It is
 // separate from PortLike because what crosses here is not a frame — it is the
 // port itself, with a plain object beside it.
 export interface WorkerLike {
   postMessage(message: unknown, transfer?: unknown[]): void
 }
 
-export interface WorkerConnectOptions extends PortOptions {
+export interface WorkerDialOptions extends PortOptions {
   // The message posted alongside the port. The default is `{ drpc: 'serve' }`,
   // which is what the worker this package ships answers (src/wasm/protocol.ts)
-  // — so connectWorker and that worker are a working pair with nothing
+  // — so dialWorker and that worker are a working pair with nothing
   // configured. A worker of your own can ignore the message entirely: a
   // transferred port always arrives as `ev.ports[0]`, whatever came with it.
   message?: unknown
 }
 
-// connectWorker opens one connection to a worker: a fresh MessageChannel, one
-// end transferred to the worker, a PortTransport over the other.
+// dialWorker opens one connection to a worker that is already running — a
+// fresh MessageChannel, one end transferred to it, a Conn over the other:
 //
-//   const conn = new Conn(connectWorker(worker))
+//   const conn = dialWorker(worker)
+//
+// dial is the verb for reaching a peer that exists; what starts one is `open`
+// (../../wasm, for a Go instance), and what it hands back is the endpoint you
+// make calls on, not the plumbing underneath.
 //
 // A transferred port is the safe way in, and the reason this is a function
 // rather than `new PortTransport(worker)`: a MessagePort queues everything
@@ -457,21 +461,31 @@ export interface WorkerConnectOptions extends PortOptions {
 // each with its own epoch, sid space and windows, where the worker object
 // itself is one channel shared by everything on it.
 //
-// The worker is never terminated here, not even when the transport dies:
+// The options are one bag with two halves and no key in common: the adapter
+// reads PortOptions plus the `message`, the Conn reads everything ConnOptions
+// declares. Build the pair yourself — a MessageChannel, `new
+// PortTransport(ch.port1, opts)`, the transfer, `new Conn(tx, opts)` — when
+// you need the transport object itself, or when the port reaches the peer by
+// some other road (an iframe, an end you were handed).
+//
+// The worker is never terminated here, not even when the connection dies:
 // terminate() aborts it at once, discarding whatever is still queued for it,
 // and killing a worker is the host's decision, taken after its endpoints have
 // torn down. Nothing else here owns it either — the far end's §4.5 duty is the
 // worker's own (the goodbye it posts when its instance dies), and this end's
-// belongs to the returned transport.
-export function connectWorker(worker: WorkerLike, opts: WorkerConnectOptions = {}): PortTransport {
+// belongs to the returned Conn, whose close() takes the transport and the port
+// with it.
+export function dialWorker(worker: WorkerLike, opts: ConnOptions & WorkerDialOptions = {}): Conn {
   const ch = new MessageChannel()
   let tx: PortTransport | undefined
   try {
-    // The transport is constructed BEFORE the far end is handed over, so
-    // nothing the worker posts on its first tick arrives unlistened.
+    // Both are constructed BEFORE the far end is handed over, so nothing the
+    // worker posts on its first tick arrives unlistened — and so a failure
+    // here is one nothing has been transferred into yet.
     tx = new PortTransport(ch.port1, opts)
+    const conn = new Conn(tx, opts)
     worker.postMessage(opts.message ?? { drpc: 'serve' }, [ch.port2])
-    return tx
+    return conn
   } catch (e) {
     // Nothing is left half-attached: the transport takes its listeners off its
     // end, and both ends are closed — a live MessagePort keeps the event loop

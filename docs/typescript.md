@@ -27,6 +27,7 @@ ts/src/
   conn.ts     Conn + ClientStream          server.ts  Server + streams
   seq.ts      tx seq + rx window           flow (in util.ts) credit windows
   transport/  webrtc · websocket · port · node-udp · protobuf-es · connect
+  wasm/       open() — a Go server compiled to js/wasm, started in a worker
 ```
 
 ## How interoperability is kept honest
@@ -84,16 +85,34 @@ conn.close()  // one close tears down conn, transport and channel
 Node, over UDP, against a Go server:
 
 ```ts
-import { Conn } from '@lesomnus/grpc-dgram'
 import { dialUdp } from '@lesomnus/grpc-dgram/transport/node-udp'
 
-const conn = new Conn(await dialUdp(7777, '127.0.0.1'))
+const conn = await dialUdp(7777, '127.0.0.1')
 ```
 
+The browser, with no server anywhere — the Go service compiled to `js/wasm`
+and started by the page ([`examples/browser-wasm`](../examples/browser-wasm)):
+
+```ts
+import { open } from '@lesomnus/grpc-dgram/wasm'
+
+const sock = await open('/app.wasm')  // a worker, an instance, a readiness handshake
+const conn = sock.dial()              // and again for a second, independent peer
+```
+
+Three ways in, and the verb says which: `new XTransport(ch)` wraps a channel you
+already hold, `dial…(target)` makes the channel and hands back a `Conn` the way
+`net.Dial` hands back a `net.Conn`, and `open(app)` brings the peer into
+existence first because a `.wasm` file is not something you can reach yet.
+[Transports](./transports.md#the-four-ways-in) has the fourth — the serving
+side — and the reasoning.
+
 A server is the same shape in reverse — `new Server(gateway)`,
-`server.register(desc, handler)` per method, then `gateway.servePeer(...)`
-after registration, for the reason §13 gives: the registry freezes when serving
-starts.
+`server.register(desc, handler)` per method, then serving, always *after*
+registration, for the reason §13 gives: the registry freezes when serving
+starts. Which serving call depends on what the gateway owns: `serve(server)`
+where it holds the whole endpoint (the UDP socket), `bind` + `servePeer` where
+channels arrive one at a time (a WebSocket, a DataChannel, a port).
 
 Method descriptors come from generated code if you have it
 (`fromService(EchoService)` in the protobuf-es binding derives path, streaming

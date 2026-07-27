@@ -16,7 +16,7 @@
 // protocol rides out.
 
 import { createSocket, type RemoteInfo, type Socket } from 'node:dgram'
-import type { Conn } from '../../conn'
+import { Conn, type ConnOptions } from '../../conn'
 import { MessageTooLargeError } from '../../status'
 import type { Server } from '../../server'
 import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '../../seam'
@@ -195,22 +195,45 @@ export class UdpGateway implements FrameHandler {
   }
 }
 
-// dialUdp opens a connected client socket to host:port and returns a
-// UdpTransport for it — the convenience path (Go's net.Dial("udp", addr) +
-// udp.New). The socket connects so it only receives from that server.
-export function dialUdp(port: number, host = '127.0.0.1', opts?: { maxMessageSize?: number }): Promise<UdpTransport> {
+// dialUdp opens a connected client socket to host:port and hands back a Conn
+// over it, ready to call:
+//
+//   const conn = await dialUdp(7777, '127.0.0.1')
+//
+// dial is the verb for reaching a peer that already exists, and what it hands
+// back is the endpoint you make calls on — the same bargain as Go's
+// net.Dial("udp", addr), which returns a net.Conn and not a socket to assemble
+// something from. The socket is connected, so it only ever receives from that
+// server (PROTOCOL.md §6.4).
+//
+// The options are one bag with two halves and no key in common: the adapter
+// reads maxMessageSize, the Conn reads everything ConnOptions declares —
+// timing, rxBuffer, limits, compressors, the call defaults.
+//
+// Build the pair yourself when you brought the socket, or when you need the
+// transport object itself (a test tapping what goes on the wire):
+//
+//   const conn = new Conn(new UdpTransport(socket, { maxMessageSize }), opts)
+export function dialUdp(port: number, host = '127.0.0.1', opts: ConnOptions & { maxMessageSize?: number } = {}): Promise<Conn> {
   const socket = createSocket('udp4')
   return new Promise((resolve, reject) => {
     socket.once('error', reject)
     socket.connect(port, host, () => {
       socket.off('error', reject)
-      resolve(new UdpTransport(socket, opts))
+      resolve(new Conn(new UdpTransport(socket, opts), opts))
     })
   })
 }
 
 // listenUdp binds a server socket on host:port (0 = ephemeral) and returns a
 // UdpGateway plus the bound port.
+//
+// It is a listen and not a dial because a server endpoint reaches nobody: it
+// waits, and the one socket it waits on serves every peer that writes to it,
+// each keyed by its source address (§6.4) — so there is no single connection
+// to hand back, only the gateway that multiplexes them. Nor can it start
+// serving here: the registry freezes when serving starts (§13), so `serve`
+// stays a separate call made after `server.register`.
 export function listenUdp(port = 0, host = '127.0.0.1', opts?: { maxMessageSize?: number }): Promise<{ gateway: UdpGateway; port: number }> {
   const socket = createSocket('udp4')
   return new Promise((resolve, reject) => {

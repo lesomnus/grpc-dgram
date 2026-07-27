@@ -18,10 +18,10 @@ one. The normative contract is [PROTOCOL.md](./PROTOCOL.md) §3–§4.
 | [`transport/gorilla`](../transport/gorilla) | WebSocket | reliable | `gorilla.New(wsc)` | `gorilla.NewGateway()` + `ServePeer` |
 | [`transport/pion`](../transport/pion) | WebRTC DataChannel | derived per channel | `pion.New(dc)` | `pion.NewGateway()` + `Bind` + `ServePeer` |
 | [`transport/jsport`](../transport/jsport) | JS message port (`js/wasm`) | reliable | `jsport.New(port)` | `jsport.NewGateway()` + `Serve` |
-| [`ts/…/node-udp`](../ts/src/transport/node-udp) | UDP (Node) | unreliable | `new UdpTransport(...)`, `dialUdp` | `new UdpGateway(...)`, `listenUdp` |
-| [`ts/…/websocket`](../ts/src/transport/websocket) | WebSocket | reliable | `new WebSocketTransport(ws)`, `dialWebSocket` | `new WebSocketGateway()` |
-| [`ts/…/webrtc`](../ts/src/transport/webrtc) | WebRTC DataChannel | derived per channel | `new DataChannelTransport(dc)` | `new DataChannelGateway()` |
-| [`ts/…/port`](../ts/src/transport/port) | JS message port | reliable | `new PortTransport(port)`, `connectWorker` | `new PortGateway()` + `bind` + `servePeer` |
+| [`ts/…/node-udp`](../ts/src/transport/node-udp) | UDP (Node) | unreliable | `new UdpTransport(...)`, `dialUdp` → `Conn` | `listenUdp` → `UdpGateway` + `serve` |
+| [`ts/…/websocket`](../ts/src/transport/websocket) | WebSocket | reliable | `new WebSocketTransport(ws)`, `dialWebSocket` → `Conn` | `new WebSocketGateway()` + `bind` + `servePeer` |
+| [`ts/…/webrtc`](../ts/src/transport/webrtc) | WebRTC DataChannel | derived per channel | `new DataChannelTransport(dc)` | `new DataChannelGateway()` + `bind` + `servePeer` |
+| [`ts/…/port`](../ts/src/transport/port) | JS message port | reliable | `new PortTransport(port)`, `dialWorker` → `Conn` | `new PortGateway()` + `bind` + `servePeer` |
 
 Two things under `ts/src/transport/` are **not** transports, despite living
 there: [`protobuf-es`](../ts/src/transport/protobuf-es) derives method
@@ -44,15 +44,58 @@ serves every port handed to it; [`open('/app.wasm')`](../ts/src/wasm) on the
 page starts the instance in the worker that entry ships, waits for that publish
 and hands back a sock, and `sock.dial()` is one connection over a channel it
 makes itself. One instance serves as many as it is given ports, each its own
-peer (§6.4), so a second `dial()` is the next one. Any other shape — a `Worker`
-of your own (`connectWorker`), an iframe, two TS endpoints — is the manual path
-below, unchanged.
+peer (§6.4), so a second `dial()` is the next one. A `Worker` already running a server of its own
+needs no `open` — there is nothing to bring into existence — so it is
+`dialWorker(worker)`; an iframe or a second TS endpoint, where you hold the
+port yourself, is the manual path below, unchanged.
 
 `transport/udp` and `transport/jsport` are part of the core Go module (stdlib
 only — `jsport` needs nothing but `syscall/js`, and being `//go:build js &&
 wasm` it is silently skipped by `go build ./...` on every other GOOS).
 `gorilla` and `pion` are separate modules, so importing the core never pulls
 their dependencies.
+
+## The four ways in
+
+Every entry point above is one of four cases, and the verb in its name says
+which:
+
+| what you have | the way in | what you get |
+|---|---|---|
+| **the channel already** — a `net.Conn`, a `*websocket.Conn`, an `RTCDataChannel`, a `MessagePort` | wrap it: `new XTransport(ch)` in TS, `xxx.New(ch)` in Go | a transport, which you hand to `new Conn(tx, opts)` / `drpc.NewConn(tx, …)` |
+| **a target, and want the library to make the channel** | `dial…(target, opts?)` — `dialUdp`, `dialWebSocket`, `dialWorker` | a **`Conn`**, ready to call |
+| **a program, and no peer yet** | `open(app)` → a `Sock`, then `sock.dial(opts?)` | a **`Conn`** per `dial` |
+| **the serving side** | a `Gateway` — `listen…` where the library opens the socket, then `Serve` when the gateway owns the whole endpoint, or `Bind` + `ServePeer` per channel handed in from outside | frames delivered to your `Server` |
+
+`dial…` returns a `Conn` for the reason `net.Dial` returns a `net.Conn`: a
+caller who named a target wants the endpoint to make calls on, not the plumbing
+under it. The first row is the explicit path and stays for everything else —
+you brought the socket, you need constructor options the one-liner does not
+expose, or you need the transport object itself (a test tapping what goes on
+the wire). Options are one bag either way: `ConnOptions` and an adapter's own
+options share no key, so `dialWebSocket(url, { keepaliveIntervalMs: 5000,
+defaultCallOptions: {…} })` is unambiguous, and each key is read by whichever
+half owns it.
+
+`open` and `dial` are deliberately different verbs. `open` brings a peer into
+existence — `open('/app.wasm')` fetches a program, instantiates it, and waits
+for it to say it can serve — and hands back a `Sock`, not a `Conn`, because
+there is still nothing connected; `dial` reaches a peer that already exists.
+`Sock` and not `Server` for the mirror reason: this side is the client, and
+what it names is the thing it dials into.
+
+Go has no `dial…` at all, and that is consistent rather than a gap: a Go
+caller always already holds the channel — `net.Dial`, `websocket.Dialer`, a
+`*webrtc.DataChannel`, a `js.Value` port — so the first row is the only one it
+needs.
+
+The three server verbs are three different jobs, not an inconsistency. `Serve`
+is for a gateway that owns the whole endpoint (a UDP socket, the js entry
+point) and serves everything arriving on it. `ServePeer` is for one channel
+handed in from outside — a WebSocket the http server upgraded, a DataChannel,
+a transferred port — one call per channel. `Bind` registers a channel *now* to
+be served in a moment, which is what keeps the messages arriving in between
+from being dropped.
 
 ## How an adapter decides "reliable"
 

@@ -28,6 +28,7 @@
 import { create, fromBinary } from '@bufbuild/protobuf'
 import { createClient } from '@connectrpc/connect'
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { createSocket, type Socket } from 'node:dgram'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -37,7 +38,7 @@ import { unaryMethod } from '../src/desc'
 import { decodeBase64, type Metadata } from '../src/metadata'
 import { Code } from '../src/status'
 import { createDrpcTransport } from '../src/transport/connect'
-import { dialUdp, type UdpTransport } from '../src/transport/node-udp'
+import { UdpTransport } from '../src/transport/node-udp'
 import { fromService } from '../src/transport/protobuf-es'
 import type { Compressor } from '../src/util'
 import { encodeFrame, FlagClose, FlagCompressed, FlagOpen, FlagWindow, shapeOf, type Frame } from '../src/wire'
@@ -140,6 +141,22 @@ async function startGoServer(bin: string): Promise<{ ports: { unreliable: number
   return { ports, proc }
 }
 
+// connectSocket is the socket half of dialUdp, on its own. These tests tap the
+// transport (record, below) to assert what actually goes on the wire, and
+// dialUdp hands back a Conn with the transport tucked underneath it — so the
+// pair is built explicitly here: a connected socket, a UdpTransport over it, a
+// Conn over that, which is exactly what the one-line dialUdp does.
+function connectSocket(port: number, host = '127.0.0.1'): Promise<Socket> {
+  const socket = createSocket('udp4')
+  return new Promise((resolve, reject) => {
+    socket.once('error', reject)
+    socket.connect(port, host, () => {
+      socket.off('error', reject)
+      resolve(socket)
+    })
+  })
+}
+
 // ---------------------------------------------------------------------------
 // wire recorder
 // ---------------------------------------------------------------------------
@@ -213,11 +230,11 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
     const started = await startGoServer(bin)
     proc = started.proc
 
-    const transport = await dialUdp(started.ports.unreliable)
+    const transport = new UdpTransport(await connectSocket(started.ports.unreliable))
     conn = new Conn(transport, { compressors: { 'x-conformance-nope': passthrough } })
     wire = record(transport, conn) // discovers unreliable mode from the transport
 
-    const relTransport = await dialUdp(started.ports.reliable)
+    const relTransport = new UdpTransport(await connectSocket(started.ports.reliable))
     relConn = new Conn(relTransport, { reliable: true })
     relWire = record(relTransport, relConn)
   }, 60_000)

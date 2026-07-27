@@ -31,13 +31,15 @@ server and vice versa.
   twin of the Go `transport/gorilla` adapter: reliable mode, one Envelop per
   message, and the §4.5 teardown duty carried by `onclose`/`onerror` plus a
   keepalive — browser-safe (WhatWG `WebSocket`, `binaryType='arraybuffer'`).
+  `dialWebSocket(url)` is a `Conn` in one line; `new WebSocketTransport(ws)` is
+  the path for a socket you brought yourself.
 - **Message-port adapter** (`@lesomnus/grpc-dgram/transport/port`), the TS twin
   of the Go `transport/jsport` adapter: `PortTransport`/`PortGateway` over
   anything with `postMessage` and a `message` event — a `MessagePort`, a
-  `Worker`, a worker's own `self` — plus `connectWorker(worker)`, which
-  transfers a port to a worker of yours and is one independent peer per call.
-  Always reliable, since a port in one process loses nothing, and since nothing
-  dies that a port can report, teardown is spoken: an empty message is the
+  `Worker`, a worker's own `self` — plus `dialWorker(worker)`, which transfers
+  a port to a worker of yours and hands back a `Conn`, one independent peer per
+  call. Always reliable, since a port in one process loses nothing, and since
+  nothing dies that a port can report, teardown is spoken: an empty message is the
   goodbye, and `close(cause)` carries what only the host knows (a wasm instance
   that exited, a terminated worker).
 - **A Go server in the browser** (`@lesomnus/grpc-dgram/wasm`): `open()` starts
@@ -55,10 +57,11 @@ server and vice versa.
   unreliable telemetry channels on one peer connection serve side by side,
   each peer in its channel's mode).
 - **Node UDP adapter** (`@lesomnus/grpc-dgram/transport/node-udp`, Node only), the TS
-  twin of the Go `transport/udp` adapter — `UdpTransport`/`UdpGateway` with
-  `dialUdp`/`listenUdp` helpers. A TS client over this adapter interoperates
-  with a Go `drpc.Server` on the wire; this is exercised by a cross-language
-  conformance test (`test/conformance.test.ts`) that drives a real Go server.
+  twin of the Go `transport/udp` adapter — `UdpTransport`/`UdpGateway`, with
+  `dialUdp` (a connected socket and a `Conn` over it, in one line) and
+  `listenUdp`. A TS client over this adapter interoperates with a Go
+  `drpc.Server` on the wire; this is exercised by a cross-language conformance
+  test (`test/conformance.test.ts`) that drives a real Go server.
 - **Connect-ES transport** (`@lesomnus/grpc-dgram/transport/connect`, optional peer dep
   on `@connectrpc/connect`): use the standard `createClient(Service, transport)`
   ergonomics while the traffic runs over drpc. `createDrpcTransport(conn)`
@@ -66,6 +69,17 @@ server and vice versa.
   a **real Go `drpc.Server` through a Connect client** end to end.
 
 ## Usage
+
+**Getting a connection.** Four cases, and the verb says which:
+`new Conn(new XTransport(ch), opts)` when you already hold the channel;
+`dialUdp` / `dialWebSocket` / `dialWorker` when the library should make it —
+each hands back a `Conn`, and takes one options bag, since `ConnOptions` and an
+adapter's own options share no key; `open(app)` when there is no peer yet,
+which returns a `Sock` whose `dial()` is the connection; and, on the serving
+side, a `Gateway` — `listenUdp` where the library opens the socket, then
+`serve` when the gateway owns the whole endpoint, or `bind` + `servePeer` per
+channel handed in from outside.
+[Transports](../docs/transports.md#the-four-ways-in) spells out the whole rule.
 
 **With protobuf-es (recommended).** Point the binding at a generated service —
 paths, streaming kinds, and codecs are all derived from the `.proto`, so
@@ -204,7 +218,7 @@ calls sharing the channel.
 
 ## Tests
 
-`pnpm test` — 349 tests mirroring the Go suites: the §5 golden wire vectors
+`pnpm test` — 353 tests mirroring the Go suites: the §5 golden wire vectors
 byte-for-byte (including the v1.1 vectors generated from the Go
 implementation), e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,

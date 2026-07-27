@@ -17,7 +17,7 @@ import { Server } from '../../server'
 import { Code, type StatusError } from '../../status'
 import { echo, registerEcho, tick } from '../../testing'
 import { FlagPing, frame } from '../../wire'
-import { connectWorker, PortGateway, PortTransport, type PortLike, type PortOptions, type WorkerLike } from './index'
+import { dialWorker, PortGateway, PortTransport, type PortLike, type PortOptions, type WorkerLike } from './index'
 
 // Every real port opened by a test, closed in afterEach: a live MessagePort
 // keeps node's event loop alive and the run would never exit.
@@ -517,8 +517,8 @@ describe('malformed messages are ignored, never fatal (§4.2)', () => {
   })
 })
 
-describe('connectWorker: bring your own worker', () => {
-  // A worker seen from the thread that made it, reduced to what connectWorker
+describe('dialWorker: bring your own worker', () => {
+  // A worker seen from the thread that made it, reduced to what dialWorker
   // touches — and, on the far side, the worker's own half: it takes the port
   // off the transfer list (where a transferred port always arrives, whatever
   // message came with it) and serves it off a real Server.
@@ -559,8 +559,8 @@ describe('connectWorker: bring your own worker', () => {
 
   it('connects over a transferred port, and again for a second peer', async () => {
     const worker = new MockWorker()
-    const first = new Conn(connectWorker(worker))
-    const second = new Conn(connectWorker(worker))
+    const first = dialWorker(worker)
+    const second = dialWorker(worker)
     expect(await first.invoke(echo.once, { text: 'a' })).toEqual({ text: 'echo:a' })
     expect(await second.invoke(echo.once, { text: 'b' })).toEqual({ text: 'echo:b' })
     // One port is one peer (§6.4), so these are two independent connections to
@@ -586,7 +586,7 @@ describe('connectWorker: bring your own worker', () => {
     // onmessage, would have lost it.
     const worker = new MockWorker()
     worker.autoServe = false
-    const conn = new Conn(connectWorker(worker))
+    const conn = dialWorker(worker)
     const call = conn.invoke(echo.once, { text: 'early' })
     await tick()
 
@@ -597,7 +597,7 @@ describe('connectWorker: bring your own worker', () => {
 
   it('carries a message of your own, and the port options through', async () => {
     const worker = new MockWorker()
-    const conn = new Conn(connectWorker(worker, { message: { kind: 'rpc', id: 7 }, maxMessageSize: 128 }))
+    const conn = dialWorker(worker, { message: { kind: 'rpc', id: 7 }, maxMessageSize: 128 })
     expect(worker.messages).toEqual([{ kind: 'rpc', id: 7 }])
     const err = (await conn.invoke(echo.once, { text: 'x'.repeat(500) }).catch((e) => e)) as StatusError
     expect(err.code).toBe(Code.RESOURCE_EXHAUSTED) // §4.4, from the options given here
@@ -605,16 +605,29 @@ describe('connectWorker: bring your own worker', () => {
     conn.close()
   })
 
+  it('takes the Conn half of the options bag too', async () => {
+    // One bag, two consumers, no key in common: maxMessageSize is the
+    // adapter's ceiling (§4.4), `reliable` is the Conn's override of transport
+    // discovery (§4.3). Nothing is called here — where each key landed is the
+    // whole assertion, and a mode the far side does not share would not
+    // survive a round trip anyway (§10.6).
+    const worker = new MockWorker()
+    const conn = dialWorker(worker, { maxMessageSize: 128, reliable: false })
+    expect(conn.reliable).toBe(false)
+    conn.close()
+    await tick()
+  })
+
   it('never terminates the worker, not even when the connection dies', async () => {
     // terminate() aborts a worker at once, discarding whatever is still queued
     // for it. Killing it is the host's decision, taken after its endpoints have
     // torn down — never a side effect of one peer's §4.5 teardown.
     const worker = new MockWorker()
-    const transport = connectWorker(worker)
-    const conn = new Conn(transport)
+    const conn = dialWorker(worker)
     expect(await conn.invoke(echo.once, { text: 'hi' })).toEqual({ text: 'echo:hi' })
+    // One close is the whole teardown: Conn.close closes the transport, which
+    // says goodbye and releases the port. The worker is not its to end.
     conn.close()
-    transport.close()
     await tick()
     expect(worker.terminated).toBe(0)
   })
@@ -628,7 +641,7 @@ describe('connectWorker: bring your own worker', () => {
         throw new Error('worker terminated')
       },
     }
-    expect(() => connectWorker(worker)).toThrow(/worker terminated/)
+    expect(() => dialWorker(worker)).toThrow(/worker terminated/)
   })
 })
 

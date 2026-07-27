@@ -10,24 +10,38 @@ owning call (§4.4).
 **Node only** (it imports `node:dgram`); the browser uses the WebRTC adapter
 instead. No npm dependency beyond the Node builtin.
 
-## Client — `UdpTransport` / `dialUdp`
+## Client — `dialUdp` / `UdpTransport`
+
+```ts
+import { dialUdp } from '@lesomnus/grpc-dgram/transport/node-udp'
+
+const conn = await dialUdp(port, '127.0.0.1')
+await conn.invoke(Once, req)
+conn.close() // closes the transport and the socket too
+```
+
+`dialUdp` opens a connected socket and hands back a **`Conn`** — the endpoint
+you make calls on, the way `net.Dial` hands back a `net.Conn`. Its options are
+one bag: `maxMessageSize` is the adapter's, everything `ConnOptions` declares
+is the core's, and the two share no key.
+
+Bring your own socket — or reach for the transport itself — with the explicit
+pair:
 
 ```ts
 import { Conn } from '@lesomnus/grpc-dgram'
-import { dialUdp } from '@lesomnus/grpc-dgram/transport/node-udp'
+import { UdpTransport } from '@lesomnus/grpc-dgram/transport/node-udp'
 
-const conn = new Conn(await dialUdp(port, '127.0.0.1'))
-await conn.invoke(Once, req)
-conn.close() // closes the socket too
+const conn = new Conn(new UdpTransport(socket, { maxMessageSize: 1200 }), connOpts)
 ```
 
-`dialUdp` opens a connected socket and returns a `UdpTransport`; wrap an
-existing `dgram.Socket` with `new UdpTransport(socket)` if you manage it
-yourself.
+## Server — `listenUdp` / `UdpGateway`
 
-## Server — `UdpGateway` / `listenUdp`
-
-The source `address:port` is the peer key. `serve` runs until `close()`.
+`listen`, not `dial`: a server endpoint reaches nobody. One socket serves every
+peer that writes to it, keyed by source `address:port` (§6.4), so what comes
+back is the gateway rather than a connection. `serve` is a separate call
+because the registry freezes when serving starts (§13); it runs until
+`close()`.
 
 ```ts
 import { Server } from '@lesomnus/grpc-dgram'

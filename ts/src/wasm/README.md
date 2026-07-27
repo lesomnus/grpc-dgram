@@ -38,6 +38,16 @@ WebSocket wire — and the running example is
 
 ## `open(app, opts?)`
 
+`open`, not `dial`, because at this point there is no peer: a `.wasm` URL is a
+program, and nothing exists to reach until this has fetched it, instantiated it
+and waited for it to say it can serve. `open` is the verb for bringing
+something into existence; `dial` is the verb for reaching something that
+exists, which is why what comes back is a **`Sock`** — and the connection is
+the `sock.dial()` after it. (`Sock` and not `Server` for the mirror reason:
+this side is the client, and what it names is the thing it dials into. For a
+worker that is *already* running a server of its own, there is nothing to open:
+that is [`dialWorker`](../transport/port).)
+
 `app` is the compiled program in any form that survives a trip to a worker: a
 URL (`string` or `URL`), the module's bytes, or a `WebAssembly.Module` compiled
 once and instantiated many times. A `Response` is deliberately not one — it
@@ -61,7 +71,7 @@ the shipped module has no `error` event to fall back on either.
 | `entryPoint` | `'drpcServe'` | the global the instance publishes its port-taking function as; must match the Go side's (`jsport.WithEntryPoint`) |
 | `readyTimeoutMs` | `10_000` | how long to wait for that publish, measured from instantiation; `<= 0` waits forever |
 | `go` | `new Go()` in the running realm | a `Go` instance you built — the way to pass argv or env. It belongs to the realm that made it, so it goes with `{ worker: false }`; `open()` refuses it otherwise rather than ignore it |
-| `maxMessageSize`, `transfer` | see [`transport/port`](../transport/port#options) | passed to every transport `dial()` creates |
+| `maxMessageSize`, `transfer` | see [`transport/port`](../transport/port#options) | passed to the transport under every `dial()` |
 
 ## `WasmSock`
 
@@ -209,9 +219,11 @@ carries a `drpc` tag and anything untagged is dropped in silence, and an
 uncaught `error` in the worker is taken as a failure to start only *before*
 `ready` — after that a worker survives its own exceptions, and somebody else's
 bug does not tear these connections down. If what you want is a connection to a
-worker that is *not* a wasm instance at all, that is
-[`connectWorker`](../transport/port) in the port adapter: a channel, one end
-transferred, a `PortTransport` over the other, and no wasm anywhere.
+worker that is *not* a wasm instance at all — one already running, with a
+server of its own — that is [`dialWorker`](../transport/port) in the port
+adapter: nothing to open, so it is a `dial`, and it hands back the same `Conn`
+this one does over the same channel — one end transferred, a `PortTransport`
+over the other — with no wasm anywhere.
 
 ## `wasm_exec.js` is not vendored
 

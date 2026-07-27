@@ -32,9 +32,9 @@
 // teardown that reaches only it.
 
 import { Conn, type ConnOptions } from '../conn'
-import { connectWorker, PortTransport, type PortOptions } from '../transport/port'
+import { PortTransport, type PortOptions } from '../transport/port'
 import { DefaultEntryPoint, DefaultReadyTimeoutMs, DefaultWasmExec, startInstance, type GoLike, type Instance, type WasmApp } from './instance'
-import { isWorkerMessage, type StartMessage } from './protocol'
+import { isWorkerMessage, type ServeMessage, type StartMessage } from './protocol'
 
 export { DefaultEntryPoint, DefaultReadyTimeoutMs, DefaultWasmExec, type GoLike, type WasmApp } from './instance'
 
@@ -57,7 +57,8 @@ export interface OpenOptions extends PortOptions {
   // worker'`, or serveIn(self)) — one that answers nothing leaves open()
   // waiting with nothing to end the wait, since readyTimeoutMs is a clock the
   // realm running the instance keeps. For a worker that is not a wasm instance
-  // at all, the seam is connectWorker (../transport/port), not this.
+  // at all — one already running, with a server of its own — the seam is
+  // dialWorker (../transport/port), not this: there is nothing to open.
   worker?: boolean | WasmWorker
   // Where the shipped worker module lives. It is resolved from this module's
   // own URL by default, which is right for a plain <script type="module"> and
@@ -104,6 +105,12 @@ export interface WasmSock {
   // own peer (§6.4), a Conn over the other. Call it again for another,
   // independent connection.
   //
+  // dial, because by now the peer exists — open() is what brought it into
+  // existence, and this is the verb for reaching something that already does.
+  // It hands back a Conn for the same reason every dial… in this library does:
+  // a Conn is the endpoint you make calls on, and the plumbing under it is not
+  // this caller's business (the transport path is ../transport/port).
+  //
   // Synchronous on purpose. A transferred MessagePort queues everything posted
   // into it until the far side binds it, so nothing is lost and there is
   // nothing to wait for — a call opened on this very tick is delivered late,
@@ -123,6 +130,15 @@ export interface WasmSock {
 //
 //   const sock = await open('/app.wasm')
 //   const conn = sock.dial()
+//
+// open, not dial, because at this point there is no peer: a .wasm URL is a
+// program, not an endpoint, and nothing exists to reach until this has fetched
+// it, instantiated it and waited for it to say it can serve. open is the verb
+// for bringing something into existence; dial is the verb for reaching
+// something that exists, which is why what comes back is a Sock — not a Conn —
+// and the connection is the sock.dial() after it. It is a Sock and not a
+// Server for the other half of the same reason: this side is the client, and
+// the thing it names is what it dials into.
 //
 // It rejects, having left nothing behind, if the module cannot be fetched or
 // instantiated, if the instance dies on the way up, or if it has not published
@@ -224,6 +240,37 @@ abstract class Sock implements WasmSock {
   // stop ends the instance if this sock is what owns it.
   protected abstract stop(): void
 
+  // channelTo is what every connection here is made of, and all the two modes
+  // differ by is `handover` — the one line that gives the far end to whatever
+  // runs the instance. A MessageChannel is ONE channel with two entangled,
+  // symmetric ends: what is posted into one arrives at the other, and the only
+  // thing telling them apart is which one you give away. Making it here is why
+  // port1 and port2 never appear in application code.
+  //
+  // It is the same shape dialWorker (../transport/port) has, kept here rather
+  // than borrowed from there because what this sock has to hold is the
+  // transport: a dying instance fails every connection at once (bury), and the
+  // transport is what carries the cause that says why.
+  protected channelTo(handover: (port: MessagePort) => void): PortTransport {
+    const ch = new MessageChannel()
+    let tx: PortTransport | undefined
+    try {
+      // Constructed BEFORE the far end is handed over, so nothing the instance
+      // posts on its first tick arrives unlistened.
+      tx = new PortTransport(ch.port1, this.o)
+      handover(ch.port2)
+      return tx
+    } catch (e) {
+      // Nothing is left half-attached: the transport takes its listeners off
+      // its end, and both ends are closed — a live MessagePort keeps the event
+      // loop (and, in node, the whole process) alive.
+      tx?.close(e)
+      ch.port1.close()
+      ch.port2.close()
+      throw e
+    }
+  }
+
   // bury fails every connection at once and announces the cause. Every
   // connection, not just the first: they share the process that stopped
   // existing.
@@ -308,7 +355,8 @@ class WorkerSock extends Sock {
     // The port is transferred, never the worker itself: a MessagePort queues
     // what is posted into it until the far side binds it (see ./worker, rule
     // 1), and it is what makes a second, independent peer possible at all.
-    return connectWorker(this.worker, this.o)
+    const serve: ServeMessage = { drpc: 'serve' }
+    return this.channelTo((port) => this.worker.postMessage(serve, [port]))
   }
 
   protected stop(): void {
@@ -374,27 +422,10 @@ class HereSock extends Sock {
   }
 
   protected connect(): PortTransport {
-    // A MessageChannel is ONE channel with two entangled, symmetric ends —
-    // what is posted into one arrives at the other, and the only thing telling
-    // them apart is which one you give away. Making it here is why port1 and
-    // port2 never appear in application code.
-    const ch = new MessageChannel()
-    let tx: PortTransport | undefined
-    try {
-      // Constructed BEFORE the far end is handed over, so nothing the server
-      // posts on its first tick arrives unlistened.
-      tx = new PortTransport(ch.port1, this.o)
-      this.inst.serve(ch.port2)
-      return tx
-    } catch (e) {
-      // Nothing is left half-attached: the transport takes its listeners off
-      // its end, and both ends are closed — a live MessagePort keeps the event
-      // loop (and, in node, the whole process) alive.
-      tx?.close(e)
-      ch.port1.close()
-      ch.port2.close()
-      throw e
-    }
+    // No transfer list: the instance runs in this realm, so handing it the
+    // other end is a plain call — which is also what makes it the one place
+    // that throws when the instance has already exited.
+    return this.channelTo((port) => this.inst.serve(port))
   }
 
   protected stop(): void {

@@ -3,7 +3,8 @@
 // Covers the reliable echo round-trip (the TS side of the Go gorilla pair),
 // the §4.5 teardown duty on close and on error, the post-close delivery ban,
 // the §4.4 size ceiling, and the out-of-band death signals (keepalive, a
-// stalled send) that make teardown work in reliable mode.
+// stalled send) that make teardown work in reliable mode, plus the one-line
+// dialWebSocket path with the runtime's global WebSocket stubbed out.
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Conn } from '../../conn'
@@ -11,7 +12,7 @@ import { Server } from '../../server'
 import { Code, type StatusError } from '../../status'
 import { echo, registerEcho, tick } from '../../testing'
 import { FlagPing, frame } from '../../wire'
-import { WebSocketGateway, WebSocketTransport, type WebSocketLike, type WebSocketOptions } from './index'
+import { dialWebSocket, WebSocketGateway, WebSocketTransport, type WebSocketLike, type WebSocketOptions } from './index'
 
 const CONNECTING = 0
 const OPEN = 1
@@ -465,5 +466,64 @@ describe('send gating (§4.2)', () => {
     await tick()
     expect(() => conn.newStream(echo.live, {})).toThrow(/connection is closed/)
     expect(a.readyState).toBe(CLOSED)
+  })
+})
+
+describe('dialWebSocket (the one-line client path)', () => {
+  // The runtime's global WebSocket, stubbed: a constructor may return an
+  // object of its own, so `new` on this hands back a mock end instead of
+  // opening a real socket.
+  function withGlobalWS<T>(ws: MockWS | undefined, fn: (seen: () => { url: string; protocols?: string | string[] } | undefined) => T): T {
+    const g = globalThis as { WebSocket?: unknown }
+    const had = Object.hasOwn(g, 'WebSocket')
+    const saved = g.WebSocket
+    let seen: { url: string; protocols?: string | string[] } | undefined
+    if (ws === undefined) delete g.WebSocket
+    else {
+      g.WebSocket = function (url: string, protocols?: string | string[]) {
+        seen = { url, protocols }
+        return ws
+      }
+    }
+    try {
+      return fn(() => seen)
+    } finally {
+      if (had) g.WebSocket = saved
+      else delete g.WebSocket
+    }
+  }
+
+  it('hands back a Conn, ready to call, with one options bag split three ways', async () => {
+    const [a, b] = mockPair()
+    const gateway = new WebSocketGateway()
+    const server = new Server(gateway)
+    registerEcho(server)
+    gateway.bind(b)
+    const serving = gateway.servePeer(server, b)
+
+    // `protocols` is the socket's, maxMessageSize the adapter's (§4.4),
+    // reliable the Conn's (§4.3): one bag, three consumers, no key in common.
+    const conn = withGlobalWS(a, (seen) => {
+      const c = dialWebSocket('wss://host/rpc', { protocols: 'drpc', maxMessageSize: 1 << 20, reliable: true })
+      expect(seen()).toEqual({ url: 'wss://host/rpc', protocols: 'drpc' })
+      return c
+    })
+    expect(conn.reliable).toBe(true)
+
+    // It returns before the handshake: the call queues rather than fails.
+    const early = conn.invoke(echo.once, { text: 'hi' })
+    a.open()
+    b.open()
+    expect(await early).toEqual({ text: 'echo:hi' })
+
+    conn.close() // one close: the Conn, the transport, the socket
+    await serving
+    expect(a.readyState).toBe(CLOSED)
+  })
+
+  it('names the way out where the runtime has no global WebSocket', () => {
+    withGlobalWS(undefined, () => {
+      expect(() => dialWebSocket('wss://host/rpc')).toThrow(/no global WebSocket/)
+    })
   })
 })

@@ -37,7 +37,7 @@
 // A ws:// wire is plaintext. Deploy wss:// (TLS) or stay on a trusted
 // network — see PROTOCOL.md §15.
 
-import type { Conn } from '../../conn'
+import { Conn, type ConnOptions } from '../../conn'
 import type { Server } from '../../server'
 import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '../../seam'
 import { unpack } from '../../seam'
@@ -610,20 +610,31 @@ interface WebSocketCtor {
 }
 
 // dialWebSocket opens a client socket with the runtime's global WebSocket
-// (browser, Deno, Node ≥22) and returns a transport for it — the convenience
-// path, the twin of gorilla's Dial + New. It returns at once, without waiting
-// for the handshake: sends are gated on open, so calls made immediately just
-// queue.
+// (browser, Deno, Node ≥22) and hands back a Conn over it, ready to call:
 //
-//   const conn = new Conn(dialWebSocket('wss://host/rpc'))
+//   const conn = dialWebSocket('wss://host/rpc') // reliable mode, no timers
 //
-// Pass an explicit socket to `new WebSocketTransport(ws)` when the runtime has
-// no global WebSocket (node's `ws` package) or the socket needs options this
-// does not expose.
-export function dialWebSocket(url: string, opts: WebSocketOptions & { protocols?: string | string[] } = {}): WebSocketTransport {
+// dial is the verb for reaching a peer that already exists, and what it hands
+// back is the endpoint you make calls on — the same bargain as Go's net.Dial,
+// which returns a net.Conn. It is synchronous and returns before the
+// handshake: sends are gated on open, so a call made on this very tick queues
+// rather than fails.
+//
+// The options are one bag, and no two of its readers share a key: the socket
+// takes `protocols`, the adapter reads WebSocketOptions (the size ceiling, the
+// buffered-amount mark, the stall budget, the keepalive), and the Conn reads
+// everything ConnOptions declares.
+//
+// Build the pair yourself — `new Conn(new WebSocketTransport(ws), opts)` —
+// when you brought the socket (node's `ws` package, a runtime with no global
+// WebSocket, a socket needing constructor options this does not expose) or
+// when you need the transport object itself. Do it on the same tick as `new
+// WebSocket(url)`: the stack drops messages that arrive before a listener is
+// registered.
+export function dialWebSocket(url: string, opts: ConnOptions & WebSocketOptions & { protocols?: string | string[] } = {}): Conn {
   const ctor = (globalThis as { WebSocket?: WebSocketCtor }).WebSocket
   if (ctor === undefined) {
     throw new Error("websocket: this runtime has no global WebSocket; construct one (e.g. from the 'ws' package) and pass it to new WebSocketTransport()")
   }
-  return new WebSocketTransport(new ctor(url, opts.protocols), opts)
+  return new Conn(new WebSocketTransport(new ctor(url, opts.protocols), opts), opts)
 }

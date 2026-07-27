@@ -114,7 +114,7 @@ core never pulls their dependencies.
 | [`transport/udp`](./transport/udp) | UDP socket | unreliable | `udp.New(conn)` | `udp.NewGateway(pc)` + `Serve` |
 | [`transport/gorilla`](./transport/gorilla) | WebSocket | reliable | `gorilla.New(wsc)` | `gorilla.NewGateway()` + `ServePeer` |
 | [`transport/pion`](./transport/pion) | WebRTC DataChannel | **derived from the channel config** | `pion.New(dc)` | `pion.NewGateway()` + `Bind`+`ServePeer` |
-| [`transport/jsport`](./transport/jsport) | JS message port (`js/wasm`) | reliable | `jsport.New(port)` | `jsport.NewGateway()` + `Bind`+`ServePeer` |
+| [`transport/jsport`](./transport/jsport) | JS message port (`js/wasm`) | reliable | `jsport.New(port)` | `jsport.NewGateway()` + `Serve` |
 
 Clients are gRPC-shaped: `drpc.NewConn(tp)` attaches the transport and its
 receive machinery starts by itself; `conn.Close(nil)` (or the transport's

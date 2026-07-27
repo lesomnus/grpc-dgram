@@ -38,9 +38,10 @@ export interface StartMessage {
 // ServeMessage hands the instance one more port to serve as its own peer
 // (PROTOCOL.md §6.4). The port is NOT in this object — a MessagePort cannot be
 // cloned, only transferred — so it rides the transfer list and arrives as
-// `ev.ports[0]`. connectWorker (../transport/port) is what posts it, and this
-// is exactly its default message; a worker of your own can ignore the message
-// entirely and read the port off the event.
+// `ev.ports[0]`. It is exactly the default message dialWorker
+// (../transport/port) posts, which is what makes that seam and this worker a
+// working pair; a worker of your own can ignore the message entirely and read
+// the port off the event.
 export interface ServeMessage {
   drpc: 'serve'
 }
