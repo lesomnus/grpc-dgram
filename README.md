@@ -300,3 +300,7 @@ go test -run '^$' -fuzz FuzzServerHandle -fuzztime 20s .   # fuzz the frame entr
   [`timeout_test.go`](./timeout_test.go),
   [`restart_test.go`](./restart_test.go),
   [`shutdown_test.go`](./shutdown_test.go)
+
+## Licence
+
+[Apache 2.0](LICENSE).

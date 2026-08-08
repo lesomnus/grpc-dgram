@@ -202,8 +202,15 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
    page over `transport/port` — both import `dist/` through an import map, so
    `pnpm build` is their prerequisite (`../examples/` also has a UDP sensor
    stream and a WebSocket echo).
-4. **Packaging** — decide the published name/scope (currently
-   `@lesomnus/grpc-dgram`, `private: true`) and a real `version`. *(The
+4. ~~**Packaging**~~ — **done**: `@lesomnus/grpc-dgram` **0.0.1**, Apache-2.0,
+   `publishConfig.access: public`, `private` gone. `files` stays `["dist"]` —
+   tsdown emits no source maps, so there is nothing for `src` to be shipped
+   *for*. Verified the way a consumer meets it rather than the way a test does:
+   the tarball installed into an empty project, all eight entry points
+   imported, and a real unary round-trip driven through the **published
+   bundle** — `PortGateway`/`Server` on one end of a `MessageChannel`,
+   `Conn`/`PortTransport` on the other — because the suites run against `src`
+   and it is `dist` that is published. *(The
    protobuf-es binding — `@lesomnus/grpc-dgram/transport/protobuf-es`, `fromService` /
    `fromMethod`, `@bufbuild/protobuf` optional peer dep — is **done and
    verified against real `protoc-gen-es` output**: `test/protobufes-gen.test.ts`

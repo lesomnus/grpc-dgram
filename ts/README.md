@@ -239,3 +239,7 @@ integration tests (e2e, timeout, restart, limits, conformance) stay in
 `test/`. Shared test infrastructure — the echo fixtures and the generated
 `protoc-gen-es` code — lives in `src/testing/` (not an entry, not published).
 None of it reaches `dist/` (tsdown builds only the `exports` entries).
+
+## Licence
+
+[Apache 2.0](https://github.com/lesomnus/grpc-dgram/blob/main/LICENSE).

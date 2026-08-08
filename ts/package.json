@@ -1,9 +1,32 @@
 {
   "name": "@lesomnus/grpc-dgram",
   "type": "module",
-  "version": "0.0.0",
-  "private": true,
-  "description": "gRPC over unreliable datagram channels — TypeScript port of gRPC-dgram (dRPC wire protocol v1.1)",
+  "version": "0.0.1",
+  "description": "gRPC over unreliable datagram channels \u2014 TypeScript port of gRPC-dgram (dRPC wire protocol v1.1)",
+  "license": "Apache-2.0",
+  "author": "lesomnus",
+  "homepage": "https://github.com/lesomnus/grpc-dgram/tree/main/ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lesomnus/grpc-dgram.git",
+    "directory": "ts"
+  },
+  "bugs": {
+    "url": "https://github.com/lesomnus/grpc-dgram/issues"
+  },
+  "keywords": [
+    "grpc",
+    "drpc",
+    "datagram",
+    "webrtc",
+    "websocket",
+    "wasm",
+    "connect"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
   "exports": {
     ".": "./dist/index.mjs",
     "./transport/webrtc": "./dist/transport/webrtc.mjs",
