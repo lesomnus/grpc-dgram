@@ -128,12 +128,27 @@ type ServeFn = (port: MessagePort) => void
 
 // Instance is one running Go program, seen from the realm that started it.
 export interface Instance {
-  // The global it published under; the name it is known by here.
+  // The entry point it was started on; the name readiness was measured by.
   readonly entryPoint: string
-  // Hands the instance one port to serve as its own peer (§6.4). Throws once
-  // the instance has exited: a connection to a corpse would hang forever
-  // rather than fail (§10.6 — no timers), so it has to be refused out loud.
-  serve(port: MessagePort): void
+  // Hands the instance one port to serve as its own peer (§6.4), through the
+  // entry point named — the one it was started on by default.
+  //
+  // Throws, synchronously, once the instance has exited: a connection to a
+  // corpse would hang forever rather than fail (§10.6 — no timers), so it has
+  // to be refused out loud, and the caller still holds the port when it is.
+  //
+  // The promise is the rest of that answer, for a name this instance has not
+  // published yet. One program may serve several: a second gateway publishes
+  // a second name (jsport.WithEntryPoint), and only the FIRST is what
+  // readiness means — anything the program does between the two publishes
+  // that yields to the event loop (a fetch, a database opening, a sleep) lets
+  // the page reach this before the second gateway has run. So a name that is
+  // not there yet is WAITED for rather than refused, and the wait is bounded
+  // by the same readyTimeoutMs the start used. It rejects when that runs out,
+  // when the instance dies first, or when the name turns out to hold
+  // something that is not a function — and then the port is the caller's to
+  // say goodbye on, since nothing here speaks the wire.
+  serve(port: MessagePort, entryPoint?: string): Promise<void>
   // Resolves — never rejects — with the cause when the instance is gone. This
   // is the §4.5 evidence nothing else can produce, and it settles only after
   // the corpse has been defused (makeInert), so whoever holds the ports may
@@ -153,12 +168,13 @@ export async function startInstance(app: WasmApp, opts: InstanceOptions = {}): P
   // it first also means a second start on the same name is refused while this
   // one is still in the air rather than quietly stealing its publish.
   const entry = claimEntryPoint(name)
+  const readyTimeoutMs = opts.readyTimeoutMs ?? DefaultReadyTimeoutMs
   try {
     const go = opts.go ?? (await newGo(String(opts.wasmExec ?? DefaultWasmExec)))
     const instance = await instantiate(app, go.importObject)
     const run = go.run(instance)
-    const serve = await awaitPublish(entry.published, run, name, opts.readyTimeoutMs ?? DefaultReadyTimeoutMs)
-    return live(name, go, serve, run)
+    const serve = await awaitPublish(entry.published, run, name, readyTimeoutMs)
+    return live(name, go, serve, run, readyTimeoutMs)
   } finally {
     // On every path: the accessor was ours, it was never meant to survive the
     // start, and a second startInstance must find the name as it was.
@@ -169,7 +185,7 @@ export async function startInstance(app: WasmApp, opts: InstanceOptions = {}): P
 // live wraps the started instance with the one thing the port it published
 // cannot express — that it is gone. Every consumer of `exited` runs after
 // makeInert, which is why the goodbye posted to the corpse is safe.
-function live(name: string, go: GoLike, serve: ServeFn, run: Promise<void>): Instance {
+function live(name: string, go: GoLike, serve: ServeFn, run: Promise<void>, timeoutMs: number): Instance {
   let dead: { cause: unknown } | undefined
   let announce!: (cause: unknown) => void
   const exited = new Promise<unknown>((res) => {
@@ -196,11 +212,29 @@ function live(name: string, go: GoLike, serve: ServeFn, run: Promise<void>): Ins
   return {
     entryPoint: name,
     exited,
-    serve(port: MessagePort): void {
+    // Deliberately not an `async` method: the one condition knowable here and
+    // now — the instance is gone — is reported as a synchronous throw, the
+    // way it always was, and only the wait for a name becomes a promise.
+    serve(port: MessagePort, entryPoint?: string): Promise<void> {
       if (dead !== undefined) {
         throw new Error(`wasm: the instance behind globalThis.${name} has exited${dead.cause instanceof Error ? `: ${dead.cause.message}` : ''}`)
       }
-      serve(port) // one port is one peer (§6.4)
+      // The start's own name is never looked up: startInstance TOOK it back
+      // off globalThis on its way out (see claimEntryPoint's 'restore'), so
+      // what was published is only still reachable through this closure.
+      if (entryPoint === undefined || entryPoint === name) {
+        serve(port) // one port is one peer (§6.4)
+        return Promise.resolve()
+      }
+      return entryPointNamed(entryPoint, timeoutMs, exited).then((fn) => {
+        // Checked again on this side of the wait: the instance may have died
+        // while it ran, and handing a port to a dead runtime re-enters it
+        // (see makeInert) instead of serving anybody.
+        if (dead !== undefined) {
+          throw new Error(`wasm: the instance behind globalThis.${name} exited while waiting for globalThis.${entryPoint}`)
+        }
+        fn(port)
+      })
     },
   }
 }
@@ -236,11 +270,21 @@ const awaiting = new Set<string>()
 interface EntryPoint {
   // Resolves with the value the instance published.
   published: Promise<unknown>
-  // Puts globalThis back the way it was found. Idempotent.
+  // Settles what globalThis holds from here on; see `after`. Idempotent.
   release(): void
 }
 
-function claimEntryPoint(name: string): EntryPoint {
+// `after` is what the name holds once the accessor comes off, and the two
+// callers want opposite things:
+//
+//   'restore' — put globalThis back the way it was found. The start's rule:
+//     catching a publish is what a host does WITH the name, not a lease on
+//     it, and the value it caught is held in a closure from then on.
+//   'keep'    — leave the published value in place as a plain data property,
+//     which is what js.Global().Set would have left had nobody been
+//     listening. A dial's rule: this name belongs to a gateway that will
+//     never publish it again, and the NEXT dial has to find it by reading.
+function claimEntryPoint(name: string, after: 'restore' | 'keep' = 'restore'): EntryPoint {
   if (awaiting.has(name)) {
     throw new Error(`wasm: another instance is already waiting for globalThis.${name}; give one of them its own entryPoint`)
   }
@@ -276,10 +320,102 @@ function claimEntryPoint(name: string): EntryPoint {
       if (released) return
       released = true
       awaiting.delete(name)
+      if (after === 'keep' && value !== undefined) {
+        // What the Go side meant to leave: a plain, writable, configurable
+        // property, exactly as js.Global().Set produces.
+        Object.defineProperty(g, name, { configurable: true, writable: true, enumerable: true, value })
+        return
+      }
       if (prev === undefined) Reflect.deleteProperty(g, name)
       else Object.defineProperty(g, name, prev)
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// a second entry point
+// ---------------------------------------------------------------------------
+
+// The dial-time waits in flight, one per name. Two dials to a name that has
+// not appeared yet are one wait: the accessor may only be installed once, and
+// both of them want the same answer. A settled wait is dropped so the next
+// dial reads the published value straight off globalThis — and so a name that
+// timed out can be waited for again, since the gateway behind it may simply
+// have been slower than one dial was willing to wait.
+const waits = new Map<string, Promise<ServeFn>>()
+
+// entryPointNamed resolves the function published under `name`: at once when
+// it is already there, which is the common case, and otherwise by catching
+// the publish the same way the start does.
+function entryPointNamed(name: string, timeoutMs: number, exited: Promise<unknown>): Promise<ServeFn> {
+  const g = globalThis as unknown as Record<string, unknown>
+  // Read before claiming: installing an accessor over a value that is already
+  // there would replace the very thing being asked for.
+  //
+  // Own properties only, which is what js.Global().Set writes. A plain lookup
+  // reads the prototype chain too, where `constructor` and `toString` are
+  // functions on every realm — so a mistyped name would resolve to one of
+  // them and be CALLED with a port, instead of reporting that nothing serves
+  // under it. Shadowing one of those with the accessor below is fine and
+  // undone on release.
+  const v = Object.prototype.hasOwnProperty.call(g, name) ? g[name] : undefined
+  if (typeof v === 'function') return Promise.resolve(v as ServeFn)
+  if (v !== undefined) {
+    return Promise.reject(new Error(`wasm: globalThis.${name} is a ${typeof v}, not a function taking one port`))
+  }
+  const pending = waits.get(name)
+  if (pending !== undefined) return pending
+  if (awaiting.has(name)) {
+    // A startInstance is waiting on this name, and its accessor is what would
+    // be clobbered. Nothing here can tell whose publish would arrive first,
+    // so neither is guessed at.
+    return Promise.reject(new Error(`wasm: an instance is starting on globalThis.${name}; it cannot be dialled as a second entry point at the same time`))
+  }
+  const w = watchEntryPoint(name, timeoutMs, exited)
+  waits.set(name, w)
+  void w.catch(noop).then(() => {
+    if (waits.get(name) === w) waits.delete(name)
+  })
+  return w
+}
+
+// watchEntryPoint is awaitPublish's sibling for a name nobody is starting on:
+// same accessor, same three arms, and the published value is LEFT on
+// globalThis rather than taken back off it.
+function watchEntryPoint(name: string, timeoutMs: number, exited: Promise<unknown>): Promise<ServeFn> {
+  const entry = claimEntryPoint(name, 'keep')
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const arms: Promise<unknown>[] = [
+    entry.published,
+    // The instance dying is the end of the wait: nothing will ever publish
+    // this name, and with every protocol timer off (§10.6) a caller left
+    // waiting would never learn that.
+    exited.then((cause) => {
+      throw new Error(`wasm: the instance exited before publishing globalThis.${name}`, { cause })
+    }),
+  ]
+  if (timeoutMs > 0) {
+    arms.push(
+      new Promise((_, rej) => {
+        timer = setTimeout(
+          () => rej(new Error(`wasm: no globalThis.${name} after ${timeoutMs} ms — is that the name the second gateway serves under, and does it reach Serve?`)),
+          timeoutMs,
+        )
+        unrefTimer(timer)
+      }),
+    )
+  }
+  return Promise.race(arms)
+    .then((fn) => {
+      if (typeof fn !== 'function') {
+        throw new Error(`wasm: globalThis.${name} was set to a ${typeof fn}, not a function taking one port`)
+      }
+      return fn as ServeFn
+    })
+    .finally(() => {
+      if (timer !== undefined) clearTimeout(timer)
+      entry.release()
+    })
 }
 
 // awaitPublish resolves with the published entry point, or rejects with the

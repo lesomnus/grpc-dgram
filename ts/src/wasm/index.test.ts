@@ -20,7 +20,7 @@ import { Code, type StatusError } from '../status'
 import { echo, emptyModule, FakeGo, registerEcho, tick } from '../testing'
 import { PortGateway } from '../transport/port'
 import { DefaultEntryPoint, open, type OpenOptions, type WasmSock, type WasmWorker } from './index'
-import { isPageMessage, type StartMessage } from './protocol'
+import { isPageMessage, type ServeMessage, type StartMessage } from './protocol'
 
 // ---------------------------------------------------------------------------
 // fixtures
@@ -44,6 +44,32 @@ function serving(go: FakeGo) {
   return { gw, server, counts }
 }
 
+// The name a second gateway in the same instance publishes under
+// (jsport.WithEntryPoint), and `servingAlso` is that gateway. Only the FIRST
+// entry point is what readiness means, so `after` is the turns of the event
+// loop the program spends before this one appears — a program that does
+// anything asynchronous between its two gateways.
+const secondEntryPoint = 'drpcAdminServe'
+
+function servingAlso(go: FakeGo, opts: { after?: number } = {}) {
+  const gw = new PortGateway()
+  const server = new Server(gw)
+  const counts = registerEcho(server)
+  gateways.push(gw)
+  const publish = () =>
+    go.publishAt(secondEntryPoint, (port: MessagePort) => {
+      gw.bind(port)
+      void gw.servePeer(server, port)
+    })
+  const readiness = go.onRun
+  go.onRun = (g) => {
+    readiness(g)
+    if (opts.after === undefined) publish()
+    else setTimeout(publish, opts.after)
+  }
+  return { gw, server, counts }
+}
+
 // here opens an instance in this realm and records the sock, so afterEach
 // releases both ends of every channel it dialled.
 async function here(go: FakeGo, opts: OpenOptions = {}): Promise<WasmSock> {
@@ -61,6 +87,9 @@ async function here(go: FakeGo, opts: OpenOptions = {}): Promise<WasmSock> {
 // answered.
 class FakeWorker implements WasmWorker {
   readonly starts: StartMessage[] = []
+  // Every `serve` it was posted, message only: what the page asked for, as
+  // opposed to the ports it was handed (`transferred`).
+  readonly serves: ServeMessage[] = []
   readonly stray: unknown[] = []
   readonly transferred: unknown[] = []
   readonly counts: ReturnType<typeof registerEcho>
@@ -98,6 +127,7 @@ class FakeWorker implements WasmWorker {
       this.stray.push(message)
       return
     }
+    this.serves.push(message)
     this.transferred.push(port)
     this.pending.push(port)
     if (this.autoBind) this.bind()
@@ -192,6 +222,10 @@ afterEach(() => {
   for (const gw of gateways.splice(0)) gw.close()
   spawned.splice(0)
   spawnReady = true
+  // A dialled entry point is LEFT on globalThis, unlike the start's: the
+  // gateway behind it publishes once and the next dial finds it by reading. It
+  // belongs to the instance rather than to open(), so the test clears it.
+  Reflect.deleteProperty(globalThis, secondEntryPoint)
   vi.unstubAllGlobals()
   // The accessor is open()'s own scaffolding and no path may leave it behind:
   // a leftover one would swallow the next instance's publish into a promise
@@ -562,6 +596,136 @@ describe('one instance, many connections', () => {
     // Not "no such instance": a connection to a corpse would hang forever
     // rather than fail, so the error has to say which of the two happened.
     expect(() => sock.dial()).toThrow(/the wasm instance has exited/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// one instance, many servers
+// ---------------------------------------------------------------------------
+
+// A second gateway in the same program (jsport.WithEntryPoint) is a different
+// axis from a second dial(): another drpc.Server with its own registry and its
+// own interceptors, sharing the module, the runtime, the memory and the
+// lifetime. The page reaches it by name.
+describe('one instance, many servers', () => {
+  it('dials the second entry point, and the two are different servers', async () => {
+    const go = new FakeGo()
+    const control = serving(go)
+    const admin = servingAlso(go)
+    const sock = await here(go)
+
+    const c = sock.dial()
+    const a = sock.dial({ entryPoint: secondEntryPoint })
+    expect(await c.invoke(echo.once, { text: 'c' })).toEqual({ text: 'echo:c' })
+    expect(await a.invoke(echo.once, { text: 'a' })).toEqual({ text: 'echo:a' })
+
+    // Two registries, not one served twice.
+    expect(control.counts.once).toBe(1)
+    expect(admin.counts.once).toBe(1)
+  })
+
+  it('waits for a second gateway that has not published yet', async () => {
+    // The point of the whole feature. Readiness is the FIRST entry point, so a
+    // program that yields to the event loop between its two gateways — a
+    // fetch, a database opening, a sleep — is reachable here before the second
+    // has run, and whether it is depends on Go's scheduler. Refusing the dial
+    // would make that scheduling decide whether the page works.
+    const go = new FakeGo()
+    serving(go)
+    const admin = servingAlso(go, { after: 30 })
+    const sock = await here(go)
+    expect(Object.hasOwn(globalThis, secondEntryPoint)).toBe(false) // not there yet
+
+    // Synchronous even so: the port queues the call until the far side binds it.
+    const a = sock.dial({ entryPoint: secondEntryPoint })
+    expect(await a.invoke(echo.once, { text: 'early' })).toEqual({ text: 'echo:early' })
+    expect(admin.counts.once).toBe(1)
+  })
+
+  it('two dials to one unpublished name share the wait', async () => {
+    // The accessor may be installed once, so a second dial cannot claim the
+    // name for itself; both want the same answer and both must get it.
+    const go = new FakeGo()
+    serving(go)
+    servingAlso(go, { after: 30 })
+    const sock = await here(go)
+
+    const [first, second] = [sock.dial({ entryPoint: secondEntryPoint }), sock.dial({ entryPoint: secondEntryPoint })]
+    expect(await first.invoke(echo.once, { text: 'a' })).toEqual({ text: 'echo:a' })
+    expect(await second.invoke(echo.once, { text: 'b' })).toEqual({ text: 'echo:b' })
+  })
+
+  it('leaves the dialled name on globalThis for the next dial to read', async () => {
+    // Unlike the start's, which open() takes back off. This one is the
+    // gateway's: it published once and will not do it again.
+    const go = new FakeGo()
+    serving(go)
+    servingAlso(go, { after: 10 })
+    const sock = await here(go)
+    sock.dial({ entryPoint: secondEntryPoint }).close()
+    await new Promise((res) => setTimeout(res, 30))
+    expect(typeof (globalThis as Record<string, unknown>)[secondEntryPoint]).toBe('function')
+
+    const again = sock.dial({ entryPoint: secondEntryPoint })
+    expect(await again.invoke(echo.once, { text: 'again' })).toEqual({ text: 'echo:again' })
+  })
+
+  it('fails only that connection when the name never arrives', async () => {
+    // Bounded by the same readyTimeoutMs the start used. The instance is alive
+    // and every other connection to it is untouched — and with no protocol
+    // timers (§10.6) nothing but this would ever end the call.
+    const go = new FakeGo()
+    const control = serving(go)
+    const sock = await here(go, { readyTimeoutMs: 30 })
+    const ok = sock.dial()
+    const nowhere = sock.dial({ entryPoint: 'drpcNoSuchServer' })
+
+    const err = (await nowhere.invoke(echo.once, { text: 'nobody' }).catch((e: unknown) => e)) as StatusError
+    expect(err.code).toBe(Code.UNAVAILABLE)
+    expect(String(err.cause ?? err)).toMatch(/drpcNoSuchServer/)
+
+    expect(await ok.invoke(echo.once, { text: 'fine' })).toEqual({ text: 'echo:fine' })
+    expect(control.counts.once).toBe(1)
+    expect(Object.hasOwn(globalThis, 'drpcNoSuchServer')).toBe(false) // no accessor left behind
+  })
+
+  it('ends a waiting connection when the instance dies under it', async () => {
+    const go = new FakeGo()
+    serving(go)
+    servingAlso(go, { after: 10_000 }) // never, for this test's purposes
+    const sock = await here(go)
+    const waiting = sock.dial({ entryPoint: secondEntryPoint })
+
+    go.exit()
+    const err = (await waiting.invoke(echo.once, { text: 'anyone' }).catch((e: unknown) => e)) as StatusError
+    expect(err.code).toBe(Code.UNAVAILABLE)
+  })
+
+  it('does not resolve a name to something inherited from the prototype chain', async () => {
+    // `toString` is a function on every realm, through Object.prototype rather
+    // than as globalThis's own. A plain lookup would find it and CALL it with
+    // a port; a mistyped entryPoint has to report instead.
+    const go = new FakeGo()
+    serving(go)
+    const sock = await here(go, { readyTimeoutMs: 20 })
+    const conn = sock.dial({ entryPoint: 'toString' })
+    const err = (await conn.invoke(echo.once, { text: 'x' }).catch((e: unknown) => e)) as StatusError
+    expect(err.code).toBe(Code.UNAVAILABLE)
+    expect(String(err.cause ?? err)).toMatch(/no globalThis\.toString after 20 ms/)
+    // And the shadow the wait cast over it is gone.
+    expect(Object.hasOwn(globalThis, 'toString')).toBe(false)
+    expect(typeof globalThis.toString).toBe('function')
+  })
+
+  it('carries the entry point to the worker, and omits it when there is none', async () => {
+    // The page's half of the contract; the routing itself is the worker's, in
+    // worker.test.ts. Omitted rather than filled in with the started name:
+    // which name that is belongs to the realm holding the instance.
+    const w = new FakeWorker()
+    const sock = await withWorker(w)
+    sock.dial()
+    sock.dial({ entryPoint: secondEntryPoint })
+    expect(w.serves).toEqual([{ drpc: 'serve' }, { drpc: 'serve', entryPoint: secondEntryPoint }])
   })
 })
 

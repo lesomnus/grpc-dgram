@@ -66,6 +66,15 @@ export function serveIn(scope: WorkerScope): void {
   const ports = new Set<MessagePort>()
   let instance: Promise<Instance> | undefined
   let gone = false
+  // Whether this worker has already told the page how the start went. It is
+  // what makes a duplicate start answerable: every message posted here reaches
+  // EVERY open() listening on this worker, so an error posted while somebody's
+  // readiness is still unsettled could reject the start that is actually
+  // running. Once `ready` (or `error`) has gone out, no unsettled readiness can
+  // belong to anything but a duplicate — and before that, a duplicate resolves
+  // off the broadcast `ready` and dials the one instance, which is what it
+  // wanted anyway.
+  let answered = false
 
   // bury says the last word on every port at once. The goodbye goes out before
   // `exited` does, so a page that is watching neither the ports nor the
@@ -82,9 +91,20 @@ export function serveIn(scope: WorkerScope): void {
     if (!isPageMessage(msg)) return // not ours; somebody else's channel traffic
     if (msg.drpc === 'start') {
       // One worker is one instance: a second start has no entry point left to
-      // publish under and no second lifetime to report, so it is ignored the
-      // way the first would have refused it.
-      if (instance !== undefined) return
+      // publish under and no second lifetime to report. Answered rather than
+      // ignored, because the page has nothing else to wait on — `ready` is the
+      // only thing that ever settles open(), and silence here is a page that
+      // hangs with no diagnosis. The answer names what to do instead: a second
+      // SERVER in one instance is a second entry point, not a second start.
+      if (instance !== undefined) {
+        if (answered) {
+          scope.postMessage({
+            drpc: 'error',
+            message: 'this worker already runs an instance — a second server in it is a second entry point, dialled with sock.dial({ entryPoint }), not a second open()',
+          })
+        }
+        return
+      }
       instance = startInstance(msg.app, {
         entryPoint: msg.entryPoint,
         readyTimeoutMs: msg.readyTimeoutMs,
@@ -92,6 +112,7 @@ export function serveIn(scope: WorkerScope): void {
       })
       void instance.then(
         (inst) => {
+          answered = true
           scope.postMessage({ drpc: 'ready' })
           void inst.exited.then((cause) => {
             // The instance is already inert by the time this runs (see
@@ -105,6 +126,7 @@ export function serveIn(scope: WorkerScope): void {
           // Nothing is running, so there is nothing to exit — but a port that
           // was already transferred has a live transport on the other end, and
           // only the goodbye ends it.
+          answered = true
           bury()
           scope.postMessage({ drpc: 'error', message: reason(e) })
         },
@@ -126,20 +148,24 @@ export function serveIn(scope: WorkerScope): void {
     ports.add(port)
     // Handed over when the instance is ready, which may be later than now —
     // the port queues what the page posts into it in the meantime (rule 1), so
-    // a call opened on this very tick is delivered, not lost.
+    // a call opened on this very tick is delivered, not lost. A serve naming
+    // an entry point the instance has not published yet waits later still, and
+    // the port goes on queueing across that too (see Instance.serve).
     void instance.then(
       (inst) => {
+        // The instance died between the transfer and here, and serve()
+        // refuses a corpse rather than hand it a port nobody would ever read;
+        // or the entry point it names never arrives. Both end this one port
+        // and nothing else — and neither throw nor rejection may escape, where
+        // it would take a whole worker down over one connection.
+        let served: Promise<void>
         try {
-          inst.serve(port)
+          served = inst.serve(port, msg.entryPoint)
         } catch {
-          // The instance died between the transfer and here, and serve()
-          // refuses a corpse rather than hand it a port nobody would ever
-          // read. bury() may not have had this one yet, so end it the same
-          // way — and never let the throw out, where an unhandled rejection
-          // would take a worker down over one connection.
-          ports.delete(port)
-          farewell(port)
+          abandon(port)
+          return
         }
+        void served.catch(() => abandon(port))
       },
       () => {
         // The start failure already went out as {drpc:'error'}, and bury()
@@ -147,6 +173,13 @@ export function serveIn(scope: WorkerScope): void {
       },
     )
   })
+
+  // abandon ends one port the instance will never serve. bury() may not have
+  // had it yet, so it is dropped from the set as well as told.
+  function abandon(port: MessagePort): void {
+    ports.delete(port)
+    farewell(port)
+  }
 }
 
 // farewell posts the goodbye and releases the port. Best effort on both: a

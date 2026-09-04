@@ -92,18 +92,52 @@ class EchoGo extends FakeGo {
   }
 }
 
+// The second gateway's name, and how many turns of the event loop its main
+// spends before publishing it. 0 publishes in the same main as readiness; a
+// positive number is the program doing something that yields in between — a
+// fetch, a database opening — which is what lets a page reach dial() first.
+const adminEntryPoint = 'drpcAdminServe'
+let adminDelay: number | undefined
+
+// TwoGatewayGo is one instance serving TWO servers, the shape of issue #1: a
+// second drpc.Server under a name of its own (jsport.WithEntryPoint), sharing
+// the module, the runtime and the lifetime. Only the first is readiness.
+class TwoGatewayGo extends EchoGo {
+  readonly adminCounts: ReturnType<typeof registerEcho>
+
+  constructor() {
+    super()
+    const gw = new PortGateway()
+    const server = new Server(gw)
+    this.adminCounts = registerEcho(server)
+    gateways.push(gw)
+    const publishAdmin = () =>
+      this.publishAt(adminEntryPoint, (port: MessagePort) => {
+        gw.bind(port)
+        void gw.servePeer(server, port)
+      })
+    const readiness = this.onRun
+    this.onRun = (go) => {
+      readiness(go)
+      if (adminDelay === undefined) return // a program with no second gateway
+      if (adminDelay === 0) publishAdmin()
+      else setTimeout(publishAdmin, adminDelay)
+    }
+  }
+}
+
 function start(scope: FakeScope, opts: Partial<StartMessage> = {}): void {
   scope.post({ drpc: 'start', app: emptyModule, wasmExec: '/wasm_exec.js', entryPoint: 'drpcServe', readyTimeoutMs: 1_000, ...opts })
 }
 
 // dial is the page's half of a `serve`: a fresh channel, one end posted in on
 // the transfer list, a Conn over the other.
-function dial(scope: FakeScope): Conn {
+function dial(scope: FakeScope, entryPoint?: string): Conn {
   const ch = new MessageChannel()
   opened.push(ch.port1, ch.port2)
   const conn = new Conn(new PortTransport(ch.port1))
   conns.push(conn)
-  scope.post({ drpc: 'serve' }, [ch.port2])
+  scope.post({ drpc: 'serve', ...(entryPoint === undefined ? {} : { entryPoint }) }, [ch.port2])
   return conn
 }
 
@@ -113,6 +147,12 @@ afterEach(() => {
   for (const p of opened.splice(0)) p.close()
   instances.splice(0)
   publishAs = 'drpcServe'
+  adminDelay = undefined
+  // Unlike the start's, a dialled entry point is LEFT on globalThis: the
+  // gateway behind it publishes once and the next dial has to find it by
+  // reading. It is the instance's, not scaffolding, so the test owns cleaning
+  // it up.
+  Reflect.deleteProperty(globalThis, adminEntryPoint)
   vi.unstubAllGlobals()
   // The accessor the start installs is scaffolding; no path may leave it on
   // the worker's global scope.
@@ -167,7 +207,7 @@ describe('the shipped worker', () => {
     expect(await dial(scope).invoke(echo.once, { text: 'named' })).toEqual({ text: 'echo:named' })
   })
 
-  it('ignores a second start: one worker is one instance', async () => {
+  it('answers a second start rather than leave the page waiting on it', async () => {
     vi.stubGlobal('Go', EchoGo)
     const scope = new FakeScope()
     serveIn(scope)
@@ -177,6 +217,93 @@ describe('the shipped worker', () => {
     start(scope) // it has no entry point left to publish under, and one life
     await tick()
     expect(instances).toHaveLength(1)
+    // Answered, not ignored: `ready` is the only thing that ever settles an
+    // open(), so silence here is a page that hangs with no diagnosis. And the
+    // answer names what the caller actually wanted — a second server in one
+    // instance is a second entry point.
+    expect(scope.sent).toHaveLength(2)
+    const answer = scope.sent[1]!
+    expect(answer.drpc).toBe('error')
+    expect((answer as { message: string }).message).toMatch(/already runs an instance/)
+    expect((answer as { message: string }).message).toMatch(/dial\(\{ entryPoint \}\)/)
+
+    // The instance it already has is untouched by the refusal.
+    expect(await dial(scope).invoke(echo.once, { text: 'still here' })).toEqual({ text: 'echo:still here' })
+  })
+
+  it('stays silent about a second start that overtakes the first answer', async () => {
+    vi.stubGlobal('Go', EchoGo)
+    const scope = new FakeScope()
+    serveIn(scope)
+    start(scope)
+    start(scope) // in the same task: the first has not answered yet
+
+    // Every message this worker posts reaches EVERY open() listening on it, so
+    // an error posted now could reject the start that is actually running.
+    // Before the first answer the duplicate is left to resolve off the
+    // broadcast `ready` instead, which dials the one instance — what it wanted.
+    await scope.waitFor('ready')
+    await tick()
+    expect(instances).toHaveLength(1)
+    expect(scope.sent).toEqual([{ drpc: 'ready' }])
+  })
+
+  it('serves a port through the entry point the page named', async () => {
+    // Issue #1: one instance, two servers, one worker. The page reaches the
+    // second by name and the two are genuinely different registries — the
+    // handler counters below are what tell them apart.
+    adminDelay = 0
+    vi.stubGlobal('Go', TwoGatewayGo)
+    const scope = new FakeScope()
+    serveIn(scope)
+    start(scope)
+    await scope.waitFor('ready')
+
+    expect(await dial(scope).invoke(echo.once, { text: 'c' })).toEqual({ text: 'echo:c' })
+    expect(await dial(scope, adminEntryPoint).invoke(echo.once, { text: 'a' })).toEqual({ text: 'echo:a' })
+
+    const go = instances[0] as TwoGatewayGo
+    expect(go.counts.once).toBe(1)
+    expect(go.adminCounts.once).toBe(1)
+  })
+
+  it('waits for an entry point the instance has not published yet', async () => {
+    // The reason a dial to an unpublished name is not simply refused. Only the
+    // FIRST entry point is readiness, so a program that yields between its two
+    // gateways is reachable here before the second has run — and whether that
+    // happens is a matter of Go scheduling, which no page can be asked to
+    // depend on. The port queues the whole call across the wait (rule 1).
+    adminDelay = 30
+    vi.stubGlobal('Go', TwoGatewayGo)
+    const scope = new FakeScope()
+    serveIn(scope)
+    start(scope)
+    await scope.waitFor('ready')
+
+    expect(Object.hasOwn(globalThis, adminEntryPoint)).toBe(false) // not there yet
+    const conn = dial(scope, adminEntryPoint)
+    expect(await conn.invoke(echo.once, { text: 'late' })).toEqual({ text: 'echo:late' })
+    expect((instances[0] as TwoGatewayGo).adminCounts.once).toBe(1)
+  })
+
+  it('says goodbye to a port whose entry point never arrives', async () => {
+    // Bounded by the start's own readyTimeoutMs. The goodbye is what makes the
+    // call FAIL rather than hang: with every protocol timer off (§10.6) it is
+    // the only thing that ever ends it.
+    vi.stubGlobal('Go', EchoGo) // one gateway; nothing will ever publish the other
+    const scope = new FakeScope()
+    serveIn(scope)
+    start(scope, { readyTimeoutMs: 30 })
+    await scope.waitFor('ready')
+
+    const err = (await dial(scope, adminEntryPoint)
+      .invoke(echo.once, { text: 'nobody' })
+      .catch((e) => e)) as StatusError
+    expect(err.code).toBe(Code.UNAVAILABLE)
+
+    // One port, not the instance: the server it does run is untouched, and the
+    // worker has nothing to report about a death that did not happen.
+    expect(await dial(scope).invoke(echo.once, { text: 'fine' })).toEqual({ text: 'echo:fine' })
     expect(scope.sent).toEqual([{ drpc: 'ready' }])
   })
 

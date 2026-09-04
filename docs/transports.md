@@ -44,7 +44,10 @@ serves every port handed to it; [`open('/app.wasm')`](../ts/src/wasm) on the
 page starts the instance in the worker that entry ships, waits for that publish
 and hands back a sock, and `sock.dial()` is one connection over a channel it
 makes itself. One instance serves as many as it is given ports, each its own
-peer (§6.4), so a second `dial()` is the next one. A `Worker` already running a server of its own
+peer (§6.4), so a second `dial()` is the next one — and one instance may run
+more than one `drpc.Server`, each `Serve`d under a name of its own
+(`jsport.WithEntryPoint`) and reached by `sock.dial({ entryPoint })`, so a
+second registry costs a name rather than a second module. A `Worker` already running a server of its own
 needs no `open` — there is nothing to bring into existence — so it is
 `dialWorker(worker)`; an iframe or a second TS endpoint, where you hold the
 port yourself, is the manual path below, unchanged.

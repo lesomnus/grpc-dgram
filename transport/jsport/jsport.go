@@ -124,9 +124,19 @@ func WithLabel(s string) Option {
 // WithEntryPoint names the global (*Gateway).Serve publishes its entry point
 // as; default DefaultEntryPoint. The name is the entire handshake — the host
 // waits for that property to appear on globalThis and calls it with a port —
-// so changing it here means changing it in the host too. Change it when one
-// realm runs two servers: Serve refuses a name that is already taken rather
-// than steal it. Transport ignores it; a client is handed its port directly.
+// so changing it here means changing it in the host too. Transport ignores it;
+// a client is handed its port directly.
+//
+// It is how one program serves two servers: a second Gateway under a name of
+// its own, its own drpc.Server and registry, sharing this instance's module,
+// runtime, memory and lifetime. The host dials it by name (ts/src/wasm's
+// sock.dial({ entryPoint })), and it does not have to be published by the time
+// the host is ready — a dial to a name that has not appeared yet waits for it,
+// so the order the program's Serve calls happen to run in is not load-bearing.
+// Serve refuses a name that is already taken rather than steal it, and
+// publishes nothing when it does: report that error rather than dropping it in
+// a `go gw.Serve(...)`, or a collision reaches the host only as a dial that
+// waits out its timeout blaming the name.
 func WithEntryPoint(name string) Option {
 	return func(o *options) { o.entryPoint = name }
 }

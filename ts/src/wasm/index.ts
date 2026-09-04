@@ -30,6 +30,23 @@
 // §6.4), so a second dial() is a second independent peer of the same server —
 // its own epoch, sid space, flow-control windows and per-peer caps, and a
 // teardown that reaches only it.
+//
+// One instance may also serve more than one SERVER, which is a different axis
+// entirely: a second drpc.Server, its own registry and its own interceptors,
+// published under a name of its own (jsport.WithEntryPoint). The page reaches
+// it by name, and everything else — the module, the runtime, the memory, the
+// lifetime — is shared:
+//
+//   const sock = await open('/app.wasm')
+//   const control = sock.dial()                          // drpcServe
+//   const admin = sock.dial({ entryPoint: 'drpcAdmin' })  // the second gateway
+//
+// Only the FIRST of those names is what readiness means: open() resolves when
+// the started entry point publishes, and a program that yields to the event
+// loop between its two gateways can be reached before the second has run. So a
+// dial to a name that is not there yet WAITS for it (bounded by
+// readyTimeoutMs) instead of failing — which is what keeps the order the Go
+// program happens to publish in from deciding whether the page works.
 
 import { Conn, type ConnOptions } from '../conn'
 import { PortTransport, type PortOptions } from '../transport/port'
@@ -86,6 +103,23 @@ export interface OpenOptions extends PortOptions {
   go?: GoLike
 }
 
+// DialOptions is a Conn's options plus the one thing that is this sock's
+// business: which of the instance's servers to reach.
+export interface DialOptions extends ConnOptions {
+  // The entry point to dial, for a program that publishes more than one
+  // (jsport.WithEntryPoint on the Go side). Omitted — the usual case — this
+  // is the name open() started on, the one readiness was measured by.
+  //
+  // A name the instance has not published YET is waited for, not refused:
+  // readiness means the FIRST entry point, and a program that yields to the
+  // event loop between its two gateways (a fetch, a database opening) can
+  // reach this line before the second one has run. The port queues the calls
+  // opened on it meanwhile, so this stays synchronous and nothing is lost. A
+  // name that never arrives ends the connection with a cause after
+  // readyTimeoutMs — the same clock the start used — rather than hanging it.
+  entryPoint?: string
+}
+
 // WasmSock is one running instance, seen from the page.
 export interface WasmSock {
   // The worker, when there is one. Yours to look at; close() is what ends it,
@@ -103,7 +137,8 @@ export interface WasmSock {
   readonly exited: Promise<unknown>
   // dial opens one connection: a fresh channel, one end to the instance as its
   // own peer (§6.4), a Conn over the other. Call it again for another,
-  // independent connection.
+  // independent connection — or for another of the instance's servers, with
+  // `entryPoint`.
   //
   // dial, because by now the peer exists — open() is what brought it into
   // existence, and this is the verb for reaching something that already does.
@@ -111,13 +146,18 @@ export interface WasmSock {
   // a Conn is the endpoint you make calls on, and the plumbing under it is not
   // this caller's business (the transport path is ../transport/port).
   //
-  // Synchronous on purpose. A transferred MessagePort queues everything posted
-  // into it until the far side binds it, so nothing is lost and there is
-  // nothing to wait for — a call opened on this very tick is delivered late,
-  // not dropped. Throws once the instance has exited or the sock is closed: a
-  // connection to a corpse would hang forever rather than fail (§10.6 — no
-  // timers), so it is refused out loud.
-  dial(opts?: ConnOptions): Conn
+  // Synchronous on purpose, `entryPoint` included. A transferred MessagePort
+  // queues everything posted into it until the far side binds it, so nothing
+  // is lost and there is nothing to wait for — a call opened on this very tick
+  // is delivered late, not dropped. Throws once the instance has exited or the
+  // sock is closed: a connection to a corpse would hang forever rather than
+  // fail (§10.6 — no timers), so it is refused out loud.
+  //
+  // What cannot be refused here is a dial to an entry point that turns out
+  // never to appear: only the realm running the instance can see that, and it
+  // sees it later. That connection fails with the cause instead, exactly as
+  // one to an instance that dies does.
+  dial(opts?: DialOptions): Conn
   // close ends every Conn dialled here — their live calls fail with a cause
   // rather than hang — and then terminates the worker, if open() made one.
   // Idempotent. It cannot stop the Go program itself when there is no worker:
@@ -212,14 +252,18 @@ abstract class Sock implements WasmSock {
     })
   }
 
-  dial(opts: ConnOptions = {}): Conn {
+  dial(opts: DialOptions = {}): Conn {
     if (this.dead !== undefined) {
       const what = this.closed ? 'this sock is closed' : 'the wasm instance has exited'
       throw new Error(`wasm: ${what}${this.dead.cause instanceof Error ? `: ${this.dead.cause.message}` : ''}`)
     }
-    const tx = this.connect()
+    // Split rather than passed whole: entryPoint says which server this
+    // channel goes to, which is settled before a Conn exists and is no part of
+    // what a Conn is configured with.
+    const { entryPoint, ...connOpts } = opts
+    const tx = this.connect(entryPoint)
     this.txs.add(tx)
-    return new Conn(tx, opts)
+    return new Conn(tx, connOpts)
   }
 
   close(): void {
@@ -235,8 +279,9 @@ abstract class Sock implements WasmSock {
     this.stop()
   }
 
-  // connect opens one more connection to the instance.
-  protected abstract connect(): PortTransport
+  // connect opens one more connection to the instance, through the entry point
+  // named — the one it was started on by default.
+  protected abstract connect(entryPoint: string | undefined): PortTransport
   // stop ends the instance if this sock is what owns it.
   protected abstract stop(): void
 
@@ -251,14 +296,26 @@ abstract class Sock implements WasmSock {
   // than borrowed from there because what this sock has to hold is the
   // transport: a dying instance fails every connection at once (bury), and the
   // transport is what carries the cause that says why.
-  protected channelTo(handover: (port: MessagePort) => void): PortTransport {
+  protected channelTo(handover: (port: MessagePort) => void | Promise<void>): PortTransport {
     const ch = new MessageChannel()
     let tx: PortTransport | undefined
     try {
       // Constructed BEFORE the far end is handed over, so nothing the instance
       // posts on its first tick arrives unlistened.
       tx = new PortTransport(ch.port1, this.o)
-      handover(ch.port2)
+      const handed = handover(ch.port2)
+      // A handover that is not settled yet — an entry point this instance has
+      // not published — reports its failure later than this call can throw.
+      // THIS connection ends then, and only this one: the instance is alive
+      // and every other connection to it is unaffected. Nothing else ever
+      // would end it, since the channel runs with no timers (§10.6).
+      if (handed !== undefined) {
+        const t = tx
+        void handed.catch((e: unknown) => {
+          this.txs.delete(t)
+          t.close(e)
+        })
+      }
       return tx
     } catch (e) {
       // Nothing is left half-attached: the transport takes its listeners off
@@ -351,11 +408,19 @@ class WorkerSock extends Sock {
     return this.readiness
   }
 
-  protected connect(): PortTransport {
+  protected connect(entryPoint: string | undefined): PortTransport {
     // The port is transferred, never the worker itself: a MessagePort queues
     // what is posted into it until the far side binds it (see ./worker, rule
     // 1), and it is what makes a second, independent peer possible at all.
-    const serve: ServeMessage = { drpc: 'serve' }
+    //
+    // The field is omitted rather than filled in with the started name: which
+    // name that is belongs to the realm holding the instance, and a worker
+    // reading the two from one message could disagree with the page about it.
+    const serve: ServeMessage = entryPoint === undefined ? { drpc: 'serve' } : { drpc: 'serve', entryPoint }
+    // Nothing to await here even when the entry point is one the instance has
+    // yet to publish: the worker holds the port until it can serve it, and
+    // ends it with a goodbye if it never can — which reaches this connection
+    // as a teardown through the transport, like any other death (§4.5).
     return this.channelTo((port) => this.worker.postMessage(serve, [port]))
   }
 
@@ -421,11 +486,13 @@ class HereSock extends Sock {
     void inst.exited.then((cause) => this.bury(cause))
   }
 
-  protected connect(): PortTransport {
+  protected connect(entryPoint: string | undefined): PortTransport {
     // No transfer list: the instance runs in this realm, so handing it the
     // other end is a plain call — which is also what makes it the one place
-    // that throws when the instance has already exited.
-    return this.channelTo((port) => this.inst.serve(port))
+    // that throws when the instance has already exited. An entry point it has
+    // not published yet is the one part that cannot answer synchronously, and
+    // channelTo ends this connection with the reason when it does.
+    return this.channelTo((port) => this.inst.serve(port, entryPoint))
   }
 
   protected stop(): void {

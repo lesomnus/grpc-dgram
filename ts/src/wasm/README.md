@@ -79,7 +79,7 @@ the shipped module has no `error` event to fall back on either.
 interface WasmSock {
   readonly worker?: WasmWorker
   readonly exited: Promise<unknown>
-  dial(opts?: ConnOptions): Conn
+  dial(opts?: DialOptions): Conn   // ConnOptions & { entryPoint?: string }
   close(): void
 }
 ```
@@ -95,9 +95,9 @@ instance has exited or the sock is closed — a connection to a corpse would han
 forever rather than fail (§10.6 leaves no timer to end it), so it is refused
 out loud.
 
-What a second `dial()` does **not** give you is a second server. Every
-connection reaches the same handlers, the same application state and the same
-thread: an instance is one Go program, and its goroutines interleave
+What a second `dial()` does **not** give you, by itself, is a second server.
+Every connection reaches the same handlers, the same application state and the
+same thread: an instance is one Go program, and its goroutines interleave
 cooperatively on whichever realm it runs in, so one connection's slow handler
 delays the others (a Worker keeps that off the page's thread, not off its
 own). The split is worth stating plainly, because it is the whole basis for
@@ -111,8 +111,53 @@ deciding how many to open:
 
 So the reason to dial twice is *isolation of the connection*, not of the
 server: a part of the page you want to tear down on its own, or a `Worker` or
-iframe that should hold its own peer rather than share yours. Two servers —
-separate state, separate everything — is two `open()` calls.
+iframe that should hold its own peer rather than share yours. A second
+*server* is the next section.
+
+## Two servers in one instance
+
+A Go program may run more than one `drpc.Server` — a second registry, a second
+interceptor chain, the shape of an admin listener sitting beside a control one
+— and publish it under a name of its own:
+
+```go
+control := jsport.NewGateway()                                  // drpcServe
+admin := jsport.NewGateway(jsport.WithEntryPoint("drpcAdmin"))
+
+go func() { log.Fatal(control.Serve(ctx, controlSrv)) }()
+log.Fatal(admin.Serve(ctx, adminSrv))
+```
+
+```ts
+const sock = await open('/app.wasm')
+const control = sock.dial()
+const admin = sock.dial({ entryPoint: 'drpcAdmin' })
+```
+
+One module, one download, one compile, one runtime, one memory, one lifetime —
+and two servers with nothing in common but the program they live in. The
+alternative is two `open()` calls, which is two of all of that and two
+deployments that have to agree.
+
+**Only the first entry point is readiness.** `open()` resolves when the name it
+started on publishes, and a program that does anything asynchronous between its
+two gateways — a fetch, a database opening, the `time.Sleep` in
+[`conformance/wasmserver`](../../../conformance/wasmserver) — hands control
+back to the page before the second `Serve` has run. Whether that happens is
+decided by Go's scheduler, and it flips when you reorder two lines of `main`.
+
+So a dial to a name that is not there **yet** waits for it rather than failing.
+It stays synchronous: the transferred port queues the calls opened on it while
+the far side waits, exactly as it queues the ones opened before the instance
+was ready. A name that never arrives ends that one connection with a cause
+after `readyTimeoutMs` — the same clock the start used — while the instance and
+every other connection to it go on working. Nothing about the ordering of your
+`Serve` calls is load-bearing.
+
+A word of warning about the Go side: `Serve` refuses a name that is already
+published rather than steal it, and returns that error *without* publishing. A
+`go gw.Serve(...)` that drops the error turns a name collision into a page that
+waits out its timeout blaming the name. Report it.
 
 `exited` resolves — never rejects — with the cause when the instance is gone.
 `close()` resolves it too: after that this sock has stopped watching, and a
@@ -214,7 +259,9 @@ const sock = await open('/app.wasm', { workerUrl })
 it must run this module (`import '@lesomnus/grpc-dgram/wasm/worker'`, or
 `serveIn(self)`), since that half is what starts the instance and says the
 goodbye — and never terminates it, because it may be hosting something else of
-yours. Sharing it is safe in both directions: every message either half posts
+yours. One worker is one instance, so a second `open()` on the same worker is
+refused with a message saying so: a second *server* in one instance is a second
+entry point (above), not a second start. Sharing it is safe in both directions: every message either half posts
 carries a `drpc` tag and anything untagged is dropped in silence, and an
 uncaught `error` in the worker is taken as a failure to start only *before*
 `ready` — after that a worker survives its own exceptions, and somebody else's

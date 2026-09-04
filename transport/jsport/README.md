@@ -57,6 +57,35 @@ woken by the assignment itself: no `drpcReady` callback, no second name, nothing
 to poll. Which is why nothing may be published before the server can serve:
 register every service first (`PROTOCOL.md` §13), then call `Serve`.
 
+### Two servers in one instance
+
+Nothing stops a second `Gateway` in the same program, under a name of its own —
+another `drpc.Server`, its own registry, its own interceptors, sharing the
+module, the runtime, the memory and the lifetime of the first:
+
+```go
+control := jsport.NewGateway()                                  // drpcServe
+admin := jsport.NewGateway(jsport.WithEntryPoint("drpcAdmin"))
+
+go func() { log.Fatal(control.Serve(ctx, controlSrv)) }()
+log.Fatal(admin.Serve(ctx, adminSrv))
+```
+
+The page dials the second by name: `sock.dial({ entryPoint: 'drpcAdmin' })`.
+
+Only the **first** name is readiness, and the host does not require the second
+to exist by then: a dial to a name that has not published yet waits for it. That
+is deliberate — a program that does anything asynchronous between its two
+gateways reaches the host with the second name still absent, and which of them
+publishes first is a matter of Go's scheduling, not of anything the page can
+arrange. Publish them in whichever order suits the program.
+
+Two duties remain yours. `Serve` refuses a name that is already published rather
+than steal it, and returns that error **without** publishing — so a
+`go gw.Serve(...)` that drops the error turns a collision into a host that waits
+out its timeout blaming the name. And exactly one `Serve` may block `main`; the
+rest are goroutines, since a returned `main` kills the instance.
+
 The host's half is [`ts/src/wasm`](../../ts/src/wasm)'s `open()`, and from the
 page it is two lines — the worker it runs in comes with the package:
 
@@ -213,7 +242,7 @@ teardown.
 | `WithMaxMessageSize(n)` | 0 (unlimited) | largest marshaled `Envelop` this endpoint will **send**; structured clone has no protocol ceiling, so set it only for a path that caps message size |
 | `WithTransfer(v)` | `true` | hand the message's `ArrayBuffer` over on the transfer list instead of copying it — safe because the adapter allocates it per message |
 | `WithLabel(s)` | `"port"` | what `Peer()` reports, and the address handlers read through `peer.FromContext`; a port has no address of its own |
-| `WithEntryPoint(name)` | `"drpcServe"` | the global `Gateway.Serve` publishes; the name is the entire handshake with the host, so change it on both sides — and only when one realm runs two servers |
+| `WithEntryPoint(name)` | `"drpcServe"` | the global `Gateway.Serve` publishes; the name is the entire handshake with the host, so change it on both sides — it is how one instance serves two servers (below) |
 
 ## Writing your own glue
 

@@ -42,8 +42,24 @@ export interface StartMessage {
 // (../transport/port) posts, which is what makes that seam and this worker a
 // working pair; a worker of your own can ignore the message entirely and read
 // the port off the event.
+//
+// `entryPoint` names which of the instance's servers to reach, and is absent
+// for the usual one — the name the instance was STARTED on, which is also the
+// one readiness was measured by. One Go program may publish several
+// (jsport.WithEntryPoint), and a page dials the others by name:
+// sock.dial({ entryPoint }). Absent rather than defaulted so the two halves
+// cannot disagree about which name that is across a version skew: only the
+// start carries it, and every serve without one means "the one you started".
+//
+// The worker looks the name up on its own globalThis, which is a page-supplied
+// string reaching a property lookup — and no new trust boundary, because
+// `start` already hands this worker a wasmExec URL that it fetches and
+// evaluates. Whoever can post here can already run anything here. The lookup
+// is restricted to OWN properties all the same, so a mistyped name reports
+// rather than resolving to something inherited (see entryPointNamed).
 export interface ServeMessage {
   drpc: 'serve'
+  entryPoint?: string
 }
 
 // ReadyMessage says the instance published its entry point and can serve. It

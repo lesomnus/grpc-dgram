@@ -72,6 +72,9 @@ function hasGo(): boolean {
 declare global {
   var drpcStop: () => void
   var drpcExit: () => void
+  // Set only when the second gateway's Serve was refused — a name already
+  // taken. Its absence is what says the two entry points really are two.
+  var drpcAdminErr: string | undefined
 }
 
 // loadGoRuntime evaluates wasm_exec.js, which defines globalThis.Go. It is
@@ -397,6 +400,39 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go wasm ser
     // not a goodbye: the peer's empty envelop trips the death latch with no
     // cause at all, and the first cause wins.
     expect(err.message).toMatch(/the wasm instance exited/)
+  })
+
+  // -------------------------------------------------------------------------
+  // two servers in one instance
+  // -------------------------------------------------------------------------
+
+  it('dial({ entryPoint }) reaches the second Go server, published after readiness', async () => {
+    // The one place both halves of this are real: a Go program running two
+    // drpc.Servers behind two jsport gateways, and a page dialling the second
+    // by name. Only the first is readiness — the fixture publishes the second
+    // 50 ms later, on purpose, so this dial NECESSARILY waits for a name that
+    // is not on globalThis yet.
+    //
+    // That delay is the whole point. Whether a page reaches dial() before a
+    // program's second Serve has run is decided by Go's scheduler, which no
+    // page can arrange, so waiting for the name is what keeps the answer from
+    // depending on it. The port queues the call across the wait: dial() is
+    // synchronous, the call is opened on that same tick, and nothing is lost.
+    const admin = server.sock.dial({ entryPoint: 'drpcAdmin' })
+    try {
+      const res = await admin.invoke(Echo.once, create(EchoRequestSchema, { message: 'hello', circularShift: 2 }))
+      // "admin:" is the second server's own handler, not the first's — the two
+      // registries are genuinely different, which "the call succeeded" alone
+      // would not have shown.
+      expect(res.message).toBe('admin:llohe')
+      // And the first server is untouched by any of it: same instance, same
+      // runtime, a peer of its own (§6.4).
+      const first = await conn.invoke(Echo.once, create(EchoRequestSchema, { message: 'hello', circularShift: 2 }))
+      expect(first.message).toBe('llohe')
+    } finally {
+      admin.close()
+    }
+    expect(globalThis.drpcAdminErr).toBeUndefined() // no refused Serve went unreported
   })
 
   // Last, because it ends the shared server: everything above needs it alive.

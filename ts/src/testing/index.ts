@@ -182,7 +182,14 @@ export class FakeGo {
 
   // publish is js.Global().Set(name, fn) seen from JS.
   publish(fn: unknown): void {
-    Reflect.set(globalThis, this.entryPoint, fn)
+    this.publishAt(this.entryPoint, fn)
+  }
+
+  // publishAt is a SECOND gateway publishing under a name of its own
+  // (jsport.WithEntryPoint): the same js.Global().Set, another name, and only
+  // the first one is what readiness was measured by.
+  publishAt(name: string, fn: unknown): void {
+    Reflect.set(globalThis, name, fn)
   }
 
   // exit RESOLVES run(), which is what wasm_exec does for a clean exit and

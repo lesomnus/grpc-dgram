@@ -20,7 +20,17 @@
 // process that instantiated this module, and everything crosses as marshaled
 // Envelop bytes over the port (§4.1).
 //
-// The host drives it through exactly three globals:
+// It serves TWO servers, which is the other thing only this fixture can prove.
+// One instance may run several — a second drpc.Server with its own registry and
+// its own handlers, published under a name of its own (jsport.WithEntryPoint)
+// — and the page reaches it with sock.dial({ entryPoint }). Only the FIRST is
+// readiness, and the second is published deliberately LATE, after a turn of the
+// JS event loop, because that is the case the host has to survive: a real
+// program does something asynchronous between its two gateways, and whether the
+// page reaches dial() before the second Serve has run is a matter of Go's
+// scheduler, not of anything the page can arrange.
+//
+// The host drives it through exactly four globals:
 //
 //	drpcServe(port)  Gateway.Serve's own entry point: bind the port and serve
 //	                 it as one peer (§6.4). Publishing it is also the readiness
@@ -28,6 +38,8 @@
 //	                 appearing is the event the host awaits (ts/src/wasm's
 //	                 open() is that host, and the two teardown globals below are
 //	                 set before Serve so they exist by the time it fires)
+//	drpcAdmin(port)  the second server's entry point, published one event-loop
+//	                 turn after readiness, so a dial to it necessarily WAITS
 //	drpcStop()       Gateway.Close: the empty-envelop goodbye on every served
 //	                 port, so the TS side can prove that a peer which says
 //	                 goodbye tears its peer's calls down (§4.5)
@@ -41,12 +53,60 @@ import (
 	"log"
 	"os"
 	"syscall/js"
+	"time"
 
 	drpc "github.com/lesomnus/grpc-dgram"
 	"github.com/lesomnus/grpc-dgram/internal/echo"
 	"github.com/lesomnus/grpc-dgram/transport/jsport"
 	_ "google.golang.org/grpc/encoding/gzip" // registers "gzip", the §12.1 interop baseline
 )
+
+// adminEntryPoint is the second server's name; the host dials it by it.
+const adminEntryPoint = "drpcAdmin"
+
+// adminDelay is how long the second gateway waits before publishing. A sleep
+// stands in for whatever a real program does between its two gateways — a
+// fetch, a database opening — and the only thing that matters about it is that
+// it YIELDS: Go's scheduler runs on the JS event loop here, so a sleeping
+// goroutine hands control back to the host, which is then free to reach dial()
+// with this name still absent. Long enough that the host cannot win the race by
+// accident, short enough to cost the suite nothing.
+const adminDelay = 50 * time.Millisecond
+
+// adminServer is internal/echo with Once marked, which is the whole of how the
+// host tells the two servers apart: same service, same wire, different
+// registry. Every other method falls through unchanged.
+type adminServer struct {
+	*echo.EchoServer
+}
+
+func (s *adminServer) Once(ctx context.Context, req *echo.EchoRequest) (*echo.EchoResponse, error) {
+	res, err := s.EchoServer.Once(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	res.SetMessage("admin:" + res.GetMessage())
+	return res, nil
+}
+
+// serveAdmin is the second server: its own registry, its own handlers, sharing
+// the module, the runtime, the memory and the lifetime of the first. It runs on
+// its own goroutine because Serve blocks — and it publishes late on purpose;
+// see the delay above.
+func serveAdmin(ctx context.Context) {
+	gw := jsport.NewGateway(jsport.WithEntryPoint(adminEntryPoint))
+	srv := drpc.NewServer(gw)
+	// A DIFFERENT implementation behind the same service, so the host can tell
+	// which of the two servers answered rather than take the wiring on faith.
+	echo.RegisterEchoServiceServer(srv, &adminServer{EchoServer: &echo.EchoServer{}})
+
+	time.Sleep(adminDelay)
+	// A refusal must not be silent: it would reach the host only as a dial
+	// that waits out its timeout, blaming the name rather than the collision.
+	if err := gw.Serve(ctx, srv); err != nil {
+		js.Global().Set("drpcAdminErr", err.Error())
+	}
+}
 
 func main() {
 	gw := jsport.NewGateway()
@@ -69,9 +129,12 @@ func main() {
 		return nil
 	}))
 
+	ctx := context.Background()
+	go serveAdmin(ctx)
+
 	// Serve publishes drpcServe, serves every port the host hands it, and
 	// blocks — which is also what keeps main from returning, and a returned
 	// main would kill the instance and every js.Func above with it the moment
 	// the host saw it ready.
-	log.Fatal(gw.Serve(context.Background(), srv))
+	log.Fatal(gw.Serve(ctx, srv))
 }
