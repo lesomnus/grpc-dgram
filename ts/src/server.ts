@@ -13,7 +13,7 @@
 
 import type { CallOptions, MethodDesc, NamedCodec, PayloadCodec } from './desc'
 import { isUnary } from './desc'
-import { chain2, type StreamServerHandler, type StreamServerInterceptor, type UnaryServerInterceptor } from './interceptor'
+import { chain2, type StreamServerHandler, type StreamServerInterceptor, type UnaryServerHandler, type UnaryServerInterceptor } from './interceptor'
 import { resolveLimits, resolveRxConfig, type Limits, type ResolvedLimits, type ResolvedRxConfig, type RxBufferConfig } from './limits'
 import { metadataJoin, validateMetadata, type Metadata } from './metadata'
 import { RxVerdict, RxWindow, TxSeq } from './seq'
@@ -745,8 +745,11 @@ export class Server {
         // The request rides the OPEN; it is decompressed and size-capped like
         // any received message (§12.1).
         const req = await st.decodeMessage(open)
-        const h = st.reg.handler as UnaryHandler<unknown, unknown>
+        const h: UnaryServerHandler = async (r, c) => (await (st.reg.handler as UnaryHandler<unknown, unknown>)(r, c)) as NonNullable<unknown>
         resp = this.unaryInt === undefined ? await h(req, st.context) : await this.unaryInt(req, st.context, h)
+        // A response is required; nothing is a bug upstream (a handler or an
+        // interceptor that forgot to return), not an empty message.
+        if (resp === undefined) throw statusError(Code.INTERNAL, 'unary handler produced no response')
       } catch (e) {
         err = toStatusError(e)
       }
@@ -794,7 +797,10 @@ export class Server {
         const out = this.streamInt === undefined ? await last(st, st.context) : await this.streamInt(st, st.context, last)
         if (desc.clientStreams && !desc.serverStreams) {
           // Client-streaming: what the chain resolves to is the response,
-          // riding the terminal frame (§8 SendAndClose).
+          // riding the terminal frame (§8 SendAndClose). Nothing is a bug
+          // upstream (a handler or an interceptor that forgot to return),
+          // not an empty message.
+          if (out === undefined) throw statusError(Code.INTERNAL, 'client-streaming handler produced no response')
           st.setResponse(out)
         }
       } catch (e) {

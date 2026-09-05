@@ -3,9 +3,9 @@
 // server stream interceptor gets for all three streaming shapes — the TS
 // twin of the Go interceptor coverage.
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { clientStreamingMethod, unaryMethod } from '../src/desc'
-import type { StreamClientInterceptor, StreamServerInterceptor, UnaryClientInterceptor, UnaryServerInterceptor } from '../src/interceptor'
+import type { ClientCall, StreamClientInterceptor, StreamServerInterceptor, UnaryClientInterceptor, UnaryInvoker, UnaryServerHandler, UnaryServerInterceptor } from '../src/interceptor'
 import type { Metadata } from '../src/metadata'
 import type { ServerContext } from '../src/server'
 import { Code, StatusError, statusError } from '../src/status'
@@ -164,8 +164,10 @@ describe('client unary', () => {
     expect(net.counts.once).toBe(0)
   })
 
-  it('may call next again — a retry is a fresh stream', async () => {
+  it('may call next again — a retry is a fresh stream, with its own header/trailer callbacks', async () => {
     let attempts = 0
+    let headers = 0
+    let trailers = 0
     const flaky = unaryMethod<TestReq, TestRes>('/test.Echo/Flaky', { request: jsonCodec(), response: jsonCodec() })
     const net = makeNet({
       reliable: true,
@@ -189,10 +191,68 @@ describe('client unary', () => {
           return { text: `ok:${req.text}` }
         }),
     })
-    const res = await net.conn.invoke(flaky, { text: 'x' })
+    const res = await net.conn.invoke(flaky, { text: 'x' }, { onHeader: () => headers++, onTrailer: () => trailers++ })
     expect(res).toEqual({ text: 'ok:x' })
     expect(attempts).toBe(2)
     expect(net.sentC2S.filter(isOpen)).toHaveLength(2)
+    expect([headers, trailers]).toEqual([2, 2])
+  })
+
+  it('the budget is absolute across the chain: a retry gets the remainder, an exhausted one fails first (§10.2)', async () => {
+    vi.useFakeTimers()
+    try {
+      let attempts = 0
+      const flaky = unaryMethod<TestReq, TestRes>('/test.Echo/Flaky', { request: jsonCodec(), response: jsonCodec() })
+      const net = makeNet({
+        reliable: false,
+        connOpts: {
+          unaryInterceptors: [
+            async (req, call, next) => {
+              for (;;) {
+                try {
+                  return await next(req, call)
+                } catch (e) {
+                  if (!(e instanceof StatusError) || e.code !== Code.UNAVAILABLE) throw e
+                  await vi.advanceTimersByTimeAsync(2_000)
+                }
+              }
+            },
+          ],
+        },
+        register: (s) =>
+          s.register(flaky, () => {
+            attempts++
+            throw statusError(Code.UNAVAILABLE, 'not yet')
+          }),
+      })
+      try {
+        const err = await net.conn.invoke(flaky, { text: '' }).catch((e) => e)
+        expect(err).toBeInstanceOf(StatusError)
+        expect(err.code).toBe(Code.DEADLINE_EXCEEDED)
+        expect(err.desc).toBe('drpc: default call timeout')
+        // T_call = 5 s: each OPEN carries what is left of the one budget, and
+        // the fourth attempt never reaches the wire.
+        expect(net.sentC2S.filter(isOpen).map((f) => f.timeoutMs)).toEqual([5_000, 3_000, 1_000])
+        expect(attempts).toBe(3)
+      } finally {
+        net.conn.close()
+        await net.server.stop()
+      }
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a chain that resolves to nothing is INTERNAL, not an empty response', async () => {
+    // The types forbid it; a JS caller can still do it.
+    const forgot = (async (req: unknown, call: ClientCall, next: UnaryInvoker) => {
+      await next(req, call)
+    }) as unknown as UnaryClientInterceptor
+    const net = makeNet({ reliable: true, connOpts: { unaryInterceptors: [forgot] } })
+    const err = await net.conn.invoke(echo.once, { text: 'hi' }).catch((e) => e)
+    expect(err).toBeInstanceOf(StatusError)
+    expect(err.code).toBe(Code.INTERNAL)
+    expect(net.counts.once).toBe(1)
   })
 
   it('may translate the status', async () => {
@@ -357,6 +417,40 @@ describe('server unary', () => {
     })
     expect(await net.conn.invoke(echo.once, { text: 'hi' })).toEqual({ text: 'wrapped:echo:hi' })
   })
+
+  it("may recover from the handler's throw", async () => {
+    const bad = unaryMethod<TestReq, TestRes>('/test.Echo/Bad', { request: jsonCodec(), response: jsonCodec() })
+    const net = makeNet({
+      reliable: true,
+      serverOpts: {
+        unaryInterceptors: [
+          async (req, ctx, next) => {
+            try {
+              return await next(req, ctx)
+            } catch {
+              return { text: 'fallback' }
+            }
+          },
+        ],
+      },
+      register: (s) =>
+        s.register(bad, () => {
+          throw statusError(Code.INTERNAL, 'boom')
+        }),
+    })
+    expect(await net.conn.invoke(bad, { text: '' })).toEqual({ text: 'fallback' })
+  })
+
+  it('a chain that resolves to nothing is INTERNAL, not an empty response', async () => {
+    const forgot = (async (req: unknown, ctx: ServerContext, next: UnaryServerHandler) => {
+      await next(req, ctx)
+    }) as unknown as UnaryServerInterceptor
+    const net = makeNet({ reliable: true, serverOpts: { unaryInterceptors: [forgot] } })
+    const err = await net.conn.invoke(echo.once, { text: 'hi' }).catch((e) => e)
+    expect(err).toBeInstanceOf(StatusError)
+    expect(err.code).toBe(Code.INTERNAL)
+    expect(net.counts.once).toBe(1)
+  })
 })
 
 describe('server stream', () => {
@@ -447,5 +541,60 @@ describe('server stream', () => {
     expect(err).toBeInstanceOf(StatusError)
     expect(err.code).toBe(Code.PERMISSION_DENIED)
     expect(net.counts.live).toBe(0)
+  })
+
+  it('a throw after next resolved is the terminal: sent messages stand, a response does not', async () => {
+    const net = makeNet({
+      reliable: true,
+      serverOpts: {
+        streamInterceptors: [
+          async (stream, ctx, next) => {
+            await next(stream, ctx)
+            throw statusError(Code.ABORTED, 'after')
+          },
+        ],
+      },
+    })
+    const many = net.conn.newStream(echo.many)
+    await many.send({ text: 'm', n: 2 })
+    many.closeSend()
+    expect(await many.recv()).toEqual({ text: 'm#0' })
+    expect(await many.recv()).toEqual({ text: 'm#1' })
+    const e1 = await many.recv().catch((e) => e)
+    expect(e1).toBeInstanceOf(StatusError)
+    expect(e1.code).toBe(Code.ABORTED)
+
+    const count = net.conn.newStream(echo.count)
+    await count.send({ text: 'a' })
+    count.closeSend()
+    const e2 = await count.recv().catch((e) => e)
+    expect(e2).toBeInstanceOf(StatusError)
+    expect(e2.code).toBe(Code.ABORTED)
+    expect(net.counts).toEqual({ once: 0, many: 1, count: 1, live: 0 })
+  })
+
+  it('a client-streaming chain that resolves to nothing is INTERNAL, not an empty response', async () => {
+    const net = makeNet({
+      reliable: true,
+      serverOpts: {
+        streamInterceptors: [
+          async (stream, ctx, next) => {
+            await next(stream, ctx)
+          },
+        ],
+      },
+    })
+    const count = net.conn.newStream(echo.count)
+    await count.send({ text: 'a' })
+    count.closeSend()
+    const err = await count.recv().catch((e) => e)
+    expect(err).toBeInstanceOf(StatusError)
+    expect(err.code).toBe(Code.INTERNAL)
+    // The other shapes legitimately resolve to nothing.
+    const many = net.conn.newStream(echo.many)
+    await many.send({ text: 'm', n: 1 })
+    many.closeSend()
+    expect(await many.recv()).toEqual({ text: 'm#0' })
+    expect(await many.recv()).toBeUndefined()
   })
 })

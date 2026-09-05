@@ -23,14 +23,26 @@ import type { ServerContext, ServerReader, ServerWriter } from './server'
 // (PROTOCOL.md §10.2), as Go's Invoke sets the ctx deadline before its chain
 // runs. opts is mutable up to `next`: what the innermost invoker reads is what
 // reaches the OPEN, and it is validated there (metadata, compressor, codec).
+//
+// The budget is absolute across the chain, as a ctx deadline is in Go: on a
+// unary call, timeoutMs is measured from the moment invoke was called, so a
+// retrying interceptor's later attempts carry the remainder and an exhausted
+// budget fails DEADLINE_EXCEEDED before reaching the wire. An interceptor
+// that sets a different timeoutMs starts a new budget from that point — what
+// a new ctx deadline does in Go.
 export interface ClientCall<Req = unknown, Res = unknown> {
   readonly desc: MethodDesc<Req, Res>
   opts: CallConfig<Req, Res>
 }
 
+// A unary call resolves to its response, which is never nullish; the types
+// say so (NonNullable<unknown>) so that an interceptor which awaits next and
+// forgets to return is a compile error — as in grpc-go and Connect-ES — and
+// not an empty message on the wire.
+
 // UnaryInvoker performs one unary call; the innermost one is the Conn's own.
-export type UnaryInvoker = (req: unknown, call: ClientCall) => Promise<unknown>
-export type UnaryClientInterceptor = (req: unknown, call: ClientCall, next: UnaryInvoker) => Promise<unknown>
+export type UnaryInvoker = (req: unknown, call: ClientCall) => Promise<NonNullable<unknown>>
+export type UnaryClientInterceptor = (req: unknown, call: ClientCall, next: UnaryInvoker) => Promise<NonNullable<unknown>>
 
 // Streamer starts one streaming call. It is synchronous, as Conn.newStream
 // is: an interceptor that needs async work does it on the stream it returns.
@@ -44,20 +56,24 @@ export type StreamClientInterceptor = (call: ClientCall, next: Streamer) => Clie
 // ---------------------------------------------------------------------------
 
 // UnaryServerHandler is the shape `next` has for a unary server interceptor:
-// the registered handler, or the rest of the chain. It resolves to the
-// response, which the core marshals onto the terminal frame (PROTOCOL.md §8).
-export type UnaryServerHandler = (req: unknown, ctx: ServerContext) => unknown
-export type UnaryServerInterceptor = (req: unknown, ctx: ServerContext, next: UnaryServerHandler) => unknown
+// the registered handler, or the rest of the chain. It is async and resolves
+// to the response, which the core marshals onto the terminal frame
+// (PROTOCOL.md §8); an interceptor returns next's promise or its own
+// response, never nothing (see above).
+export type UnaryServerHandler = (req: unknown, ctx: ServerContext) => Promise<NonNullable<unknown>>
+export type UnaryServerInterceptor = (req: unknown, ctx: ServerContext, next: UnaryServerHandler) => Promise<NonNullable<unknown>>
 
 // StreamServerHandler is `next` for the three streaming shapes at once; the
 // desc on ctx (clientStreams / serverStreams, PROTOCOL.md §13) tells them
 // apart. For server-streaming the innermost handler reads the request that
 // rode the OPEN off the stream itself, as grpc-go's generated handler does —
 // an interceptor that recv()s first eats it. For client-streaming the value
-// the chain resolves to IS the response (the handler's return); an
-// interceptor returns what `next` returned, or substitutes its own.
-export type StreamServerHandler = (stream: ServerReader<unknown> & ServerWriter<unknown>, ctx: ServerContext) => unknown
-export type StreamServerInterceptor = (stream: ServerReader<unknown> & ServerWriter<unknown>, ctx: ServerContext, next: StreamServerHandler) => unknown
+// the chain resolves to IS the response (the handler's return): an
+// interceptor returns what `next` returned, or substitutes its own, and a
+// chain that resolves to nothing fails the call with INTERNAL — the type
+// cannot demand a value here because the other two shapes resolve to none.
+export type StreamServerHandler = (stream: ServerReader<unknown> & ServerWriter<unknown>, ctx: ServerContext) => Promise<unknown>
+export type StreamServerInterceptor = (stream: ServerReader<unknown> & ServerWriter<unknown>, ctx: ServerContext, next: StreamServerHandler) => Promise<unknown>
 
 // ---------------------------------------------------------------------------
 // chaining

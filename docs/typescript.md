@@ -173,15 +173,22 @@ Connect-ES, which applies the last interceptor first); the stream is created
 by the innermost invoker, after the chain, so metadata an interceptor adds
 still rides the OPEN (§8, §11) and is validated there; and on a unary call in
 unreliable mode `call.opts.timeoutMs` already holds T_call when the chain sees
-it, as Go sets the ctx deadline before its chain runs (§10.2). An interceptor
-may skip `next` (a cache), call it again (a retry — every call is a fresh
-stream), or wrap what it returns.
+it, as Go sets the ctx deadline before its chain runs (§10.2), and the budget
+is absolute across the chain as a ctx deadline is: a retrying interceptor's
+later attempts carry the remainder, an exhausted one fails
+`DEADLINE_EXCEEDED` before reaching the wire, and an interceptor that sets a
+different `timeoutMs` starts a new budget from that point. An interceptor may
+skip `next` (a cache), call it again (a retry — every call is a fresh stream,
+and `onHeader` / `onTrailer` fire once per attempt), or wrap what it returns.
 
-What differs from grpc-go's signatures: a server stream interceptor gets one
-`next` for the three streaming shapes and reads `ctx.desc` to tell them apart,
-and for a client-streaming call the value the chain resolves to is the
-response. Under the Connect binding a Conn's own chain runs inside Connect's:
-the drpc transport sits at the centre of that onion.
+What differs from grpc-go's signatures: `next` is async on the server and a
+unary interceptor resolves to the response — the type rejects a void arrow,
+so awaiting `next` without returning is a compile error rather than an empty
+message; a server stream interceptor gets one `next` for the three streaming
+shapes and reads `ctx.desc` to tell them apart; and for a client-streaming
+call the value the chain resolves to is the response (resolving to nothing
+fails the call with `INTERNAL`). Under the Connect binding a Conn's own chain
+runs inside Connect's: the drpc transport sits at the centre of that onion.
 
 ## What the port deliberately does not have
 

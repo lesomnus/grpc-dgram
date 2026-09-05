@@ -363,16 +363,27 @@ export class Conn {
       timeoutCause = statusError(Code.DEADLINE_EXCEEDED, 'drpc: default call timeout')
     }
     const call: ClientCall<Req, Res> = { desc, opts: merged }
-    // The default's cause only names T_call if the chain left it in place.
-    const tcall = merged.timeoutMs
-    const last: UnaryInvoker = (r, c) => this.doInvoke(r, c, c.opts.timeoutMs === tcall ? timeoutCause : undefined)
-    const out = this.unaryInt === undefined ? await last(req, call) : await this.unaryInt(req, call, last)
+    // The budget is absolute across the chain, as a ctx deadline is in Go: a
+    // retrying interceptor's later attempts get the remainder, not a fresh
+    // budget — unless the chain replaced timeoutMs, which starts a new one
+    // from that point (a new ctx deadline). The default's cause survives
+    // only with the budget it named. A remainder that has run out fails the
+    // attempt at arm time, before anything reaches the wire.
+    const budget = merged.timeoutMs
+    const deadlineAt = budget === undefined ? undefined : nowMs() + budget
+    const last: UnaryInvoker = (r, c) => {
+      if (deadlineAt === undefined || c.opts.timeoutMs !== budget) return this.doInvoke(r, c, undefined)
+      return this.doInvoke(r, { desc: c.desc, opts: { ...c.opts, timeoutMs: deadlineAt - nowMs() } }, timeoutCause)
+    }
+    const out: unknown = this.unaryInt === undefined ? await last(req, call) : await this.unaryInt(req, call, last)
+    // The types demand a response; a JS caller can still resolve to nothing.
+    if (out === undefined) throw statusError(Code.INTERNAL, 'drpc: the interceptor chain resolved to no response')
     return out as Res
   }
 
   // doInvoke is the innermost unary invoker: the stream is created here, after
   // the chain, so the OPEN carries the interceptor-final options (§8, §11).
-  private async doInvoke(req: unknown, call: ClientCall, timeoutCause: StatusError | undefined): Promise<unknown> {
+  private async doInvoke(req: unknown, call: ClientCall, timeoutCause: StatusError | undefined): Promise<NonNullable<unknown>> {
     const { desc, opts: merged } = call
     const s = this.createStream(desc, merged, timeoutCause)
     let err: StatusError | undefined
@@ -404,7 +415,7 @@ export class Conn {
     if (merged.onHeader !== undefined) merged.onHeader(await s.header())
     if (merged.onTrailer !== undefined) merged.onTrailer(s.trailer())
     if (err !== undefined) throw err
-    return out
+    return out as NonNullable<unknown>
   }
 
   // newStream starts a streaming call. The stream is created by the innermost
