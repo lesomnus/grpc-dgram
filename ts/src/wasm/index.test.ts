@@ -357,6 +357,27 @@ describe('teardown is wired for you (§4.5)', () => {
     expect(go.resumes).toBe(1)
   })
 
+  it('cancels the timers Go left pending, so an exit is not an endless warning', async () => {
+    // The other half of defusing. wasm_exec's timer callback is
+    // `_resume(); while (_scheduledTimeouts.has(id)) { console.warn(…); _resume() }`
+    // and wasmExit does not clear the map — the real _resume throws its way
+    // out of that loop once exited, and a no-op returns into it, forever, one
+    // warning per turn until whatever collects console output runs out of
+    // memory. Any program that exits inside a time.Sleep leaves such a timer.
+    const go = new FakeGo()
+    serving(go)
+    const conn = (await here(go)).dial()
+    expect(await conn.invoke(echo.once, { text: 'hi' })).toEqual({ text: 'echo:hi' })
+
+    let fired = 0
+    go._scheduledTimeouts.set(7, setTimeout(() => fired++, 5))
+    go.exit()
+    await tick()
+    expect(go._scheduledTimeouts.size).toBe(0) // the loop's own condition, emptied
+    await new Promise((res) => setTimeout(res, 25))
+    expect(fired).toBe(0) // and the timer itself never fires
+  })
+
   it('a trap arrives as the cause instead', async () => {
     const go = new FakeGo()
     serving(go)

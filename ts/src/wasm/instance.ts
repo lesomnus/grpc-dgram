@@ -251,9 +251,25 @@ function live(name: string, go: GoLike, serve: ServeFn, run: Promise<void>, time
 // it should have been — legal only because run() has settled, after which
 // every call into it would have thrown anyway. Structural, since _resume is
 // wasm_exec's own field and not part of GoLike.
+//
+// The no-op alone is not enough, and the reason is the other half of the same
+// wasm_exec code. A timer Go scheduled before it exited is still pending —
+// wasmExit deletes the instance but not `_scheduledTimeouts` — and the
+// callback it fires is `this._resume(); while (this._scheduledTimeouts.has(id))
+// { console.warn("scheduleTimeoutEvent: missed timeout event"); this._resume() }`.
+// The real _resume, once exited, throws out of that loop; a no-op returns into
+// it, and the loop has no other exit: it spins, one warning per iteration,
+// until whatever collects console output runs out of memory. Any Go program
+// that exits inside a time.Sleep, a ticker, or a deadline has such a timer.
+// So the pending timers are cleared too, and the map emptied, which is the
+// loop's own condition — a callback already queued finds nothing and returns.
 function makeInert(go: GoLike): void {
-  const inner = go as { _resume?: () => void }
+  const inner = go as { _resume?: () => void; _scheduledTimeouts?: Map<number, ReturnType<typeof setTimeout>> }
   if (typeof inner._resume === 'function') inner._resume = noop
+  if (inner._scheduledTimeouts instanceof Map) {
+    for (const t of inner._scheduledTimeouts.values()) clearTimeout(t)
+    inner._scheduledTimeouts.clear()
+  }
 }
 
 // ---------------------------------------------------------------------------

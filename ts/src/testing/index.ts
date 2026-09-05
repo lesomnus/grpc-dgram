@@ -161,6 +161,10 @@ export class FakeGo {
     this.resumes++
   }
   resumes = 0
+  // The timers Go scheduled through wasm_exec's scheduleTimeoutEvent and has
+  // not cleared: what an exit inside a time.Sleep leaves behind, and what
+  // makeInert must cancel (see instance.ts).
+  _scheduledTimeouts = new Map<number, ReturnType<typeof setTimeout>>()
   // onRun stands in for main(): a server publishes, a broken one exits.
   onRun: (go: FakeGo) => void = () => {}
   private readonly finished: Promise<void>
