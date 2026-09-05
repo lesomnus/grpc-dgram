@@ -292,6 +292,21 @@ The client-side names are the `ConnOption` spellings of the dial options:
 `WithUnaryInterceptor`, `WithChainUnaryInterceptor`, `WithStreamInterceptor`,
 `WithChainStreamInterceptor`.
 
+The TypeScript port has the same chains, same order, in a TS-native shape —
+arrays on `ConnOptions` / `ServerOptions`, a `(req, ctx, next)` function
+instead of grpc-go's signature ([typescript.md](./typescript.md#interceptors)):
+
+```ts
+const srv = new Server(tx, {
+  unaryInterceptors: [
+    async (req, ctx, next) => {
+      console.log(`${ctx.method} from ${String(ctx.peer)}`)
+      return next(req, ctx)
+    },
+  ],
+})
+```
+
 **The divergence to know:** the `cc *grpc.ClientConn` parameter is always
 `nil`. A `drpc.Conn` is a `ClientConnInterface`, not a `*grpc.ClientConn`, and
 there is no honest value to pass. A ported interceptor that calls

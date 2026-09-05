@@ -205,9 +205,10 @@ else maps to `UNKNOWN`).
 | `NewPeerContext` / `NewReliableContext` | `FrameContext { peer, reliable, signal }` argument to `handle` |
 | mutexes + atomics | none needed: state transitions are synchronous between `await` points |
 | `WithProtocolStats(obs)` (repeatable) | `protocolStats: obs` or `protocolStats: [obs, …]` on `ConnOptions` / `ServerOptions`; `Counters.observe` is the ready-made observer |
+| `WithChainUnaryInterceptor(…)` / `ChainUnaryInterceptors(…)` and the stream twins | `unaryInterceptors: […]` / `streamInterceptors: […]` on `ConnOptions` / `ServerOptions` — same order (element 0 outermost), `(req, call, next)` shape; see `docs/typescript.md` |
 
-Deliberately not ported (yet): client/server interceptors, the `stats.Handler`
-bridge (a grpc-go type; the drpc half of the observability surface,
+Deliberately not ported (yet): the `stats.Handler` bridge (a grpc-go type; the
+drpc half of the observability surface,
 `ProtocolStats`/`Counters`, is ported — `protocolStats` on `ConnOptions` and
 `ServerOptions`, `docs/observability.md`), and `Envelop` batching
 (`Coalescer` — deferred to M8 in Go; every envelop carries one frame, as the

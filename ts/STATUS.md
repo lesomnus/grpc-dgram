@@ -45,6 +45,7 @@ each).
 | `conn.ts` | `Conn` + `ClientStream`, client unreliable-mode machinery | `conn.go`, `stream.go`, `unreliable.go` |
 | `server.ts` | `Server` + server stream, per-peer state, sweep, caps | `server.go`, `stream.go`, `unreliable_server.go` |
 | `stats.ts` | `ProtocolStats` observer type, `ProtocolEvent`, `Counters` — the §14 gap counter and the other datagram-only events | `stats.go` (the `ProtocolStats` half; the `stats.Handler` half has no TS twin) |
+| `interceptor.ts` | Unary/stream, client/server interceptor types in a `(…, next)` shape, and the chain fold — element 0 outermost, the last element gets the real invoker/handler | the interceptor chains of `conn.go` / `server.go` (grpc-go's order; TS-native signatures, arrays instead of single-vs-chain options) |
 | `transport/webrtc/` | `DataChannelTransport` (client) + `DataChannelGateway` (server, mixed-mode) | `transport/pion/*.go` |
 | `transport/websocket/` | `WebSocketTransport` + `dialWebSocket` → `Conn` (client), gateway/`servePeer` (server), reliable | `transport/gorilla/*.go` |
 | `transport/port/` | `PortTransport` + `dialWorker` → `Conn`, `PortGateway` over `postMessage`, reliable; teardown is the empty-message goodbye plus `close(cause)` | `transport/jsport/*.go` |
@@ -54,7 +55,7 @@ each).
 
 Verified at this commit:
 
-- `pnpm test` → **397 passing** (22 files). Unit and per-adapter tests are
+- `pnpm test` → **416 passing** (23 files). Unit and per-adapter tests are
   co-located next to their source (`src/wire.test.ts`,
   `src/transport/connect/index.test.ts`, …); cross-cutting integration tests
   (e2e, timeout, restart, limits, conformance, wasm, protobufes-gen, stats —
@@ -148,7 +149,7 @@ represent; the message and status always surface.
 ## Deliberately NOT ported (not gaps)
 
 Do not "fix" these — they are intentional, matching the Go feature set or TS
-idiom: client/server **interceptors**; the **`stats.Handler` bridge** (Go's
+idiom: the **`stats.Handler` bridge** (Go's
 `WithStatsHandler` takes a grpc-go type with no TS counterpart — the drpc
 half, `ProtocolStats`/`Counters`, IS ported: `src/stats.ts`,
 `docs/observability.md`); **`Envelop` batching / `Coalescer`**
@@ -224,7 +225,7 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
    bytes — so a TS client and the Go server address the same methods with the
    same encoding. Regenerate the fixture with `pnpm gen`. Core stays zero-dep;
    verified the core bundles carry no `@bufbuild/protobuf` reference.)*
-5. Optional parity with Go stretch items if/when they land there: interceptors,
+5. Optional parity with Go stretch items if/when they land there:
    `Coalescer` batching.
 
 ## Build / test

@@ -13,6 +13,7 @@
 
 import type { CallOptions, MethodDesc, NamedCodec, PayloadCodec } from './desc'
 import { isUnary } from './desc'
+import { chain2, type StreamServerHandler, type StreamServerInterceptor, type UnaryServerInterceptor } from './interceptor'
 import { resolveLimits, resolveRxConfig, type Limits, type ResolvedLimits, type ResolvedRxConfig, type RxBufferConfig } from './limits'
 import { metadataJoin, validateMetadata, type Metadata } from './metadata'
 import { RxVerdict, RxWindow, TxSeq } from './seq'
@@ -104,6 +105,12 @@ export interface ServerOptions {
   // would turn a deliberate lockdown into an open door.
   maxRecvMsgSize?: number
   maxSendMsgSize?: number
+  // Interceptor chains (interceptor.ts). Element 0 runs outermost; the last
+  // element is handed the registered handler — grpc-go's order
+  // (ChainUnaryInterceptors / ChainStreamInterceptors). One stream chain
+  // serves all three streaming shapes; ctx.desc tells them apart.
+  unaryInterceptors?: UnaryServerInterceptor[]
+  streamInterceptors?: StreamServerInterceptor[]
   // Observers of the protocol events gRPC has no concept of (PROTOCOL.md
   // §14; stats.ts) — the twin of ConnOptions.protocolStats. Every event a
   // server emits names the transport peer it concerns, which is what makes a
@@ -157,7 +164,11 @@ export interface ServerContext {
   // Incoming request metadata from the OPEN frame (§11).
   readonly metadata: Metadata | undefined
   readonly peer: unknown
+  // Full method name (§13) — desc.path — and the descriptor it was
+  // registered under, which is how a stream interceptor tells the three
+  // streaming shapes apart (clientStreams / serverStreams).
   readonly method: string
+  readonly desc: MethodDesc
   // Call deadline (epoch ms) when the client propagated a budget (§10.2).
   readonly deadline: number | undefined
   // Joins metadata into the pending header (§11). It rejects — StatusError
@@ -408,6 +419,11 @@ export class Server {
   private sawUnreliable = false
   private readonly sw = new Sweeper()
 
+  // The folded interceptor chains; undefined = none, and the call goes
+  // straight to the registered handler (server.go NewServer).
+  private readonly unaryInt: UnaryServerInterceptor | undefined
+  private readonly streamInt: StreamServerInterceptor | undefined
+
   constructor(tx: FrameHandler, opts: ServerOptions = {}) {
     this.epoch = nonzeroEpoch()
     this.tx = tx
@@ -425,6 +441,8 @@ export class Server {
     this.maxSend = sizeOr(opts.maxSendMsgSize, DEFAULT_MAX_SEND_MSG_SIZE)
     this.stallMs = opts.timing?.stallMs ?? DEFAULT_STALL_MS
     this.pstats = statsSink(opts.protocolStats)
+    this.unaryInt = chain2(opts.unaryInterceptors)
+    this.streamInt = chain2(opts.streamInterceptors)
   }
 
   // protoEvent reports one peer-scope protocol event (stats.ts): the transport
@@ -727,7 +745,8 @@ export class Server {
         // The request rides the OPEN; it is decompressed and size-capped like
         // any received message (§12.1).
         const req = await st.decodeMessage(open)
-        resp = await (st.reg.handler as UnaryHandler<unknown, unknown>)(req, st.context)
+        const h = st.reg.handler as UnaryHandler<unknown, unknown>
+        resp = this.unaryInt === undefined ? await h(req, st.context) : await this.unaryInt(req, st.context, h)
       } catch (e) {
         err = toStatusError(e)
       }
@@ -759,18 +778,24 @@ export class Server {
       const desc = st.reg.desc
       let err: StatusError | undefined
       try {
-        if (!desc.clientStreams) {
-          // Server-streaming: the request rode the OPEN (§8).
-          const req = await st.recv()
-          if (req === undefined) throw statusError(Code.UNKNOWN, 'missing request message')
-          await (st.reg.handler as ServerStreamingHandler<unknown, unknown>)(req, st, st.context)
-        } else if (!desc.serverStreams) {
-          // Client-streaming: the handler's return value is the response,
+        // The innermost handler runs the registered one in its shape. It
+        // uses the stream and ctx it is handed, not st: an interceptor may
+        // wrap either (grpc-go's WrapServerStream idiom).
+        const last: StreamServerHandler = async (stream, ctx) => {
+          if (!desc.clientStreams) {
+            // Server-streaming: the request rode the OPEN (§8).
+            const req = await stream.recv()
+            if (req === undefined) throw statusError(Code.UNKNOWN, 'missing request message')
+            return (st.reg.handler as ServerStreamingHandler<unknown, unknown>)(req, stream, ctx)
+          }
+          if (!desc.serverStreams) return (st.reg.handler as ClientStreamingHandler<unknown, unknown>)(stream, ctx)
+          return (st.reg.handler as BidiHandler<unknown, unknown>)(stream, ctx)
+        }
+        const out = this.streamInt === undefined ? await last(st, st.context) : await this.streamInt(st, st.context, last)
+        if (desc.clientStreams && !desc.serverStreams) {
+          // Client-streaming: what the chain resolves to is the response,
           // riding the terminal frame (§8 SendAndClose).
-          const resp = await (st.reg.handler as ClientStreamingHandler<unknown, unknown>)(st, st.context)
-          st.setResponse(resp)
-        } else {
-          await (st.reg.handler as BidiHandler<unknown, unknown>)(st, st.context)
+          st.setResponse(out)
         }
       } catch (e) {
         err = toStatusError(e)
@@ -1285,6 +1310,7 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
       },
       peer,
       method: reg.desc.path,
+      desc: reg.desc,
       get deadline() {
         return self.deadlineAt
       },

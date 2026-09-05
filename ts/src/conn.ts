@@ -8,6 +8,7 @@
 // blocking region are marked where the translation still needs them.
 
 import type { CallOptions, ForcedCodec, MethodDesc, PayloadCodec } from './desc'
+import { chain1, chain2, type ClientCall, type StreamClientInterceptor, type UnaryClientInterceptor, type UnaryInvoker } from './interceptor'
 import { DropPolicy, resolveLimits, resolveRxConfig, type Limits, type ResolvedLimits, type ResolvedRxConfig, type RxBufferConfig } from './limits'
 import { validateMetadata, type Metadata } from './metadata'
 import { RxVerdict, RxWindow, TxSeq } from './seq'
@@ -120,6 +121,12 @@ export interface ConnOptions {
   // call with INTERNAL before it starts.
   compressors?: Record<string, Compressor>
   defaultCallOptions?: CallConfig
+  // Interceptor chains (interceptor.ts). Element 0 runs outermost; the last
+  // element is handed the Conn's own invoker/streamer — grpc-go's order
+  // (WithChainUnaryInterceptor / WithChainStreamInterceptor), the reverse of
+  // Connect-ES. Folded once here, not per call.
+  unaryInterceptors?: UnaryClientInterceptor[]
+  streamInterceptors?: StreamClientInterceptor[]
   // Observers of the protocol events gRPC has no concept of — skipped
   // messages, rx drops, RESETs, retransmissions, probes, liveness expiry,
   // tombstone replays, flow-control stalls (PROTOCOL.md §14; stats.ts). One
@@ -203,6 +210,11 @@ export class Conn {
   private lastPing = 0
   private readonly sw = new Sweeper()
 
+  // The folded interceptor chains; undefined = none, and the call goes
+  // straight to the invoker (Go's pass-through, conn.go NewConn).
+  private readonly unaryInt: UnaryClientInterceptor | undefined
+  private readonly streamInt: StreamClientInterceptor | undefined
+
   constructor(tx: FrameHandler, opts: ConnOptions = {}) {
     this.epoch = nonzeroEpoch()
     this.tx = tx
@@ -223,6 +235,8 @@ export class Conn {
     this.maxSend = sizeOr(opts.maxSendMsgSize, DEFAULT_MAX_SEND_MSG_SIZE)
     this.stallMs = opts.timing?.stallMs ?? DEFAULT_STALL_MS
     this.pstats = statsSink(opts.protocolStats)
+    this.unaryInt = chain2(opts.unaryInterceptors)
+    this.streamInt = chain1(opts.streamInterceptors)
 
     // Last, with the Conn fully usable: the transport may start delivering
     // frames from inside attachConn.
@@ -336,7 +350,10 @@ export class Conn {
     if (typeof cl === 'function') cl.call(this.tx)
   }
 
-  // invoke performs a unary call (grpc-go Invoke parity).
+  // invoke performs a unary call (grpc-go Invoke parity). The endpoint
+  // defaults and T_call are folded in before the interceptor chain runs, as
+  // Go sets the ctx deadline before its chain: an interceptor sees the
+  // effective timeoutMs and may still replace it.
   async invoke<Req, Res>(desc: MethodDesc<Req, Res>, req: Req, opts: CallConfig<Req, Res> = {}): Promise<Res> {
     const merged: CallConfig<Req, Res> = { ...(this.defaults as CallConfig<Req, Res>), ...opts }
     let timeoutCause: StatusError | undefined
@@ -345,10 +362,21 @@ export class Conn {
       merged.timeoutMs = this.mode.timing.callMs
       timeoutCause = statusError(Code.DEADLINE_EXCEEDED, 'drpc: default call timeout')
     }
+    const call: ClientCall<Req, Res> = { desc, opts: merged }
+    // The default's cause only names T_call if the chain left it in place.
+    const tcall = merged.timeoutMs
+    const last: UnaryInvoker = (r, c) => this.doInvoke(r, c, c.opts.timeoutMs === tcall ? timeoutCause : undefined)
+    const out = this.unaryInt === undefined ? await last(req, call) : await this.unaryInt(req, call, last)
+    return out as Res
+  }
 
+  // doInvoke is the innermost unary invoker: the stream is created here, after
+  // the chain, so the OPEN carries the interceptor-final options (§8, §11).
+  private async doInvoke(req: unknown, call: ClientCall, timeoutCause: StatusError | undefined): Promise<unknown> {
+    const { desc, opts: merged } = call
     const s = this.createStream(desc, merged, timeoutCause)
     let err: StatusError | undefined
-    let out: Res | undefined
+    let out: unknown
     try {
       try {
         await s.sendRaw(req)
@@ -376,16 +404,25 @@ export class Conn {
     if (merged.onHeader !== undefined) merged.onHeader(await s.header())
     if (merged.onTrailer !== undefined) merged.onTrailer(s.trailer())
     if (err !== undefined) throw err
-    return out as Res
+    return out
   }
 
-  // newStream starts a streaming call. For client-streaming and bidi the
-  // eager OPEN is sent at stream creation, so the server can start the
-  // handler and push even if the client never sends (PROTOCOL.md §8).
+  // newStream starts a streaming call. The stream is created by the innermost
+  // streamer, after the interceptor chain, so the OPEN sees the chain's final
+  // options (PROTOCOL.md §8; conn.go NewStream).
   newStream<Req, Res>(desc: MethodDesc<Req, Res>, opts: CallConfig<Req, Res> = {}): ClientStream<Req, Res> {
     const merged: CallConfig<Req, Res> = { ...(this.defaults as CallConfig<Req, Res>), ...opts }
-    const s = this.createStream(desc, merged, undefined)
-    if (desc.clientStreams) void s.sendOpen()
+    const call: ClientCall<Req, Res> = { desc, opts: merged }
+    const s = this.streamInt === undefined ? this.doNewStream(call) : this.streamInt(call, (c) => this.doNewStream(c))
+    return s as ClientStream<Req, Res>
+  }
+
+  // doNewStream is the innermost streamer. For client-streaming and bidi the
+  // eager OPEN is sent at stream creation, so the server can start the
+  // handler and push even if the client never sends (PROTOCOL.md §8).
+  private doNewStream(call: ClientCall): ClientStream<unknown, unknown> {
+    const s = this.createStream(call.desc, call.opts, undefined)
+    if (call.desc.clientStreams) void s.sendOpen()
     return s
   }
 

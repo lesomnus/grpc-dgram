@@ -140,12 +140,55 @@ value inside a `string`, which is grpc-go's own convention; a JS string cannot,
 so the TS API uses base64 and converts at the codec boundary. Both put the same
 bytes on the wire — the conformance test above is what proves it.
 
+## Interceptors
+
+Both ends take interceptor chains as arrays on their options —
+`unaryInterceptors` / `streamInterceptors` on `ConnOptions` and
+`ServerOptions` — in a TS-native shape: a function over the call and a
+`next`, with no single-vs-chain split.
+
+```ts
+const conn = new Conn(adapter, {
+  unaryInterceptors: [
+    async (req, call, next) => {
+      call.opts = { ...call.opts, metadata: { ...call.opts.metadata, authorization: ['bearer …'] } }
+      return next(req, call)
+    },
+  ],
+})
+
+const server = new Server(adapter, {
+  streamInterceptors: [
+    async (stream, ctx, next) => {
+      console.log(ctx.method, ctx.desc.clientStreams, ctx.desc.serverStreams)
+      return next(stream, ctx)
+    },
+  ],
+})
+```
+
+What carries over from Go: element 0 runs outermost and the last element is
+handed the real invoker or handler (grpc-go's chain order — the reverse of
+Connect-ES, which applies the last interceptor first); the stream is created
+by the innermost invoker, after the chain, so metadata an interceptor adds
+still rides the OPEN (§8, §11) and is validated there; and on a unary call in
+unreliable mode `call.opts.timeoutMs` already holds T_call when the chain sees
+it, as Go sets the ctx deadline before its chain runs (§10.2). An interceptor
+may skip `next` (a cache), call it again (a retry — every call is a fresh
+stream), or wrap what it returns.
+
+What differs from grpc-go's signatures: a server stream interceptor gets one
+`next` for the three streaming shapes and reads `ctx.desc` to tell them apart,
+and for a client-streaming call the value the chain resolves to is the
+response. Under the Connect binding a Conn's own chain runs inside Connect's:
+the drpc transport sits at the centre of that onion.
+
 ## What the port deliberately does not have
 
-Client/server **interceptors**, the **`stats.Handler` bridge** (grpc-go's
-type; the drpc half, `ProtocolStats`/`Counters`, is ported — see
-[observability.md](./observability.md#typescript)), and **`Envelop`
-batching** — the last one is unbuilt in Go too ([TODO.md](./TODO.md)). These
+The **`stats.Handler` bridge** (grpc-go's type; the drpc half,
+`ProtocolStats`/`Counters`, is ported — see
+[observability.md](./observability.md#typescript)) and **`Envelop`
+batching** — the latter is unbuilt in Go too ([TODO.md](./TODO.md)). These
 are gaps, not divergences: the wire is identical either way.
 
 One more gap is sequenced rather than deliberate, and until it closes it *is*

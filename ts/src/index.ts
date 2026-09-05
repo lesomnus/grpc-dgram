@@ -7,6 +7,7 @@ export {
   Conn,
   EndOfStreamError,
   statusDetails,
+  type CallConfig,
   type ConnOptions,
   type DetailedStatusError,
   type FlowTiming,
@@ -27,6 +28,17 @@ export {
   type ServerStreamingDesc,
   type UnaryDesc,
 } from './desc'
+export {
+  type ClientCall,
+  type StreamClientInterceptor,
+  type Streamer,
+  type StreamServerHandler,
+  type StreamServerInterceptor,
+  type UnaryClientInterceptor,
+  type UnaryInvoker,
+  type UnaryServerHandler,
+  type UnaryServerInterceptor,
+} from './interceptor'
 export { DropPolicy, type Limits, type RxBufferConfig } from './limits'
 export {
   cloneMetadata,

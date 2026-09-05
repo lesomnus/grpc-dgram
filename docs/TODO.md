@@ -65,10 +65,9 @@ above, (3) a §4.1/§10.7 spec revision to match.
 
 ## 3. TypeScript parity, if and when it is wanted
 
-The port deliberately stops short of the Go feature set in three places
+The port deliberately stops short of the Go feature set in two places
 (`ts/STATUS.md` has the reasoning):
 
-- client/server **interceptors**;
 - the **`stats.Handler` bridge** — `ProtocolStats`/`Counters` are ported
   (`ts/src/stats.ts`, so a browser client reports the §14 gap counter), but the
   grpc-go `stats.Handler` type has no TS counterpart and is not mirrored;

@@ -5,7 +5,7 @@
 import { create } from '@bufbuild/protobuf'
 import { Code as ConnectCode, ConnectError, createClient } from '@connectrpc/connect'
 import { describe, expect, it } from 'vitest'
-import { Conn } from '../../conn'
+import { Conn, type ConnOptions } from '../../conn'
 import { createDrpcTransport } from './index'
 import { fromService } from '../protobuf-es'
 import { Server } from '../../server'
@@ -19,10 +19,10 @@ async function* iterate<T>(items: T[]): AsyncIterable<T> {
 }
 
 // A reliable in-memory pipe wired to a Connect client backed by a drpc Conn.
-function connectClient() {
+function connectClient(connOpts: ConnOptions = {}) {
   let server!: Server
   let conn!: Conn
-  conn = new Conn({ handle: async (f) => void (await server.handle(f, { peer: 'p' })) }, { reliable: true })
+  conn = new Conn({ handle: async (f) => void (await server.handle(f, { peer: 'p' })) }, { reliable: true, ...connOpts })
   server = new Server({ handle: async (f) => void (await conn.handle(f, {})) }, { reliable: true })
 
   server.register(Echo.once, (req, ctx) => {
@@ -155,5 +155,35 @@ describe('Connect client over drpc', () => {
     const err = await client.once({ message: 'x' }).catch((e) => e)
     expect(err).toBeInstanceOf(ConnectError)
     expect(err.code).toBe(ConnectCode.Unimplemented)
+  })
+})
+
+describe('native interceptors under the Connect transport', () => {
+  // The drpc transport sits at the centre of Connect's onion: a Conn's own
+  // interceptor chain runs inside whatever Connect wraps around it, and what
+  // it adds still rides the OPEN.
+  it('a Conn interceptor sees and shapes every Connect call', async () => {
+    const methods: string[] = []
+    const { client } = connectClient({
+      unaryInterceptors: [
+        async (req, call, next) => {
+          methods.push(call.desc.path)
+          call.opts = { ...call.opts, metadata: { ...call.opts.metadata, authorization: ['bearer t'] } }
+          return next(req, call)
+        },
+      ],
+      streamInterceptors: [
+        (call, next) => {
+          methods.push(call.desc.path)
+          return next(call)
+        },
+      ],
+    })
+    const res = await client.once({ message: 'hi' })
+    expect(res.message).toBe('echo:hi')
+    const got: string[] = []
+    for await (const r of client.many({ message: 'm', repeat: 2 })) got.push(r.message)
+    expect(got).toEqual(['m#0', 'm#1'])
+    expect(methods).toEqual(['/echo.EchoService/Once', '/echo.EchoService/Many'])
   })
 })
