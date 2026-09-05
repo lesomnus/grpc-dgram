@@ -50,6 +50,18 @@ type Conn struct {
 	exhausted bool
 	closed    bool
 
+	// Connection flow control (reliable mode, PROTOCOL.md §4.2.1): connTx is
+	// credit for what this side sends to the server across all calls, connRx
+	// bounds what the server has buffered here (Limits.MaxPeerWindow).
+	// srvEpoch is the server incarnation connTx is counted against — the
+	// Conn-level twin of the per-stream lock (guarded by mu): a restarted
+	// server on a surviving channel (§10.6) counts from zero, so the sender
+	// starts over when a call first accepts a frame from a new one.
+	connTx      flowSender
+	connRx      peerFlowRx
+	srvEpoch    uint32
+	srvEpochSet bool
+
 	// Peer-liveness clocks (unreliable mode, PROTOCOL.md §10.4).
 	lastRx   atomic.Int64
 	lastTx   atomic.Int64
@@ -93,6 +105,15 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 	// as it does on gRPC (PROTOCOL.md §6.4).
 	if p, ok := tx.(TransportPeer); ok {
 		v.peer = p.Peer()
+	}
+	if v.mode.reliable {
+		// The connection window (§4.2.1): this side paces itself by W_conn
+		// from its first data frame — the server's first per-stream
+		// advertisement settles it, a sid-0 WINDOW adds to it — and bounds
+		// the server by MaxPeerWindow. Unreliable mode has neither: a full
+		// buffer there drops by policy (§4.2).
+		v.connTx.assume(wConn)
+		v.connRx.enable(uint32(v.limits.MaxPeerWindow), 0)
 	}
 	if opt.call_opts != nil {
 		v.call_opts = append(v.call_opts, opt.call_opts...)
@@ -154,13 +175,27 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 	// Conn's calls or clocks: sids restart at 1 across restarts, so a sid
 	// match means nothing without the epoch echo.
 	if f.GetPeerEpoch() != c.epoch {
-		if f.isPing() && sid == 0 {
-			return nil // another incarnation's keepalive: not ours to answer
+		if sid == 0 && (f.isPing() || f.shape() == FlagWindow) {
+			// Another incarnation's keepalive or connection grant: not ours
+			// to answer (§9.1).
+			return nil
 		}
 		// Tell the desynced server to stop (§9.3): the RESET echoes the
 		// offending frame's peer_epoch, so exactly that incarnation's call
 		// dies at the server.
 		return c.sendReset(ctx, f)
+	}
+
+	if sid == 0 && f.shape() == FlagWindow {
+		// A connection grant (§4.2.1): additive credit for this side's sends
+		// to the server across all calls. Only the incarnation the sender is
+		// counted against may credit it — a grant from any other is dropped
+		// in silence, as is one in unreliable mode; it never enables, never
+		// refreshes liveness and never draws a RESET (§9.1, §9.3).
+		if c.mode.reliable && c.serverEpochIs(f.GetEpoch()) {
+			c.connTx.grant(f.GetWindow())
+		}
+		return nil
 	}
 
 	if f.shape() == FlagWindow {
@@ -195,6 +230,21 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 		return nil
 	}
 
+	// A sequenced server frame for a call this side no longer has still
+	// names the incarnation that answered one of this Conn's OPENs — as
+	// validated as the RESET decision below — so the Conn locks to it here
+	// exactly as a live call's first accepted frame would (§4.2.1 Restart).
+	// The one raise the server sends rides right behind its first H, and a
+	// Conn whose first streaming call died before that H arrived would
+	// otherwise drop the raise as a stranger's and stay at W_conn against a
+	// larger window for its whole life: a forever-park (§4.2.1 Raise).
+	c.lockServerEpoch(ctx, f.GetEpoch())
+
+	// Whatever happens to it below, a data frame for a call this side no
+	// longer has spent one connection credit at the server and is never
+	// buffered: return it, or the window shrinks for good (§4.2.1).
+	c.creditUnbuffered(ctx, f)
+
 	c.mu.Lock()
 	tomb := c.tombs[sid]
 	c.mu.Unlock()
@@ -211,6 +261,103 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 	// Unknown sid: tell the desynced server to stop — no OPEN can ever
 	// arrive at a client (PROTOCOL.md §9.3).
 	return c.sendReset(ctx, f)
+}
+
+// lockServerEpoch is called with the epoch of a sequenced server frame that
+// answers one of this Conn's calls — a live call's first accepted frame, or
+// one for a call already released (Handle's no-live-stream path, a done
+// stream): the Conn locks to the first incarnation it hears and starts its
+// connection sender over when it hears a new one (§4.2.1, §10.6). The dead
+// incarnation's calls die by RESET on their own; what must not survive it is
+// the sender's count, which the new server never saw. The new incarnation
+// has never seen this side's window either, so the raise is due again — its
+// container exists, it just answered a call. A reliable channel is ordered,
+// so a dead incarnation's frame never follows a live one's (§10.6).
+func (c *Conn) lockServerEpoch(ctx context.Context, epoch uint32) {
+	c.mu.Lock()
+	changed := c.srvEpochSet && c.srvEpoch != epoch
+	c.srvEpoch, c.srvEpochSet = epoch, true
+	c.mu.Unlock()
+	if !changed || !c.mode.reliable {
+		return
+	}
+	c.connTx.reassume(wConn)
+	c.connRx.renew()
+	c.raise(ctx)
+}
+
+// serverEpochIs reports whether epoch names the server incarnation the Conn
+// is locked to — what a connection grant must echo to count.
+func (c *Conn) serverEpochIs(epoch uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.srvEpochSet && c.srvEpoch == epoch
+}
+
+// serverCurrent reports whether a frame from epoch still has someone to
+// return connection credit to: the incarnation the Conn is locked to, or any
+// while it is locked to none. Frames of an incarnation the Conn moved past
+// leave the buffer uncredited — their calls are RESET-failed anyway (§10.6),
+// and the new server never counted them.
+func (c *Conn) serverCurrent(epoch uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.srvEpochSet || c.srvEpoch == epoch
+}
+
+// creditUnbuffered returns the connection credit of a data frame this side
+// received and will never buffer — off-shape, unknown flag, seq failure, a
+// call it no longer has, an overrun refusal (§4.2.1). It never touched
+// outstanding. Anything but a reliable-mode data frame spent no credit.
+func (c *Conn) creditUnbuffered(ctx context.Context, f *Frame) {
+	if !c.mode.reliable || !f.isData() || !c.serverCurrent(f.GetEpoch()) {
+		return
+	}
+	if g := c.connRx.unadmitted(f.GetEpoch(), 1); g > 0 {
+		c.grantPeer(ctx, g)
+	}
+}
+
+// retirePeer returns the connection credit of n admitted frames of a call
+// locked to epoch that stopped occupying its buffer: consumed, or discarded
+// with the call (§4.2.1).
+func (c *Conn) retirePeer(ctx context.Context, n uint32, epoch uint32) {
+	if n == 0 {
+		return
+	}
+	if g := c.connRx.retire(epoch, n, c.serverCurrent(epoch)); g > 0 {
+		c.grantPeer(ctx, g)
+	}
+}
+
+// raise lifts the server's assumed W_conn to this side's MaxPeerWindow, once
+// per server incarnation (§4.2.1): a sid-0 grant of the difference, right
+// behind the first OPEN — the server's container for this incarnation exists
+// from then on. It is a MUST, not an optimisation: this side's grant cadence
+// is computed against MaxPeerWindow, so a sender left at W_conn against a
+// larger window would park before any batched grant fired.
+func (c *Conn) raise(ctx context.Context) {
+	if g := c.connRx.raise(); g > 0 {
+		c.grantPeer(ctx, g)
+	}
+}
+
+// grantPeer transmits a connection-window grant: sid 0, seq 0, no payload
+// (§4.2.1, §7). It is a control frame like any other — outside every lock,
+// so a blocking adapter never wedges Handle — and pointless once the Conn is
+// closed.
+func (c *Conn) grantPeer(ctx context.Context, n uint32) {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return
+	}
+	f := &Frame{}
+	f.SetEpoch(c.epoch)
+	f.SetFlags(FlagWindow)
+	f.SetWindow(n)
+	c.tx.Handle(ctx, f)
 }
 
 // Close fails every live call with UNAVAILABLE. Adapters call it when the
@@ -230,6 +377,9 @@ func (c *Conn) Close(err error) {
 	c.closed = true
 	c.mu.Unlock()
 	c.failAll(st)
+	// A sender parked on connection credit has no call left to wake it
+	// through — its stream's release only covers the stream window (§4.2.1).
+	c.connTx.release()
 	c.sw.stop()
 	c.connEnd()
 	if cl, ok := c.tx.(io.Closer); ok {

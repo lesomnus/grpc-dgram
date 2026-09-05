@@ -49,6 +49,16 @@ const (
 	// EventFlowResume when it got some (§4.2, reliable mode).
 	EventFlowStall
 	EventFlowResume
+	// EventPeerFlowStall: a sender parked because the peer's CONNECTION
+	// window was empty — whether or not its stream window had credit too: a
+	// send short on both waits on the peer's whole budget, and reports this
+	// pair (§4.2.1, §14) — and EventPeerFlowResume when it got some
+	// (reliable mode). Distinct
+	// from EventFlowStall because the remedies differ: a stream stall is
+	// "this consumer stopped", a peer stall is "raise MaxPeerWindow or find
+	// the other slow consumer". Both carry the parked call's Sid and Method.
+	EventPeerFlowStall
+	EventPeerFlowResume
 )
 
 func (k ProtocolEventKind) String() string {
@@ -79,6 +89,10 @@ func (k ProtocolEventKind) String() string {
 		return "flow-stall"
 	case EventFlowResume:
 		return "flow-resume"
+	case EventPeerFlowStall:
+		return "peer-flow-stall"
+	case EventPeerFlowResume:
+		return "peer-flow-resume"
 	}
 	return "unknown"
 }
@@ -125,6 +139,8 @@ type Counters struct {
 	dataLoss        atomic.Uint64
 	flowStall       atomic.Uint64
 	flowResume      atomic.Uint64
+	peerFlowStall   atomic.Uint64
+	peerFlowResume  atomic.Uint64
 }
 
 // CounterSnapshot is a point-in-time read of Counters.
@@ -140,8 +156,10 @@ type CounterSnapshot struct {
 	LivenessExpired uint64
 	TombstoneReplay uint64
 	DataLoss        uint64 // calls failed by window overrun (§6.3)
-	FlowStall       uint64 // sends parked on flow-control credit
+	FlowStall       uint64 // sends parked on stream flow-control credit
 	FlowResume      uint64 // parked sends that got credit and continued
+	PeerFlowStall   uint64 // sends parked on the peer's connection window (§4.2.1)
+	PeerFlowResume  uint64 // parked sends that got connection credit and continued
 }
 
 func (c *Counters) ProtocolEvent(ev ProtocolEvent) {
@@ -173,6 +191,10 @@ func (c *Counters) ProtocolEvent(ev ProtocolEvent) {
 		c.flowStall.Add(1)
 	case EventFlowResume:
 		c.flowResume.Add(1)
+	case EventPeerFlowStall:
+		c.peerFlowStall.Add(1)
+	case EventPeerFlowResume:
+		c.peerFlowResume.Add(1)
 	}
 }
 
@@ -191,6 +213,8 @@ func (c *Counters) Snapshot() CounterSnapshot {
 		DataLoss:        c.dataLoss.Load(),
 		FlowStall:       c.flowStall.Load(),
 		FlowResume:      c.flowResume.Load(),
+		PeerFlowStall:   c.peerFlowStall.Load(),
+		PeerFlowResume:  c.peerFlowResume.Load(),
 	}
 }
 

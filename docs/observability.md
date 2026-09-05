@@ -25,6 +25,7 @@ model those events cannot happen — HTTP/2 has no lost messages to count.
 | Is the loss the network's, or my consumer's? | `Skipped` vs `Dropped` |
 | Is the peer still there? | `LivenessExpired`, `KeepaliveSent` |
 | Why is this stream slow on a reliable channel? | `FlowStall` / `FlowResume` |
+| Is it this consumer, or the peer's whole budget? | `FlowStall` vs `PeerFlowStall` |
 | Who is flooding me with junk? | `ResetSent`, `TombstoneReplay` (both name the peer) |
 
 Both options may be given more than once, on either endpoint, and are
@@ -228,15 +229,18 @@ atomically. `drpc.ProtocolStatsFunc` adapts a plain function.
 | `LivenessExpired` | No validated frame from the peer for `T_live`; every live call fails `UNAVAILABLE` and server handlers are cancelled (§10.4). | The peer vanished — process death, NAT rebinding, a black-holed path. Any non-zero value is a real outage for the calls that were live. |
 | `TombstoneReplay` | A duplicate OPEN or straggler drew a stored terminal back out (§9.2). | The peer is not receiving our terminals, so it keeps retrying — or one peer is poking finished calls. The event names the peer and the sid. |
 | `DataLoss` | `K_loud` (3) mutually consistent beyond-window frames arrived with no accepted frame between them: a loss burst wider than `W_fwd` (4096) frames. The call fails `DATA_LOSS` (§6.3). | A path that is dropping most of what you send — classically a PMTU black hole where small frames pass and large ones die. This is the one loss that is loud. |
-| `FlowStall` | A send parked with no flow-control credit left (§4.2.1). Reliable mode only. | The receiving application is not draining its stream. Other calls on the channel keep flowing — that is the point — but this one is stopped. |
-| `FlowResume` | A parked send got credit and continued. | Paired with `FlowStall`. **`FlowStall` without a matching `FlowResume` is a sender still parked right now**; after `T_stall` (default 30 s) the send fails `UNAVAILABLE`. |
+| `FlowStall` | A send parked with no credit left on its **stream** window (§4.2.1). Reliable mode only. | The receiving application is not draining its stream. Other calls on the channel keep flowing — that is the point — but this one is stopped. |
+| `FlowResume` | A parked send got stream credit and continued. | Paired with `FlowStall`. **`FlowStall` without a matching `FlowResume` is a sender still parked right now**; after `T_stall` (default 30 s) the send fails `UNAVAILABLE`. |
+| `PeerFlowStall` | A send parked because the peer's **connection** window was empty (§4.2.1): the peer already holds `MaxPeerWindow` messages across all of its calls. Reliable mode only. Carries the parked call's sid and method. | Not this consumer — the parked call is healthy, or short on both windows at once. Either other consumers on that channel are holding the budget (find them: their calls show `FlowStall`), or the workload needs more than 1024 messages in flight to one peer and `Limits.MaxPeerWindow` is the knob. Against a peer on the pre-connection-window text it fires on every streaming send past 1024 cumulative messages and never resumes: `PeerFlowStall` rising one per failed send with `PeerFlowResume` flat is the Direction A signature (Appendix A, entry 11). |
+| `PeerFlowResume` | A send parked on the connection window got credit and continued. | Paired with `PeerFlowStall`, with the same reading: a `PeerFlowStall` without its resume is a sender parked on the peer right now, `T_stall` away from `UNAVAILABLE` (`the peer granted no connection credit`). A send short on both windows reports this pair — the peer's whole budget is what it waits on, not one consumer. |
 
 Mode matters when reading these. `Skipped`, `Dropped` and `DataLoss` are
 **unreliable mode only** — a reliable channel that loses or reorders a frame
 fails the call with `INTERNAL` instead of counting anything (§10.6), which is
-the correct behavior for a transport that promised not to. `FlowStall` and
-`FlowResume` are **reliable mode only**, since that is the mode flow control
-exists in. `Retransmit`, `ProbeSent`, `KeepaliveSent` and `LivenessExpired`
+the correct behavior for a transport that promised not to. `FlowStall`,
+`FlowResume`, `PeerFlowStall` and `PeerFlowResume` are **reliable mode
+only**, since that is the mode flow control exists in. `Retransmit`,
+`ProbeSent`, `KeepaliveSent` and `LivenessExpired`
 require the protocol timers, which reliable mode turns off; there, transport
 death detection is the adapter's job.
 
@@ -354,7 +358,8 @@ observer := drpc.ProtocolStatsFunc(func(ev drpc.ProtocolEvent) {
 table above (`skipped`, `dropped`, `off-shape`, `reset-sent`,
 `reset-received`, `retransmit`, `probe-sent`, `keepalive-sent`,
 `liveness-expired`, `tombstone-replay`, `data-loss`, `flow-stall`,
-`flow-resume`). Note `Count`: `Counters` adds it for `Skipped`, `Dropped` and
+`flow-resume`, `peer-flow-stall`, `peer-flow-resume`). Note `Count`:
+`Counters` adds it for `Skipped`, `Dropped` and
 `OffShape` and adds 1 for everything else, so a raw event handler that ignores
 `Count` will under-report gaps.
 
@@ -394,7 +399,10 @@ interface ProtocolEvent {
 Everything in [Every event](#every-event) holds verbatim: the same kinds, emitted
 from the same decision points, with the same fields — `peer` on every
 server-side event, `sid` and `method` on every call-scope one, `count` only for
-`skipped`, `dropped` and `off-shape`. `protocolStats` accepts one observer or an
+`skipped`, `dropped` and `off-shape`. (The `peer-flow-stall` /
+`peer-flow-resume` pair arrives with the port's connection window, which
+follows the Go core; until then a TS endpoint has no connection window to
+stall on.) `protocolStats` accepts one observer or an
 array, which is the TS spelling of "`WithProtocolStats` may be given more than
 once". `Counters.observe` is an arrow property, so it can be handed over
 unbound, and `snapshot()` returns a copy.

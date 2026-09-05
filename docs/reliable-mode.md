@@ -112,7 +112,7 @@ one channel's two ends disagree.
 | Aged watermark | `hwm_aged` with checkpoints | degenerate: plain `sid > hwm` |
 | `T_hold` (delayed RESET) | `RTI` | **0** — nothing is ever merely reordered |
 | seq validation | 4096-frame window, fail-loud at `K_loud` | any gap or duplicate fails the call `INTERNAL` |
-| rx buffering | drop per `DropNewest`/`DropOldest` | per-stream flow control |
+| rx buffering | drop per `DropNewest`/`DropOldest` | per-stream **and per-peer** flow control |
 | Liveness responsibility | the protocol | **the adapter** (§4.5) — non-optional |
 
 The strict sequencing is the visible half. A gap or a duplicate on a channel
@@ -125,11 +125,13 @@ only mean the transport made one.
 otherwise reliable pipe and asserts that; `websocket-echo` asserts the
 positive form, that `Count` delivers `1..N` with no gaps.
 
-## Per-stream flow control
+## Flow control
 
 This is the newest part of reliable mode (wire v1.1) and the least obvious.
 It is HTTP/2's per-stream window, counted in **messages** rather than bytes,
-and it exists to remove one specific failure.
+and it exists to remove one specific failure. A second window sits beside it
+— [the connection window](#the-connection-window), one per peer — and bounds
+what a peer can pin across all of its calls at once.
 
 A reliable adapter delivers every call's frames from **one** read loop
 (§4.2), because that is what makes its blocking propagate into TCP/SCTP
@@ -217,6 +219,85 @@ That frame never reached the wire, and gRPC lets a handler ignore what `Send`
 returns; without the refund such a handler would leak its whole window and
 then park on every later message until `T_stall`.
 
+### The connection window
+
+A stream window bounds one call. What a *peer* could pin across all of its
+calls was, until now, `MaxLiveCalls × window` — 4096 × 32 messages at the
+defaults, a number nobody chose. So beside the stream windows there is one
+**connection window** per peer, HTTP/2's connection-level window counted in
+messages (§4.2.1): a data frame needs one credit from its stream **and** one
+from the peer, and a receiver holds at most `Limits.MaxPeerWindow` messages
+from one peer at a time, whatever the calls. Three things make it different
+from the stream window.
+
+- **It is never advertised.** Every sender assumes `W_conn` = **1024
+  messages** toward each peer and counts from its first data frame. The
+  peer's first per-stream advertisement settles that assumption — a window
+  above 0 confirms it, 0 turns it off — and only a *streaming* call's
+  creation-ack `H` does so on the client: a unary `T` carries no window and
+  never settles anything, so a `Conn` that only ever made unary calls stays
+  on the assumption. On the server the first OPEN it admits from a client
+  incarnation settles it, unary included, since every reliable-mode OPEN
+  carries the client's window. Because the assumption is the whole of the
+  sender's initial credit, `MaxPeerWindow` has a **floor of 1024**: a
+  receiver holding less would be overrun by a conforming sender — the
+  `W_init` argument again. A receiver configured *above* it lifts the sender
+  once, with a `sid = 0` grant of the difference right behind its first OPEN
+  (client) or its first creation ack to that incarnation (server).
+  `TestPeerWindow_UnaryTerminalNeverSettles`,
+  `TestPeerWindow_StreamingAckWithWindowZeroTurnsItOff` and
+  `TestPeerWindow_RaiseBehindFirstOpen` pin the three halves of that rule.
+- **Credit rides `WINDOW` with `sid = 0`.** A grant on sid 0 credits the
+  peer's connection window; every other sid credits its call, as before.
+  The receiver returns one credit for **every** data frame it received, once,
+  when the frame stops occupying a buffer: consumed by the application,
+  discarded with a call that ended first, or never buffered at all — an
+  off-shape frame, a frame for a call that is already gone (the ones
+  pipelined behind an abort, which each draw a RESET on a reliable channel),
+  a frame the window itself refused. The window is cumulative for the life
+  of the peer, so a credit that never came back would be a permanent shrink,
+  which is why the ledger counts what is physically buffered and junk cannot
+  desync it (`TestPeerWindow_NeverBufferedFramesReturnCredit` and its server
+  twin). Grants batch at half the window like stream grants — and fire
+  regardless whenever the peer would otherwise be starved, so seventeen stuck
+  consumers pinning most of the window cannot cost a healthy eighteenth its
+  `T_stall` (`TestPeerWindow_StarvationClause`).
+- **Scope.** The receiver's bound is per **transport peer** on the server —
+  across client epochs, as `MaxLiveCalls` is counted, so a restarting or
+  epoch-spoofing peer holds no more than an honest one
+  (`TestLimits_PeerWindowScope`) — and per `Conn` on the client. The sender's
+  credit is per incarnation: one per (peer, client-epoch) container on the
+  server, one per `Conn` on the client, started over from `W_conn` if the
+  `Conn` hears a new server incarnation on a surviving channel
+  (`TestPeerWindow_ReassumeOnNewServerEpoch`). The `Conn` locks to a server
+  incarnation on the first sequenced frame it hears from it, for a live call
+  or for one it has already released — the server's raise rides right behind
+  its first creation ack, and a `Conn` that only locked from live calls would
+  drop it when that call was cancelled before the ack arrived
+  (`TestPeerWindow_RaiseSurvivesACancelledFirstCall`). And because the
+  ledger is per peer while grants are per incarnation, what it holds back is
+  held back per incarnation too: a restarted client's returned credit never
+  rides in a grant addressed to its dead predecessor
+  (`TestPeerWindow_CreditIsGrantedToTheIncarnationThatSpentIt`).
+
+A send takes stream credit first and refunds it if the peer's window turns
+out to be empty, so a stream parked on its own window never holds a piece of
+the shared budget. There is one park and one `T_stall` for both windows.
+
+Nothing changes at the defaults for the flows that exist today: 1024 messages
+is 32 full stream windows, so a sender never parks on the connection window
+with fewer than 32 saturated streams, and no `sid = 0` frame appears until 512
+messages have been consumed in one direction — a stream's first WINDOW is
+still its own, the flows the existing tests move never see one, and a
+receiver at the floor has nothing to raise by.
+`TestPeerWindow_ParksAcrossStreamsAndKeepsTheChannelLive` is the scenario the
+window exists for: two 600-message streams nobody reads, on a channel whose
+stream buffers are deep enough that no stream window binds, and a unary `Once`
+that still returns while both producers park on the peer's window;
+`TestPeerWindow_GoToGoPastWConnBothWays` moves 1200 messages each way across
+three streams under the defaults, which completes only because both ends
+grant on sid 0.
+
 ### What a parked sender looks like
 
 Nothing new appears in the API. A parked sender is a `SendMsg` that has not
@@ -265,8 +346,12 @@ is cancelled or its deadline expires; the call ends underneath the sender
 `T_stall` (default **30 s**) is the only bound reliable mode owns itself.
 Everything else delegates to the adapter, but a park happens *before* the
 adapter's write path, so its write deadline never sees one, and no protocol
-timer is running. Past `T_stall` the call fails `UNAVAILABLE` (`the peer
-granted no credit for 30s`) rather than hanging.
+timer is running. Past `T_stall` the call fails `UNAVAILABLE` rather than
+hanging, and the message names the window that starved it: `the peer granted
+no credit for 30s` for the stream's, `the peer granted no connection credit
+for 30s` for the peer's. A send that parks on its stream window and later on
+the connection window gets one budget, not two — `T_stall` is armed at the
+first park and measures the whole wait.
 
 ```go
 _ = drpc.NewConn(tx,
@@ -288,7 +373,19 @@ block is stalling. Instead the receiver fails **that one call** with
 `INTERNAL` (`peer exceeded the advertised flow-control window`) and the
 channel keeps running for everyone else.
 
-Two rules keep a grant from becoming a weapon (§4.2.1, §15):
+The connection window has the same rule at the peer level. A data frame that
+would take a peer past `MaxPeerWindow` is not buffered, and the call it
+belongs to fails `INTERNAL` (`peer exceeded the connection flow-control
+window`) — that call only, never the peer
+(`TestPeerWindow_OverrunFailsOnlyTheOffendingCall`, both roles). HTTP/2
+answers the same violation by closing the connection; here the connection is
+the adapter's (§4.5), and closing it from inside the read loop would turn one
+accounting slip — two `Conn`s sharing a channel, a client restarted at the
+same address on a datagram channel — into an outage for every call. The
+refused frame's credit goes back like any other never-buffered frame's, so
+the bound holds either way.
+
+Three rules keep a grant from becoming a weapon (§4.2.1, §15):
 
 - A `WINDOW` for an unknown, finished or tombstoned sid is dropped **in
   silence**, never answered with a `RESET`. A grant legitimately races the
@@ -299,7 +396,17 @@ Two rules keep a grant from becoming a weapon (§4.2.1, §15):
   one stray, duplicated or injected `WINDOW` could park a sender that was
   never paced at all. Unreliable mode ignores `window` and `WINDOW` outright:
   no advertisement on the OPEN, no grants sent, injected grants inert
-  (`TestFlow_UnreliableModeIgnoresWindow`).
+  (`TestFlow_UnreliableModeIgnoresWindow`,
+  `TestPeerWindow_Sid0GrantIgnoredInUnreliableMode`).
+- A `WINDOW` on `sid = 0` credits only a connection window that exists: on
+  the client one locked to the server incarnation the frame names, on the
+  server the container of the client incarnation it names. Anything else —
+  a grant before any OPEN, one naming a foreign epoch, one for a window the
+  peer turned off — is dropped in silence, creates nothing, and answers
+  nothing (`TestPeerWindow_Sid0GrantGate`, both roles). The bound itself is
+  enforced on what is actually buffered, never on what was granted, so a
+  forged grant can over-credit a sender but cannot make the receiver hold
+  more.
 
 ### Watching it
 
@@ -308,7 +415,8 @@ counters := &drpc.Counters{}
 _ = drpc.NewServer(tx, drpc.WithProtocolStats(counters))
 
 snap := counters.Snapshot()
-log.Printf("flow stalls: %d, resumes: %d", snap.FlowStall, snap.FlowResume)
+log.Printf("stream stalls: %d/%d, peer stalls: %d/%d",
+    snap.FlowStall, snap.FlowResume, snap.PeerFlowStall, snap.PeerFlowResume)
 ```
 
 `EventFlowStall` fires at the moment a send first parks — while it is still
@@ -316,6 +424,17 @@ parked, which is what a stall counter has to report — and `EventFlowResume`
 when that same send gets credit and continues. Rising `FlowStall` matched by
 `FlowResume` is healthy back-pressure; `FlowStall` without `FlowResume` is a
 consumer that stopped, heading for `T_stall`.
+
+`EventPeerFlowStall` / `EventPeerFlowResume` are the same pair for the
+connection window, and they are separate because the remedies differ. A
+stream stall is *this consumer stopped*: find it. A peer stall is *the peer's
+whole budget is spent*: the parked call is healthy, and some other consumers
+on that channel are holding the window — or the workload genuinely needs more
+than 1024 messages in flight to one peer, and `MaxPeerWindow` is the knob.
+Both carry the parked call's sid and method. A send short on both windows
+reports the connection one: the peer's whole budget is what it waits on, not
+one consumer, and the stream pair is for a send whose peer still had credit
+to give (`TestPeerWindow_CountersPeerFlow`, `TestPeerWindow_SingleStallBudget`).
 
 ## Sizing the buffer
 
@@ -337,6 +456,29 @@ The `DropPolicy` argument is inert here — nothing is dropped in reliable
 mode — and any size below 32 is raised to the `W_init` floor. Deeper windows
 buy throughput on a high-latency link (fewer round trips waiting for credit)
 at the cost of a larger burst a stalled consumer can pin in memory.
+
+The connection window is sized with `Limits`, on either role — it is one of
+the two `Limits` fields a `Conn` honours:
+
+```go
+_ = drpc.NewServer(gw,
+    // Each transport peer may have 4096 messages buffered here, all calls
+    // and client incarnations together.
+    drpc.WithLimits(drpc.Limits{MaxPeerWindow: 4096}),
+)
+_ = drpc.NewConn(tx,
+    // The one peer this Conn talks to.
+    drpc.WithLimits(drpc.Limits{MaxPeerWindow: 4096}),
+)
+```
+
+Values below 1024 are raised to it — a sender assumes that much — so the
+memory one peer can pin is min(`MaxLiveCalls` × per-call buffer,
+`MaxPeerWindow`) messages, times the adapter's frame size. A deployment that
+needs a tighter pin than 1024 messages lowers `MaxLiveCalls` or the per-call
+buffer; a deployment with many concurrently saturated streams to one peer
+raises `MaxPeerWindow`, and the raise reaches the peer as a single `sid = 0`
+grant behind the first OPEN or creation ack.
 
 ## The adapter's teardown duty
 
@@ -411,4 +553,8 @@ conforming peer cannot post what it has no credit for.
   version of this page: mode auto-detected, exact sequence asserted,
   `GracefulStop` draining a live stream.
 - [`flow_test.go`](../flow_test.go) and [`flow.go`](../flow.go) — every
-  flow-control claim above, pinned end to end, plus the window accounting.
+  per-stream claim above, pinned end to end, plus the window accounting;
+  [`flow_peer_client_test.go`](../flow_peer_client_test.go),
+  [`flow_peer_server_test.go`](../flow_peer_server_test.go) and
+  [`flow_unit_test.go`](../flow_unit_test.go) — the connection window, from
+  the ledger arithmetic up to a Go↔Go channel past `W_conn` both ways.

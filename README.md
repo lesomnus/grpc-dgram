@@ -55,9 +55,9 @@ subsequence** instead of stalling.
 | Client & server deadlines | ✅ propagated on the wire, enforced both ends |
 | Default timeout / liveness so lost frames never hang a call | ✅ core design (see [Guarantees](#guarantees)) |
 | Reliable transports: loss machinery off, violations fail loud (`INTERNAL` on a seq gap/duplicate) | ✅ auto-detected per transport / per peer — see [Reliable transports](#reliable-transports) |
-| Per-stream flow control on reliable channels (no head-of-line blocking) | ✅ HTTP/2-shaped windows, counted in messages |
+| Per-stream and per-peer flow control on reliable channels (no head-of-line blocking; bounded memory per peer) | ✅ HTTP/2-shaped windows, counted in messages |
 | Per-stream buffering & drop policy (`DropNewest` / `DropOldest`) | ✅ per method / per role |
-| Resource caps (tombstones, live calls, reset maps) | ✅ bounded under a junk flood |
+| Resource caps (tombstones, live calls, reset maps, buffered messages per peer) | ✅ bounded under a junk flood |
 | Transport adapters: UDP, WebSocket, pion/webrtc, JS message port | ✅ [`transport/udp`](./transport/udp), [`transport/gorilla`](./transport/gorilla), [`transport/pion`](./transport/pion), [`transport/jsport`](./transport/jsport) |
 | A server compiled to `js/wasm`, served to the page over a message port | ✅ [`transport/jsport`](./transport/jsport) ↔ [`ts/…/transport/port`](./ts/src/transport/port) — same wire as WebSocket, both ends in one process |
 | Browser / Node TypeScript port (client + server, same wire) | ✅ [`ts/`](./ts) — WebRTC DataChannel, WebSocket, JS message port, Node UDP, protobuf-es & Connect-ES bindings |
@@ -140,8 +140,10 @@ stops its *own* producer instead of losing messages: each stream carries a
 credit window (advertised on the OPEN and on the creation ack, refreshed as
 the application consumes), so the sender parks and **other calls on the same
 channel keep flowing** — the head-of-line blocking a single blocking receiver
-would otherwise impose, and the reason gRPC has per-stream HTTP/2 windows.
-This is the path to
+would otherwise impose, and the reason gRPC has per-stream HTTP/2 windows. A
+second window per peer (`Limits.MaxPeerWindow`, 1024 messages by default)
+bounds what one peer can have buffered across *all* of its calls, as HTTP/2's
+connection window does. This is the path to
 **plain gRPC-over-WebSocket / reliable-datachannel** semantics, and it is
 auto-detected with zero options: `transport/gorilla` and `transport/jsport`
 always advertise reliable, and `transport/pion` derives it from each data

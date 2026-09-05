@@ -29,6 +29,15 @@
 > head-of-line blocking a single blocking receiver used to impose on every call
 > sharing its channel. Appendix A lists the deltas.
 >
+> **v1.1 (2026-09-05)** adds a **per-peer connection window** beside the
+> per-stream one (§4.2.1). No wire change — same fields, same flags — but a
+> new obligation: a `WINDOW` frame with `sid = 0`, which the previous text
+> dropped in silence, credits the peer's aggregate window; a reliable-mode
+> receiver bounds what one peer may have buffered across all of its calls
+> (`Limits.MaxPeerWindow`, §15); and a sender assumes `W_conn` (§10.1) toward
+> every peer. A peer on the previous text parks a streaming sender at `W_conn`,
+> which is why this lands before the wire freeze (Appendix A, entry 11).
+>
 > **What this document pins down:** the on-wire encoding and the normative
 > behaviors that two independent implementations must agree on. **What may
 > still evolve compatibly:** timer *defaults* (§10.1), resource *cap* defaults
@@ -156,11 +165,12 @@ type EnvelopHandler interface { Handle(ctx context.Context, e *Envelop) error }
   remaining options applies depends on whether the stream is flow-controlled
   (§4.2.1):
   - **Flow-controlled (the normal case):** a conforming sender never exceeds
-    the window it was granted, so a full buffer is a contract violation. The
-    receiver MUST NOT block — it fails **that call** with `INTERNAL`. Blocking
-    here is what flow control exists to remove, and it would deadlock: the
-    grant that would unpark the peer travels the very read loop the block
-    stalls.
+    the credit it holds — on the call's window or on the peer's connection
+    window (§4.2.1) — so a full buffer on either is a contract violation. The
+    receiver MUST NOT block — it fails **that call** with `INTERNAL`, never
+    the peer. Blocking here is what flow control exists to remove, and it
+    would deadlock: the grant that would unpark the peer travels the very
+    read loop the block stalls.
   - **Not flow-controlled** (a peer that advertised no window): `Handle`
     blocks until the stream buffer drains, bounded by the rx `ctx` (adapter
     teardown) and by the call's own end (a frame for a finished call is
@@ -176,14 +186,19 @@ type EnvelopHandler interface { Handle(ctx context.Context, e *Envelop) error }
   out-of-band — a keepalive write failure, `OnClose`/`OnError` callbacks, a
   send stall — and cancel the rx ctx from there (the shipped adapters do).
 
-### 4.2.1 Per-stream flow control (reliable mode)
+### 4.2.1 Flow control (reliable mode)
 
-Message-level flow control, in the shape of HTTP/2's per-stream windows but
-counted in **messages** rather than bytes. It exists for one reason: without
-it the only back-pressure a receiver has is to stall its read loop, and since
-a reliable adapter delivers every call's frames from **one** loop (§4.2), one
-slow consumer stalls every call on the channel — the head-of-line blocking
-gRPC does not have.
+Message-level flow control, in the shape of HTTP/2's windows but counted in
+**messages** rather than bytes. Two windows compose, as RFC 9113 §6.9.1's do.
+The **per-stream window** exists for one reason: without it the only
+back-pressure a receiver has is to stall its read loop, and since a reliable
+adapter delivers every call's frames from **one** loop (§4.2), one slow
+consumer stalls every call on the channel — the head-of-line blocking gRPC
+does not have. The **connection window**, one per peer, bounds what a peer can
+pin across **all** of its calls (§15): without it the aggregate is
+`MaxLiveCalls × window`, a number no receiver chose.
+
+**Per-stream window**
 
 - **Scope.** Reliable mode only. Unreliable mode ignores `window` and the
   `WINDOW` flag entirely: there a full buffer drops by policy, and a peer that
@@ -202,24 +217,201 @@ gRPC does not have.
   configured buffer to it. The advertisement is **authoritative** and replaces
   the assumption, counted against what the sender has already sent — a smaller
   window simply parks the sender until the receiver drains.
-- **Grants.** A `WINDOW` frame (§7) carries additive credit for its sid in
-  `window`. A receiver SHOULD grant once the application has consumed at least
+- **Grants.** A `WINDOW` frame (§7) with `sid ≠ 0` carries additive credit for
+  that call in `window` (`sid = 0` credits the peer's connection window,
+  below). A receiver SHOULD grant once the application has consumed at least
   half the window (one small frame per window/2 messages); it MUST grant
   whenever the sender could otherwise starve. A receiver MUST NOT grant after
   its call has ended, and a `WINDOW` frame for an unknown, finished or
-  tombstoned sid MUST be dropped **silently** — never answered with a RESET
-  (§9.3), since a grant legitimately races the call's end.
-- **Sending.** A sender consumes one credit per **data frame**. `OPEN`, `H`,
-  `T`, half-close, abort, RESET, PING and WINDOW frames are never credited:
-  they are not buffered, and crediting them would make a call at zero credit
-  unable to terminate (G1). A sender with no credit parks — bounded by the
-  call's own ctx/deadline, by the call ending, and by `T_stall` (§10.1), after
-  which the call fails `UNAVAILABLE`. That bound is load-bearing: reliable
-  mode runs no protocol timers and the park happens before the adapter's write
-  path, so nothing else would ever break it.
+  tombstoned sid ≠ 0 MUST be dropped **silently** — never answered with a
+  RESET (§9.3), since a grant legitimately races the call's end.
+- **Sending.** A sender consumes one credit per **data frame** — from the
+  call's window and, at the same time, from the peer's connection window
+  (below). `OPEN`, `H`, `T`, half-close, abort, RESET, PING and WINDOW frames
+  are never credited on either: they are not buffered, and crediting them
+  would make a call at zero credit unable to terminate (G1). A sender with no
+  credit parks — bounded by the call's own ctx/deadline, by the call ending,
+  and by `T_stall` (§10.1), after which the call fails `UNAVAILABLE`. That
+  bound is load-bearing: reliable mode runs no protocol timers and the park
+  happens before the adapter's write path, so nothing else would ever break
+  it.
 - **A grant never enables flow control by itself.** Only an advertisement
-  does. Otherwise a single stray, duplicated or injected `WINDOW` frame could
-  park a sender that was never flow-controlled (§15).
+  does — for the per-stream window and for the connection window alike.
+  Otherwise a single stray, duplicated or injected `WINDOW` frame could park a
+  sender that was never flow-controlled (§15).
+
+**Connection window**
+
+One window per peer, beside the per-stream ones, bounding the messages a
+peer may have buffered at the receiver across all of its calls. Everything the
+per-stream rules say that is not restated here applies unchanged: control
+frames are uncredited, `T_stall` bounds a park, a grant never enables.
+
+- **Scope.** Reliable mode only. The two halves of the window have different
+  scopes, because the memory bounded is pinned by a *transport peer* while a
+  sender's count belongs to one *incarnation*:
+  - the **receiver's bound** is per **transport peer, across client epochs**
+    on the server — one ledger per peer key (§6.4), counted exactly as
+    `MaxLiveCalls` is (§15): only a key the peer cannot mint bounds anything —
+    and per `Conn` on the client (one `Conn` = one channel = one peer, §4.3);
+  - the **sender's credit** is per **peer incarnation**: on the server one
+    window per (peer, client-epoch) container (§9.4), on the client one per
+    `Conn`, counted toward the server incarnation the `Conn` is locked to
+    (*Restart*, below).
+- **Assumption.** The connection window is never advertised. Every sender
+  assumes `W_conn` = 1024 messages (§10.1, Appendix B) toward each peer
+  incarnation from the moment it holds state for it — the `Conn` at
+  construction, the server at container creation — and counts every data
+  frame against it from the first. A receiver MUST therefore be able to hold
+  `W_conn` messages from one peer: `MaxPeerWindow` (§15) is floored at
+  `W_conn`, for the same reason the rx buffer is floored at `W_init`.
+- **Settle.** The assumption is settled **exactly once per peer incarnation**
+  by the peer's first per-stream advertisement — the protocol's only "this
+  peer does flow control" signal. `window > 0` **confirms** it: the credit
+  stays as assumed, plus anything already granted on `sid = 0`, counted
+  against what was already sent. `window = 0` turns the connection window
+  **off** toward that peer, as it turns the stream's off. Which advertisement
+  settles is fixed, and a settle that fires on the wrong frame would switch
+  the window off while the peer enforces:
+  - **client:** the first accepted **creation-ack `H`** (§8 — a header frame,
+    payload absent) of a **streaming** call, when it is that stream's first
+    accepted frame. A unary `T` and a `SendHeader`-flushed `H` carry no
+    `window` (§7, §8) and MUST NOT settle; a unary-first `Conn` stays assumed
+    until its first streaming ack.
+  - **server:** the container's first **admitted** `OPEN` (§9.4). Every
+    `OPEN` a reliable-mode client sends carries its advertisement, unary
+    included, so the first admitted call of any shape settles. A rejected
+    `OPEN` creates the container (§9.4) but settles nothing.
+  Nothing else settles it — in particular a `sid = 0` grant does not.
+- **Grants.** A `WINDOW` frame with `sid = 0` carries additive credit for the
+  peer's connection window in `window` (§7): `seq = 0`, no payload, the
+  sender's own `epoch`; server→client it names the client incarnation in
+  `peer_epoch` (§6.1). It is the **only** thing that adds connection credit,
+  and it never enables. A receiver applies it only in reliable mode and only
+  when it holds a connection sender for the incarnation the frame names — the
+  client when the frame's `epoch` is the server incarnation the `Conn` is
+  locked to (*Restart*, below, says when it locks) and its `peer_epoch` the
+  `Conn`'s own epoch; the server when a container exists for (peer, `epoch`),
+  or when it still holds the sender position of one the container cap evicted
+  (§9.4) — and otherwise drops it **silently**: never validated (§9.1), never
+  answered with a RESET (§9.3), never creating state. A grant toward a window
+  that is off is dropped the same way.
+- **Sending.** A data frame needs one credit from the call's window **and**
+  one from the peer's connection window, taken **stream first**: if the
+  connection window is then short, the stream credit is refunded and the
+  sender parks on the connection window. A sender MUST NOT hold one window's
+  credit while parked on the other — streams parked on their own windows would
+  otherwise hoard the shared budget until every stream parks, a mutual
+  `T_stall`. Control frames and the server-streaming `OPEN`'s payload are
+  uncredited on both windows, as above; a send that never reaches the wire —
+  the adapter refused it (§4.4), or the call ended first, between taking the
+  credit and transmitting — refunds both: the connection window is shared by
+  every call to the peer and cumulative for the incarnation's life, so a
+  credit spent on a frame that never went out is a permanent shrink of it,
+  one cancelled call at a time. One park, one bound: the **same** `T_stall`
+  (§10.1), armed at
+  the first park, measures the whole wait across both windows, and on expiry
+  the call fails `UNAVAILABLE` naming the window it was parked on.
+  `Conn.Close` and `DisconnectPeer` (§4.5) release a parked connection sender,
+  as a call's end releases a parked stream sender.
+- **The receiver's ledger.** A receiver MUST NOT hold more than
+  `MaxPeerWindow` buffered messages from one peer (its scope above), and it
+  MUST return **one credit for every reliable-mode data frame it received
+  from that peer**, once — when the frame stops occupying a buffer: when the
+  application **consumed** it; when it was **discarded** because its call
+  ended with it still buffered; or when it was **never buffered** at all —
+  dropped as off-shape (§8), failed by the seq check (§6.3, §7.1) or an
+  unimplemented flag, refused by this very window, ended under, or addressed
+  to a call the receiver no longer has (RESET-drawn, §9.3). Two exclusions,
+  both because the sender never charged the frame: the server-streaming
+  `OPEN` payload (§8), and — client only — data frames of a server incarnation
+  the `Conn` has moved past (*Restart*, below). The server can only return
+  credit to an incarnation it holds flow state for — a container, or the
+  sender position its ledger kept when the container cap evicted one (§9.4),
+  which a RESET-drawn frame credits exactly as it would the container; a data
+  frame from an epoch it holds neither for — one that never opened a call —
+  draws its RESET and nothing else. The window
+  is cumulative for the incarnation's life, so a credit never returned is a
+  permanent shrink. The bound is enforced on what is **buffered**, never on
+  what was granted: a peer that ignores grants is over-credited harmlessly,
+  and junk cannot desync the ledger.
+- **Cadence.** A receiver SHOULD batch: grant once the credit it holds back
+  reaches **half** its window (one small frame per `MaxPeerWindow/2`
+  messages). It MUST grant, whatever it holds back, whenever
+  `buffered + held back ≥ MaxPeerWindow` — with stuck consumers pinning most
+  of the window the half never comes while the sender is out of credit, and a
+  healthy stream would die at `T_stall` with room to spare; at that edge the
+  cost is one grant per message consumed, as in HTTP/2 stacks. Grants continue
+  with **zero live calls** — the per-stream "never after its call has ended"
+  rule does not apply, the ledger outlives every call — and the ledger lives
+  until adapter teardown (`DisconnectPeer` / `Conn.Close`), never swept.
+  Credit is held back and granted per incarnation: each is granted exactly
+  what its own frames returned, in a grant naming it (`peer_epoch`). The
+  bound — what is buffered — is one number per peer, but two incarnations
+  can coexist on one key (*Restart*), and a batch that mixed their returns
+  would be addressed to whichever one's frame completed it: the live one's
+  credit, granted to the dead one, is dropped by the client and lost for good
+  — a permanent shrink of the live sender. The starvation clause reads the
+  shared bound against one incarnation's held-back credit, which can only
+  fire early, never late.
+- **Raise.** A receiver whose `MaxPeerWindow` exceeds `W_conn` MUST lift the
+  sender's assumption **once per peer incarnation** with a `sid = 0` grant of
+  `MaxPeerWindow − W_conn`: the client right behind its first `OPEN` (the OPEN
+  creates the container the grant addresses, admitted or rejected — §9.4) and,
+  when it hears a new server incarnation, at once (the call that heard it has
+  already opened there); the server right behind the first creation-ack `H`
+  it sends to a (peer, client-epoch) container — a unary-only incarnation is
+  owed nothing until its first streaming call, and on an ordered channel the
+  `H` settles the client before the grant lands. The `Conn` locks to the
+  server from that `H` even when it lands on a call the client has already
+  released (*Restart*), so the raise behind it is never dropped as a
+  stranger's. It is a MUST because the receiver's cadence is computed against
+  its own window: a sender left at `W_conn` against a larger one parks before
+  any batched grant fires — and for a receiver above 2 × `W_conn` no grant
+  ever fires, since neither half its window nor a full one can be reached by
+  a sender capped at `W_conn`. A receiver at the floor sends none. It is
+  best-effort against a draining peer: an `OPEN` a stopping server RESETs
+  (§9.4) creates no container, and the raise behind it is lost with the call.
+  A container-cap eviction (§9.4) does not repeat it while the ledger holds
+  the evicted position: the container is recreated from it, raise included.
+  Past the ledger's own cap the position is gone, the recreated container is
+  assumed at `W_conn` and raised again, and the client — whose own raise
+  latch is per server incarnation — is over-credited by up to
+  `MaxPeerWindow − W_conn` (§16).
+- **Restart on a surviving channel.** Each client stream locks to a server
+  epoch (§6.1); the `Conn` likewise locks its connection sender to a server
+  incarnation, on the first sequenced frame it hears from it, for a live call
+  or for one it has already released: a frame that draws a RESET (§9.3) still
+  answers one of this `Conn`'s OPENs and names its epoch, and the server's
+  raise may ride right behind it. When it first hears a **different** server
+  epoch (§10.6 allows a restarted server on a datagram channel forced
+  reliable, §4.3), the `Conn` MUST start its sender over — assumed at
+  `W_conn`, unsettled, nothing sent — treat the raise as due again, drop
+  grants naming the old epoch, and stop returning credit for frames of the
+  incarnation it moved past (their calls are RESET-failed anyway; the new
+  server never counted them). A reliable channel is ordered, so a dead
+  incarnation's frame never follows a live one's. Server side, a client
+  restart at the same peer key is a new container with a fresh sender (§9.4),
+  while the receiver's ledger is inherited across incarnations exactly as
+  `MaxLiveCalls` is (§15) — a dead incarnation's still-buffered frames can
+  cost the new one `INTERNAL` on one call, never a hang, and never its
+  credit: what the ledger holds back is per incarnation (*Cadence*), so the
+  dead one's returns go to the dead one alone.
+- **Overrun.** A data frame that would take the peer past `MaxPeerWindow` is
+  not buffered; the receiver fails **the call it is addressed to** with
+  `INTERNAL` through the same path as a per-stream overrun (§4.2) and returns
+  the frame's credit as never buffered. Never the peer: the core does not call
+  `DisconnectPeer` / `Conn.Close` for it — the transport is the adapter's
+  (§4.5), and closing it from inside the read loop would turn one accounting
+  slip (two `Conn`s on one channel, a client restarted at the same key) into
+  an outage for every call. HTTP/2 answers the same violation with a
+  connection error because its connection is the transport unit; here it is
+  not. A conforming sender never triggers this.
+- **Unreliable mode** has no connection window: no assumption, no ledger, no
+  raise, and a `WINDOW sid = 0` is dropped like every other `WINDOW` there.
+
+**In both windows**
+
 - An adapter's tx `Handle` SHOULD apply backpressure (e.g. WebRTC
   `OnBufferedAmountLow`), bounded by `ctx`. In **reliable mode** the core
   runs no timers and does not bound the tx ctx, so the adapter MUST bound a
@@ -255,8 +447,11 @@ type TransportInfo interface {
   Frames without the annotation run in the server's own mode, so single-mode
   gateways may rely on `TransportInfo` alone. The client needs no
   annotation: one `Conn` is one channel, and its construction-time mode is
-  already per-channel. Either way, discovery exists to satisfy the §10.6
-  mode-agreement rule: both ends of a channel land in the same mode.
+  already per-channel — as is its connection window (§4.2.1), which is why
+  `Limits.MaxPeerWindow` is, with `MaxPendingResets`, one of the two `Limits`
+  fields that apply to a `Conn` (§15). Either way, discovery exists to
+  satisfy the §10.6 mode-agreement rule: both ends of a channel land in the
+  same mode.
 - **Lifecycle discovery (client side):** `NewConn` additionally discovers
   `ConnAttacher` (`AttachConn(*Conn)`) — the transport receives its endpoint
   and starts its own receive machinery, so the client manages no goroutine
@@ -342,7 +537,7 @@ option features.field_presence = IMPLICIT;   // file-wide; exceptions below
 
 message Frame {
   fixed32 epoch        = 1;   // sender's incarnation nonce (§6.1); RESET echoes instead (§9.3).
-  fixed32 sid          = 2;   // stream id (§6.2). 0 = peer-scope control (PING).
+  fixed32 sid          = 2;   // stream id (§6.2). 0 = peer-scope control (PING, WINDOW).
   fixed32 seq          = 3;   // per-stream, per-direction sequence (§6.3).
   uint32  flags        = 4;   // bitmask: 1=OPEN 2=CLOSE 4=RESET 8=PING
                               // 16=WINDOW 32=COMPRESSED (§7); the frame's
@@ -357,7 +552,8 @@ message Frame {
   Metadata header      = 12;  // §11.
   Metadata trailer     = 13;  // §11.
   fixed32 peer_epoch   = 14;  // client-incarnation echo (§6.1); RESET re-echoes it (§9.3).
-  uint32  window       = 15;  // flow-control credit, in messages (§4.2.1).
+  uint32  window       = 15;  // flow-control credit, in messages (§4.2.1);
+                              // on WINDOW sid 0: the peer's connection window.
   string  compressor   = 16;  // message compressor name; OPEN only (§12.1).
   repeated google.protobuf.Any details = 17;  // google.rpc.Status.details (§5).
 }
@@ -384,7 +580,8 @@ Notes:
   collision with `Frame.payload`.
 - `peer_epoch` names the **client incarnation a server frame addresses**: the
   server sets it on every call-addressed frame it sends (data, `H`, `T`,
-  keepalive and probe PINGs) to the client epoch of the call's container; the
+  keepalive and probe PINGs, connection grants — `WINDOW sid=0`, §4.2.1) to
+  the client epoch of the call's container; the
   client accepts a frame only when it names its own epoch (§6.1). A
   client→server RESET re-echoes the offending frame's `peer_epoch` so the
   server resets exactly that incarnation's call (§9.3). Client→server call
@@ -396,8 +593,11 @@ Notes:
   (§4.4) MUST be re-sent without them, and if it still does not fit, as a bare
   `RESOURCE_EXHAUSTED` terminal. Every termination path depends on the
   terminal arriving (§10.7), so nothing may cost it.
-- `window` is a count of **messages**, never bytes (§4.2.1). `compressor`
-  names a message compressor for the whole call, like `codec` (§12.1).
+- `window` is a count of **messages**, never bytes (§4.2.1): an advertisement
+  on `OPEN` and on the creation-ack `H`, an additive grant on `WINDOW` — for
+  the call named by `sid`, or for the peer's connection window when
+  `sid = 0`. `compressor` names a message compressor for the whole call, like
+  `codec` (§12.1).
 - **Metadata values are `bytes`, not text** (§11). gRPC's binary metadata
   (`-bin` keys) carries arbitrary octets, which a proto `string` cannot hold;
   `bytes` and `string` share wire type 2, so text metadata encodes
@@ -444,7 +644,8 @@ Notes:
 ### 6.2 sid
 
 - Client-allocated. Starts at 1, increments by 1 per call, **never reused
-  within an epoch**. `sid = 0` is reserved for peer-scope control (PING §10.4).
+  within an epoch**. `sid = 0` is reserved for peer-scope control (PING
+  §10.4, WINDOW §4.2.1).
 - The sid space is not recycled: after 2³² calls the `Conn` MUST fail new calls
   with `RESOURCE_EXHAUSTED`; the application creates a new `Conn` (new epoch).
   Because sids never wrap, sid comparisons are **plain integer comparisons**
@@ -547,7 +748,12 @@ exists. The old epoch's container is evicted once it has no live calls
 **Reliable mode:** over a connection-oriented transport a restart *is* a
 transport death — §4.5's adapter teardown duty (`Conn.Close` /
 `DisconnectPeer`) does the failing, not epochs. The epochs then isolate the
-next connection from any stragglers of the previous one.
+next connection from any stragglers of the previous one. On a datagram
+channel forced reliable (§4.3) a restart survives the channel, and the
+walkthroughs above apply as written; the one state that must not survive it
+is the connection window's count (§4.2.1): a `Conn` that hears a new server
+incarnation starts its sender over, and a restarted client is a fresh
+container with a fresh sender at the server.
 
 ## 7. Flags
 
@@ -557,7 +763,7 @@ next connection from any stragglers of the previous one.
 | `CLOSE` (2) | both | Sender's direction is finished. **Without `code`** (client only): half-close; the call continues. **With `code`**: terminal — from the server it is the call's result, carrying `trailer` **and `header`** (§11); from the client it is an abort. MAY carry `payload` only where a §8 shape shows it; payload is processed before the close takes effect. |
 | `RESET` (4) | both | Stateless "I have no such call". `epoch` **echoes the offending frame's epoch** and `peer_epoch` re-echoes its `peer_epoch` (§9.3); no payload, `seq = 0`. |
 | `PING` (8) | both | `sid = 0`: peer keepalive (§10.4). `sid ≠ 0`: **stream probe** (§10.5). `seq = 0`, no payload, never delivered to the application. A probe does **not** count as the "first server frame" of §10.3. |
-| `WINDOW` (16) | both | Stateless flow-control grant for `sid`: `window` adds that many messages of credit (§4.2.1). `seq = 0`, no payload, never delivered to the application, reliable mode only. |
+| `WINDOW` (16) | both | Stateless flow-control grant: `window` adds that many messages of credit (§4.2.1). `sid ≠ 0`: for that call's window. `sid = 0`: for the peer's **connection window**; server→client it carries `peer_epoch`. `seq = 0`, no payload, never delivered to the application, never validated, reliable mode only. |
 | `COMPRESSED` (32) | both | **Modifier, not a shape** (§7.1): `payload` is compressed with the call's compressor (§12.1). May ride any payload-bearing frame, including a terminal. |
 
 ### 7.1 Shape and modifier bits
@@ -680,10 +886,17 @@ On every received frame, in order:
 3. **Client only — incarnation echo gate (§6.1):** a frame whose `peer_epoch`
    does not name this `Conn`'s epoch is another incarnation's traffic: it
    resolves against nothing here. Answer an immediate RESET (rate-limited,
-   §9.3) so the desynced server stops that call; a foreign keepalive
-   (`PING sid=0`) is simply dropped. Such frames refresh no liveness.
+   §9.3) so the desynced server stops that call; a foreign keepalive or
+   connection grant (`PING sid=0`, `WINDOW sid=0`) is simply dropped. Such
+   frames refresh no liveness.
 4. `PING sid=0` → refresh peer liveness (§10.4); done.
-   `WINDOW` (any sid) → in reliable mode, credit the named call and stop; in
+   `WINDOW sid=0` → in reliable mode, credit the peer's connection window
+   when this side holds a connection sender for the incarnation the frame
+   names — server: a container for (peer, `epoch`); client: the server
+   incarnation the `Conn` is locked to — else drop; in unreliable mode, drop.
+   Never validated, never answered with a RESET, never state-creating
+   (§4.2.1); done.
+   `WINDOW sid≠0` → in reliable mode, credit the named call and stop; in
    unreliable mode, drop. A WINDOW for an unknown, finished or tombstoned sid
    is dropped **silently** — it never draws a RESET and never refreshes
    liveness (§4.2.1).
@@ -704,6 +917,12 @@ On every received frame, in order:
       - server, otherwise → **delayed** RESET (§9.3), except a stream probe →
         immediate RESET;
       - client → **immediate** RESET (§9.3).
+      In reliable mode a data frame that lands here also returns its
+      connection credit (§4.2.1): the peer spent one on it, and it is never
+      buffered. At the client any sequenced frame that lands here first locks
+      the `Conn` to the frame's server epoch (§4.2.1 *Restart*): it answers
+      one of this `Conn`'s OPENs, and the server's raise may ride right
+      behind it.
 
 **Validated frame** — normative definition (exhaustive): a frame that is
 (i) accepted or dedup-dropped by a live stream's seq check, (ii) an OPEN
@@ -711,9 +930,10 @@ that creates a call **or draws a rejection terminal** (§9.4 — the peer is
 manifestly alive and mid-conversation, even when the answer is
 `UNIMPLEMENTED`/`RESOURCE_EXHAUSTED`), (iii) a tombstone hit, or (iv) a
 well-formed PING of either scope. Unknown-sid frames, watermark-RESET OPENs,
-beyond-window drops, RESETs, WINDOW frames, and malformed frames are **not**
-validated — a flow-control grant says nothing about the peer's liveness, and
-it exists only in the mode where liveness is the adapter's job anyway.
+beyond-window drops, RESETs, WINDOW frames of either scope (per-stream or
+`sid=0`), and malformed frames are **not** validated — a flow-control grant
+says nothing about the peer's liveness, and it exists only in the mode where
+liveness is the adapter's job anyway.
 Peer liveness (§10.4) and the idle clocks (§10.5) advance on validated
 frames only — junk floods cannot keep a ghost peer alive.
 
@@ -766,8 +986,9 @@ frames only — junk floods cannot keep a ghost peer alive.
   (foreign or crafted) falls back to every incarnation holding that sid at
   that peer.
 - Sent, rate-limited, when:
-  - **server**: a non-OPEN, non-PING frame references an unknown,
-    non-tombstoned sid — after a **delay of `T_hold`** (default = `RTI`) to
+  - **server**: a non-OPEN, non-PING, non-WINDOW frame references an
+    unknown, non-tombstoned sid — after a **delay of `T_hold`** (default =
+    `RTI`) to
     avoid RESETting a call whose OPEN is merely reordered/late; the frame
     itself is dropped, not buffered (its loss is within the §14 contract; the
     OPEN retransmission recovers the call). If the sid is still unknown when
@@ -781,8 +1002,8 @@ frames only — junk floods cannot keep a ghost peer alive.
   - **client**: any other frame references an unknown or tombstone-expired
     sid — immediately (no OPEN can ever arrive at a client). This is what
     stops a server streaming into a call the client has forgotten.
-- RESET MUST NOT be sent in reply to RESET or PING `sid=0`, and MUST NOT be
-  sent where §9.2 prescribes a `T` replay instead.
+- RESET MUST NOT be sent in reply to RESET, PING `sid=0` or WINDOW `sid=0`,
+  and MUST NOT be sent where §9.2 prescribes a `T` replay instead.
 - All volunteered RESETs and replays share the per-peer aggregate reply
   budget (§15) on top of their per-object rate limits.
 
@@ -817,11 +1038,21 @@ frames only — junk floods cannot keep a ghost peer alive.
   never ran and the client must surface a status, not `UNAVAILABLE`. In
   unreliable mode the rejected sid is burned (watermark bumped, tombstoned);
   a retry needs a fresh sid. In reliable mode the rejection is simply sent
-  once (§9.2) and no state is kept — nothing retransmits, so nothing needs
-  deduping.
+  once (§9.2) and no dedup state is kept — nothing retransmits, so nothing
+  needs deduping: no tombstone, no watermark bump.
+- **Container on rejection.** Either rejection above — unknown method or
+  codec, or the live-call cap — creates the (peer, client-epoch) container
+  when it does not exist yet, in **both** modes (unreliable mode already
+  needed it for the tombstone). In reliable mode that is the only state a
+  rejection leaves, and it exists so the peer's connection-window state has a
+  home (§4.2.1): the OPEN was validated (§9.1), the client's raise rides
+  right behind it, and the credit for data frames the peer pipelines after a
+  rejected call must have an incarnation to go back to. It is bounded by the
+  per-peer container cap (§15) exactly as in unreliable mode.
 - The handler ctx derives from the Server root ctx (§6.4) and is cancelled by:
   terminal frames, RESET, liveness expiry, deadline (§10.2), window-overrun
-  (§6.3), `Server.Stop`, `DisconnectPeer`.
+  (§6.3), connection-window overrun (§4.2.1), `Server.Stop`,
+  `DisconnectPeer`.
 - **`Server.Stop`:** cancels all handler ctxs; as handlers unwind, a
   best-effort `T{UNAVAILABLE}` is sent and tombstone-stored per live call;
   OPENs arriving after Stop are answered with rate-limited RESET.
@@ -831,7 +1062,25 @@ frames only — junk floods cannot keep a ghost peer alive.
   expiry), subject to the per-peer epoch-container cap (§15; containers with
   live calls are never evicted). In reliable mode there are no tombstones and
   no checkpoint ring — the watermark degenerates to plain `sid > hwm` — and
-  watermark/liveness state is retained until adapter teardown (§4.5).
+  watermark/liveness state, the container's connection sender and the peer's
+  connection-window ledger (§4.2.1) are retained until adapter teardown
+  (§4.5): reliable containers are never swept, and the ledger, keyed by the
+  transport peer, lives exactly as long as the peer's containers. When the
+  container cap evicts a reliable container, the ledger keeps the evicted
+  container's connection sender — its credit, its settle and the raise it
+  already got — and a `sid = 0` grant naming that incarnation still lands on
+  it, so that the incarnation's next OPEN continues it: an idle `Conn` is not
+  a dead one, and a container recreated at `W_conn` against a client that had
+  raised it would park at `T_stall` with no grant able to reach it (§4.2.1
+  *Raise*), while a repeated raise would over-credit the client; a data frame
+  the evicted incarnation still had in flight returns its credit to that
+  position too (§4.2.1). The ledger holds as many such positions as the cap
+  holds containers, oldest dropped first with the credit held back for it —
+  an incarnation coming back takes its own position out before the eviction
+  its OPEN causes puts another in, so a key with exactly 2 × `MaxDeadPeers`
+  idle incarnations keeps every one of them. Past that an incarnation starts
+  over as a new one would: assumed at `W_conn` and raised again, which
+  over-credits the client by up to `MaxPeerWindow − W_conn` (§16).
 
 ## 10. Liveness, deadlines, retransmission (core: G1)
 
@@ -846,15 +1095,17 @@ frames only — junk floods cannot keep a ghost peer alive.
 | `TTL_tomb` | 30 s (floors: §9.2) | Tombstone lifetime; also the watermark age gate (§9.4). |
 | `W_fwd` / `K_loud` | 4096 / 3 | seq window / fail-loud threshold (§6.3). |
 | `T_hold` | `RTI` | Delayed-RESET grace (§9.3). |
-| `T_stall` | 30 s | Longest a send may wait for flow-control credit before the call fails `UNAVAILABLE` (§4.2.1). **Runs in reliable mode too** — it is the only bound a parked sender has there. |
+| `T_stall` | 30 s | Longest a send may wait for flow-control credit — on either window, one budget for both — before the call fails `UNAVAILABLE` (§4.2.1). **Runs in reliable mode too** — it is the only bound a parked sender has there. |
 | `W_init` | 32 messages | Initial per-stream window a sender assumes before the peer advertises (§4.2.1); also the minimum reliable-mode rx buffer. |
+| `W_conn` | 1024 messages | Connection window a sender assumes per peer incarnation before any `sid = 0` grant (§4.2.1); also the minimum `MaxPeerWindow` (§15). Fixed protocol constant (= 32 × `W_init`). |
 
 The timers — `T_call`, `T_live`, `RTI`, `TTL_tomb`, `T_hold`, `T_stall` — are
 option-overridable (`WithTiming`); `T_probe` is derived from `T_live`.
-`W_fwd` and `K_loud` are **fixed protocol constants** (receiver-local, not
-option-tunable — a knob would buy nothing but a config surface two
-implementations could disagree on). Protocol timers run **only in unreliable
-mode** (§10.6) and only while calls (or their tombstones) are live.
+`W_fwd`, `K_loud`, `W_init` and `W_conn` are **fixed protocol constants** (a
+knob would buy nothing but a config surface two implementations could
+disagree on — and the two assumptions are what every receiver must be able
+to hold). Protocol timers run **only in unreliable mode** (§10.6) and only
+while calls (or their tombstones) are live.
 
 ### 10.2 Deadlines
 
@@ -924,6 +1175,8 @@ needs the fast cadence, and the total stays bounded by the same cap:
   pinging and expires within `T_live`. A server keepalive names the client
   incarnation it is keeping alive (`peer_epoch`, §6.1); a client drops
   keepalives addressed to another incarnation without refreshing liveness.
+  `sid = 0` also carries the connection-window grant (`WINDOW`, §4.2.1),
+  which refreshes no liveness either.
 - On expiry: every live call with that peer fails — client side
   `UNAVAILABLE` ("peer lost"); server side cancels handler ctxs, **no `T` is
   sent** (the peer is gone), tombstones degrade to key-only, and no abort
@@ -990,12 +1243,12 @@ ends disagree.
 | `T_call` default deadline | on | **off** (explicit ctx deadlines still honored & propagated) |
 | Retransmission, PING, probe, liveness | on | **off** (an abort/half-close is sent exactly once; no obligations) |
 | Tombstones | on | **off** ("tombstone-store" = send once; §9.2) |
-| RESET | on | on (a restarted server is still possible; client fails fast). In-flight frames pipelined behind a client abort each draw a RESET, 1:1 with no rate limit — the channel does not retransmit, so the flow is bounded by what the peer actually sent (unlike gRPC's silent discard). |
+| RESET | on | on (a restarted server is still possible; client fails fast). In-flight frames pipelined behind a client abort each draw a RESET, 1:1 with no rate limit — the channel does not retransmit, so the flow is bounded by what the peer actually sent (unlike gRPC's silent discard) — and each returns the connection credit it spent (§4.2.1). |
 | Aged watermark | on (`hwm_aged`, §9.4) | on, degenerate: plain `sid > hwm`, no aging/checkpoints; state until adapter teardown (§9.4) |
 | `T_hold` | `RTI` | **0** — RESET immediately; no reordering exists |
 | seq validation | window + fail-loud (§6.3) | any gap or duplicate = broken transport: **fail the call with `INTERNAL`** (fail loud) |
-| rx buffering | drop per policy (§4.2) | per-stream flow control (§4.2.1); `Handle` blocks only for a peer that advertises no window |
-| Flow control (`window`, WINDOW) | **off** — ignored entirely | **on**: advertise, grant, park; `T_stall` bounds a parked sender |
+| rx buffering | drop per policy (§4.2) | per-stream and per-peer flow control (§4.2.1); `Handle` blocks only for a peer that advertises no window |
+| Flow control (`window`, WINDOW) | **off** — ignored entirely, `sid = 0` included | **on**: advertise, grant, park — per stream and, on `WINDOW sid=0`, per peer (§4.2.1); `T_stall` bounds a parked sender on either |
 | Liveness responsibility | protocol (PING) | **adapter** (§4.5) — non-optional |
 
 ### 10.7 Termination bounds (G1, testable)
@@ -1158,7 +1411,8 @@ At-most-once residuals (stated honestly):
 Gap visibility: the receiver counts skipped messages per stream (seq deltas)
 and exposes the counter — alongside per-stream drop, per-peer RESET,
 retransmission, probe, liveness-expiry, tombstone-replay and flow-stall
-counters — through the **protocol stats surface**, which is implemented:
+counters (per stream and per peer, §4.2.1) — through the **protocol stats
+surface**, which is implemented:
 an endpoint takes an observer (`WithProtocolStats`) and a ready-made counter
 sink. Applications that react to gaps (e.g. request a snapshot) read it there
 rather than reimplementing sequencing. Applications that cannot tolerate gaps
@@ -1190,14 +1444,32 @@ lengths split into message size and wire size (§12.1).
   reply budget** (`MaxRepliesPerRTI`: all volunteered replies — tombstone and
   creation-ack replays, RESETs — that one transport peer can draw within one
   `RTI`, applied on the server, the amplification target; denial is silence);
-  per-method rx buffer sizes (§4.2). `W_fwd`/`K_loud` are fixed protocol
-  constants (§10.1). Message size is bounded by the adapter (§4.4), not by a
-  core knob.
+  per-method rx buffer sizes (§4.2); max **buffered messages per transport
+  peer across all of its calls and client epochs** (`MaxPeerWindow`, the
+  connection window of §4.2.1 — reliable mode only; per `Conn` on the
+  client; floored at `W_conn`, since a sender assumes that much; past it the
+  frame that overruns fails **its own call** `INTERNAL`, never the peer).
+  `W_fwd`/`K_loud`/`W_init`/`W_conn` are fixed protocol constants (§10.1).
+  Message size is bounded by the adapter (§4.4), not by a core knob.
 - Flow-control credit is bounded too (§4.2.1): a grant never enables flow
-  control by itself, so a stray or injected `WINDOW` cannot park a sender that
-  was never paced; the credit accumulator saturates rather than wrapping; and
-  a receiver never advertises more than it can buffer, so the memory a peer
-  can pin per call stays its own configured buffer.
+  control by itself — neither window — so a stray or injected `WINDOW` cannot
+  park a sender that was never paced; the credit accumulator saturates rather
+  than wrapping; a receiver never advertises more than it can buffer; and the
+  connection window is enforced on what is actually buffered, never on what
+  was granted, so over-crediting is harmless and junk cannot desync it. The
+  memory a peer can pin is therefore min(`MaxLiveCalls` × per-call buffer,
+  `MaxPeerWindow`) **messages** — a number the receiver chose — times the
+  adapter's frame size (§4.4; the 4 MiB receive cap applies at decode). A
+  byte-tight deployment reaches for `MaxLiveCalls` or the per-call buffer,
+  since `MaxPeerWindow` cannot go below `W_conn`. Coexisting incarnations on
+  one transport peer share it, as they share `MaxLiveCalls`; a reliable-mode
+  rejected OPEN's container (§9.4) is bounded by `MaxDeadPeers` like any
+  other, and so are the sender positions the ledger keeps for evicted
+  containers (§9.4) — `MaxDeadPeers` of each per peer, a few words apiece.
+  A forged same-epoch `sid = 0` grant on a spoofable channel forced
+  reliable lets a sender exceed the real window by the forged amount — one
+  call `INTERNAL` at the receiver, the connection-scope twin of the forged
+  RESET L3 already concedes (§16).
 - RESET never attests liveness (§9.1); junk floods cannot keep a ghost peer
   alive. Forging a `K_loud` fail-loud run requires sniffing live (epoch, sid,
   seq≈L) — no cheaper than the single forged RESET the threat model already
@@ -1232,6 +1504,54 @@ on credit is bounded only by `T_stall` (§10.1); a reliable-mode receiver's rx
 buffer has a floor of `W_init` (§4.2.1); and a peer that overruns its
 advertised window fails **that call** with `INTERNAL` rather than stalling the
 channel.
+
+**Resolved in v1.1 (2026-09-05):** the memory one peer can pin was
+`MaxLiveCalls × window`, a number no receiver chose; the **connection window**
+(§4.2.1, `Limits.MaxPeerWindow` §15) bounds it per transport peer, as HTTP/2's
+connection window does. Its residuals, each bounded and stated: **cross-stream
+coupling** — a peer whose stuck consumers pin most of the window slows every
+other stream to that peer, and an application whose consumers of streams A and
+B wait on something the sender can only send on C, with A+B's backlog filling
+the window, parks C until `T_stall` (the classic HTTP/2 connection-window
+deadlock; the default is 32 full stream windows, the peer-stall counter makes
+it diagnosable, and `MaxPeerWindow` is the remedy); **fairness** among streams
+sharing one window is first-come — every parked sender re-races for the same
+grant, and under sustained contention one stream can lose every race for up
+to `T_stall`, then fail loudly; a **connection overrun** fails the offending
+call `INTERNAL`, never the peer (§4.2.1), so a coexisting incarnation on a
+datagram-keyed reliable channel — a client restarted at the same key, where no
+`DisconnectPeer` fires — inherits the dead one's buffered count as it inherits
+its live-call count, and can cost the new one `INTERNAL` on one call, never a
+hang and never its credit (the ledger holds back and grants per incarnation,
+§4.2.1); a `MaxDeadPeers` eviction of an idle reliable container leaves its
+sender's position in the peer's ledger (§9.4), so the recreated container
+neither starts over at `W_conn` nor draws a second raise, and a data frame
+the evicted incarnation still had in flight returns its credit to that
+position (§4.2.1) — only past the ledger's own cap, `MaxDeadPeers` held
+positions, does an incarnation start over (reachable only with **more than**
+2 × `MaxDeadPeers` idle incarnations on one key: an incarnation coming back
+takes its own position out before its OPEN's eviction puts another in), and
+then two things follow: it is assumed at `W_conn` and **raised again**, so a
+server whose `MaxPeerWindow` exceeds `W_conn` over-credits that client's
+sender by up to `MaxPeerWindow − W_conn` (less the credit dropped with the
+position) and the client can overrun and fail one call `INTERNAL` there
+(§4.2.1); and the server's sender toward it, back at `W_conn` against a
+client whose raise latch is per server incarnation, parks at `T_stall` for
+good when that client's `MaxPeerWindow` exceeds 2 × `W_conn`; and at the
+window's edge the starvation rule costs one grant per consumed message
+(§4.2.1). Two more, both on a **datagram channel forced reliable** (§4.3), where
+frames are neither authenticated nor strictly ordered by the transport: a
+single forged or reordered sequenced frame that names the Conn's own
+`peer_epoch` under a foreign server epoch re-locks the Conn (§4.2.1 Restart)
+— its sender starts over and the credit held back for the live incarnation
+is dropped, so both directions park until the next sequenced frame re-locks
+it (before the connection window such a frame drew only a RESET; the same
+injection class as L3, closed by an encrypted transport); and after a genuine
+server restart a **receive-only** call locked to the dead epoch never ends
+without a deadline (reliable mode runs no timers and only a send draws the
+RESET), so its pinned buffers count against the new incarnation's
+`MaxPeerWindow` for as long as it lives. The bound is in messages, not bytes
+(§15).
 
 **Resolved in v1.0 (were blockers L4/L5):** the per-peer live-call cap
 (§15, `Limits.MaxLiveCalls`) and reliable-mode strict-seq fail-loud (§10.6)
@@ -1285,6 +1605,28 @@ v1.1 (2026-07-25), breaking, pre-release:
 10. The unary shape may now carry an `H` before its `T` when the handler
     flushes a header (§8, §11).
 
+v1.1 (2026-09-05), **behavioral, no wire change** — pre-release:
+
+11. `WINDOW sid=0` carries a per-peer **connection window** (§4.2.1). A
+    conforming reliable-mode receiver bounds `MaxPeerWindow` messages per
+    transport peer and grants on `sid = 0`; a conforming reliable-mode sender
+    assumes `W_conn` = 1024 messages toward every peer incarnation and
+    honours it. Was: `WINDOW sid=0` dropped silently (the client looked up
+    sid 0 and found nothing; the server took the finished-call branch), no
+    aggregate bound, no assumption. **There is no negotiation (§10.6)**, so
+    the two texts do not coexist gracefully: a sender on this text talking to
+    a receiver on the previous one parks after 1024 cumulative streamed data
+    frames to that peer and fails `UNAVAILABLE` at `T_stall` on that send and
+    on every later streaming send for the incarnation's life — loud, bounded,
+    attributable (a peer-stall event, a distinct error text), unary-exempt
+    (the request rides `OPEN|CLOSE`, the response rides `T`, both uncredited)
+    and corrupting nothing, but fatal for a long-lived streaming sender. A
+    receiver on this text talking to a sender on the previous one changes
+    nothing while that sender pins ≤ `MaxPeerWindow` messages, and past it
+    fails the overrunning call `INTERNAL`, one call at a time. This is why
+    the change precedes the wire freeze: no released peer carries the old
+    obligation, and a third implementation must not miss it.
+
 Behavioral:
 
 6. Client EOF = server `T` frame (was: inferred from `code=OK` + empty
@@ -1315,8 +1657,9 @@ Behavioral:
 | `TTL_tomb` (also watermark age) | 30 s (floors §9.2) | reliable mode (state lives until teardown) |
 | `W_fwd` / `K_loud` | 4096 / 3 | — (fixed protocol constants, §10.1; reliable mode uses the strict gap check instead) |
 | `T_hold` (delayed RESET) | `RTI` | reliable mode: 0 (immediate) |
-| `T_stall` (flow-control park) | 30 s | — (runs in both modes; only reachable in reliable, §4.2.1) |
+| `T_stall` (flow-control park) | 30 s | — (runs in both modes; only reachable in reliable, §4.2.1; one budget across both windows) |
 | `W_init` (assumed window) | 32 messages | unreliable mode (flow control is off there) |
+| `W_conn` (assumed connection window) | 1024 messages | unreliable mode (same); fixed protocol constant, §10.1 |
 | rx buffer / policy | 32 frames / `DropNewest` | endpoint-wide `WithRxBuffer`, per-method `WithMethodRxBuffer` (server) — §4.2; in reliable mode the size is also the advertised window and is floored at `W_init` |
 | message size caps (per call) | recv 4 MiB / send unlimited | `WithMaxRecvMsgSize` / `WithMaxSendMsgSize`, or gRPC's per-call options — gRPC's own defaults |
 | message size | adapter-enforced (§4.4); the core is size-agnostic | — |
@@ -1329,9 +1672,10 @@ Resource caps (`WithLimits`, §15; zero fields keep defaults):
 | `MaxLiveCalls` | 4096 | per transport peer, across client epochs |
 | `MaxTombstones` | 1024 entries | per epoch container (entry cap → floor, §9.2) |
 | `MaxTombstoneBytes` | 1 MiB | per epoch container (byte cap → key-only, §9.2) |
-| `MaxDeadPeers` | 4 | retained no-live-call epoch containers per peer |
-| `MaxPendingResets` | 1024 | RESET rate-limit / delayed-RESET / reply-budget maps |
+| `MaxDeadPeers` | 4 | retained no-live-call epoch containers per peer; also the evicted connection-sender positions the peer's ledger keeps (§9.4) |
+| `MaxPendingResets` | 1024 | RESET rate-limit / delayed-RESET / reply-budget maps (also on a `Conn`) |
 | `MaxRepliesPerRTI` | 64 | aggregate volunteered replies per peer per `RTI` (server) |
+| `MaxPeerWindow` | 1024 messages (= `W_conn`; smaller values are raised to it, ≤ 0 keeps the default) | per transport peer across client epochs (server); per `Conn` (client) — the connection window, reliable mode only (§4.2.1); this and `MaxPendingResets` are the two fields a `Conn` honours |
 
 Appendix B mirrors the body; where they disagree, the body governs.
 

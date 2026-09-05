@@ -18,7 +18,8 @@ option go_package = "github.com/lesomnus/grpc-dgram;drpc";
 //   2  = CLOSE      — sender's direction finished; with `code` it is terminal.
 //   4  = RESET      — stateless "no such call"; `epoch` echoes the offending frame.
 //   8  = PING       — sid 0: peer keepalive; sid≠0: stream probe.
-//   16 = WINDOW     — stateless flow-control credit for `sid` (reliable mode).
+//   16 = WINDOW     — stateless flow-control credit for `sid` (reliable mode);
+//                     sid 0: the peer's connection window.
 //   32 = COMPRESSED — `payload` is compressed with the call's compressor.
 message Frame {
   // Sender's incarnation nonce, chosen at random per Conn/Server instance.
@@ -26,11 +27,12 @@ message Frame {
   fixed32 epoch = 1;
 
   // Stream id, client-allocated, starting at 1, never reused within an
-  // epoch. 0 is reserved for peer-scope control frames (PING).
+  // epoch. 0 is reserved for peer-scope control frames (PING keepalive
+  // §10.4, WINDOW connection credit §4.2.1).
   fixed32 sid = 2;
 
   // Per-stream, per-direction sequence, starting at 1.
-  // Stateless frames (RESET, PING) carry 0.
+  // Stateless frames (RESET, PING, WINDOW) carry 0.
   fixed32 seq = 3;
 
   // Flag bitmask; see message comment.
@@ -69,18 +71,19 @@ message Frame {
   Metadata trailer = 13;
 
   // The client incarnation this frame addresses (PROTOCOL.md §6.1).
-  // Server→client call frames (H, data, T, stream probes, keepalive) echo the
-  // client epoch of the call they belong to; the client accepts a frame into
-  // a stream only when this names its own epoch — a sid alone does not,
-  // because a restarted client re-allocates sids from 1. A client→server
-  // RESET echoes the offending frame's peer_epoch so the server can reset
-  // exactly that incarnation's call. Client→server call frames leave it 0
-  // (their field 1 already names the incarnation).
+  // Server→client call frames (H, data, T, stream probes, keepalive,
+  // connection grants) echo the client epoch of the call they belong to; the
+  // client accepts a frame into a stream only when this names its own epoch
+  // — a sid alone does not, because a restarted client re-allocates sids
+  // from 1. A client→server RESET echoes the offending frame's peer_epoch so
+  // the server can reset exactly that incarnation's call. Client→server call
+  // frames leave it 0 (their field 1 already names the incarnation).
   fixed32 peer_epoch = 14;
 
-  // Flow-control credit, in messages, for this stream — reliable mode only
-  // (§4.2). On OPEN and on the creation-ack H it advertises the sender's
-  // initial receive window; on a WINDOW frame it is an additive grant.
+  // Flow-control credit, in messages — reliable mode only (§4.2.1). On OPEN
+  // and on the creation-ack H it advertises the sender's initial per-stream
+  // receive window; on a WINDOW frame it is an additive grant — for this
+  // stream, or for the peer's connection window when sid is 0.
   // Field 15 — the last one-byte tag — because it rides frequent frames.
   uint32 window = 15;
 

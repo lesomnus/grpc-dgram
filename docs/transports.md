@@ -192,8 +192,8 @@ attached to the context. What you may do next depends on the mode:
   policy, exactly as if the network had lost it (§4.2).
 - reliable: `Handle` may block, and adapters *should* call it synchronously
   from the read loop so the stall propagates into TCP/SCTP flow control — but
-  once per-stream flow control is active it will not block, because a
-  conforming peer cannot overrun its window (§4.2.1).
+  once flow control is active it will not block, because a conforming peer
+  cannot overrun its windows, per stream or per peer (§4.2.1).
 
 A non-nil return means "malformed input", not "tear down the channel". Dropped,
 stray and duplicate frames are normal here and return `nil`.

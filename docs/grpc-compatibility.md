@@ -412,8 +412,9 @@ on the server, with `Client` and `End.Error` set as grpc-go sets them and
 `End` last. `Length` is the message and `WireLength` the bytes that went out,
 so they differ exactly when the call is compressed. The datagram-specific
 events gRPC has no concept of — gaps, rx drops, RESETs, retransmissions,
-probes, liveness expiry, tombstone replays, flow stalls — live on a second
-surface, `WithProtocolStats` (§14), with `drpc.Counters` as a ready-made sink.
+probes, liveness expiry, tombstone replays, stream and peer flow stalls — live
+on a second surface, `WithProtocolStats` (§14), with `drpc.Counters` as a
+ready-made sink.
 
 ## Not here, and why
 
@@ -439,6 +440,16 @@ client *queue* new streams; dRPC's `Limits.MaxLiveCalls` (4096 per transport
 peer, §15) makes the server **reject** the OPEN with `RESOURCE_EXHAUSTED`,
 tombstoned so a retransmit gets the same answer. A port that relied on
 queueing to absorb a burst sees failed calls instead.
+
+The other capacity knob has HTTP/2's shape and one deliberate difference.
+`Limits.MaxPeerWindow` (§4.2.1, reliable mode) is a connection-level
+flow-control window beside the per-stream ones — counted in messages, 1024 by
+default, one per transport peer — and a sender assumes that much toward every
+peer, as an HTTP/2 sender assumes 65535 bytes. Where HTTP/2 answers an
+overrun with `FLOW_CONTROL_ERROR` and `GOAWAY` for the whole connection, dRPC
+fails **only the overrunning call** with `INTERNAL`: the transport belongs to
+the adapter, and tearing it down from inside the read loop would turn one
+accounting slip into an outage for every call on it.
 
 ## Porting checklist
 

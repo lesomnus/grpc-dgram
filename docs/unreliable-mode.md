@@ -385,6 +385,7 @@ Buffers and caps:
 | `Limits.MaxLiveCalls` | 4096 | live calls per transport peer, across client epochs — the bound on handler goroutines one peer can spawn |
 | `Limits.MaxTombstones` / `MaxTombstoneBytes` | 1024 / 1 MiB | per client incarnation; past them replays degrade, dedup does not |
 | `Limits.MaxDeadPeers` / `MaxRepliesPerRTI` | 4 / 64 | retained no-live-call incarnations per peer; volunteered replies per peer per `RTI` (anti-amplification) |
+| `Limits.MaxPeerWindow` | 1024 messages | inert here — the reliable-mode connection window, buffered messages per transport peer across all its calls ([reliable mode](./reliable-mode.md#the-connection-window)) |
 
 `W_fwd` (4096) and `K_loud` (3) are fixed protocol constants, not options: a
 knob there would buy nothing but a setting two implementations could disagree

@@ -57,11 +57,19 @@ type Server struct {
 	pendingResets map[callKey]*pendingReset
 	resetAt       map[callKey]int64 // immediate-RESET rate limit (§9.3)
 	livePeer      map[any]int       // live calls per transport peer (§15)
-	replyBudget   map[any]*replyBudget
-	drain         bool
-	closed        bool
-	wg            sync.WaitGroup
-	sw            sweeper
+	// peerFlow is the receiving half of the connection window per transport
+	// peer (§4.2.1, §15): what one peer may have buffered here across all of
+	// its calls AND client epochs — keyed like livePeer and for the same
+	// reason, since only a key the peer cannot mint bounds anything. Created
+	// by the peer's first validated reliable-mode OPEN, admitted or rejected,
+	// so the peer's raise and every credit return have a home; deleted with
+	// the peer's containers in DisconnectPeer, never swept.
+	peerFlow    map[any]*peerFlowRx
+	replyBudget map[any]*replyBudget
+	drain       bool
+	closed      bool
+	wg          sync.WaitGroup
+	sw          sweeper
 
 	// serving flips on the first Handle; the registry is immutable after
 	// that (PROTOCOL.md §13).
@@ -102,6 +110,7 @@ func NewServer(tx FrameHandler, opts ...ServerOption) *Server {
 		pendingResets: map[callKey]*pendingReset{},
 		resetAt:       map[callKey]int64{},
 		livePeer:      map[any]int{},
+		peerFlow:      map[any]*peerFlowRx{},
 		replyBudget:   map[any]*replyBudget{},
 
 		services:     map[string]*serviceDesc{},
@@ -255,6 +264,33 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 		return s.sendReset(ctx, key, f)
 	}
 
+	if f.GetSid() == 0 && f.shape() == FlagWindow {
+		// A connection grant (§4.2.1): additive credit for this side's sends
+		// to the client incarnation it names, routed on (peer, epoch). It
+		// credits only a container that exists — or the held position of
+		// one the MaxDeadPeers cap evicted (§9.4, §15), which the same
+		// incarnation's next OPEN recreates from — and only in reliable
+		// mode; anything else is dropped in silence — never validated, never
+		// answered with a RESET, and it creates no state (§9.1, §9.3): a
+		// grant never enables, and a frame no OPEN preceded must not cost a
+		// container.
+		if s.rxReliable(ctx) {
+			s.mu.Lock()
+			ps := s.peers[ek]
+			var pf *peerFlowRx
+			if ps == nil {
+				pf = s.peerFlow[peer]
+			}
+			s.mu.Unlock()
+			if ps != nil {
+				ps.connTx.grant(f.GetWindow())
+			} else if pf != nil {
+				pf.creditEvicted(ek.epoch, f.GetWindow())
+			}
+		}
+		return nil
+	}
+
 	s.mu.Lock()
 	if st := s.calls[key]; st != nil {
 		s.mu.Unlock()
@@ -315,7 +351,28 @@ func (s *Server) Handle(ctx context.Context, f *Frame) error {
 	// late (PROTOCOL.md §9.3). A reliable channel has no reordering:
 	// immediate.
 	if s.rxReliable(ctx) {
+		// A data frame for a call this side no longer has — pipelined behind
+		// an abort, say, or in flight when the handler ended — spent one
+		// connection credit at the client and is never buffered: return it,
+		// or the window shrinks for good (§4.2.1). Only for an incarnation
+		// this side holds flow state for — a container, or the sender
+		// position the ledger kept when the cap evicted one (§9.4): the
+		// grant has nowhere else to go, and junk must not draw one.
+		var pf *peerFlowRx
+		ps := s.peers[ek]
+		if f.isData() {
+			pf = s.peerFlow[key.peer]
+		}
 		s.mu.Unlock()
+		if pf != nil {
+			if ps != nil {
+				if g := pf.unadmitted(ek.epoch, 1); g > 0 {
+					s.grantPeer(ps, g)
+				}
+			} else if g := pf.unadmittedEvicted(ek.epoch, 1); g > 0 {
+				s.grantEpoch(key.peer, ek.epoch, g)
+			}
+		}
 		return s.sendReset(ctx, key, f)
 	}
 	if _, ok := s.pendingResets[key]; !ok && len(s.pendingResets) < s.limits.MaxPendingResets {
@@ -563,6 +620,16 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	ps.dead = false // the peer is evidently back
 	ps.lastRx.Store(now.UnixNano())
 	st.ps = ps
+	if rel {
+		// The peer's connection window (§4.2.1): its ledger, per transport
+		// peer, and — on the container's first admitted OPEN — the settle of
+		// this side's sender toward that incarnation by the advertisement the
+		// OPEN carries: > 0 confirms the assumed W_conn, 0 means the client
+		// does no flow control and turns it off. confirm is once-only, so
+		// every later OPEN is a no-op here.
+		st.pf = s.ensurePeerFlowLocked(key.peer)
+		ps.connTx.confirm(f.GetWindow())
+	}
 	// The OPEN arrived after all: cancel any RESET scheduled for its sid.
 	delete(s.pendingResets, key)
 	s.wg.Add(1)
@@ -585,6 +652,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		// Creation ack (§8): without it, a slow producer would leave the
 		// client's OPEN|CLOSE — full request payload — retransmitting.
 		st.sendH()
+		st.raisePeer()
 		go s.runStream(st)
 	} else {
 		// CS/bidi OPENs are eager and bare: payload or CLOSE here is
@@ -594,6 +662,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		}
 		// Creation ack (PROTOCOL.md §8).
 		st.sendH()
+		st.raisePeer()
 		go s.runStream(st)
 	}
 	return nil
@@ -612,20 +681,81 @@ func (s *Server) rejectOpen(ctx context.Context, f *Frame, code codes.Code, msg 
 	t.SetDesc(fmt.Sprintf(msg, args...))
 	t.SetPeerEpoch(f.GetEpoch()) // name the client incarnation (§6.1)
 
-	if !s.rxReliable(ctx) {
-		peer, _ := PeerFromContext(ctx)
-		now := time.Now()
-		s.mu.Lock()
-		ps := s.ensurePeerLocked(epochKey{peer: peer, epoch: f.GetEpoch()}, now, false)
-		ps.lastRx.Store(now.UnixNano())
+	peer, _ := PeerFromContext(ctx)
+	now := time.Now()
+	s.mu.Lock()
+	rel := s.rxReliable(ctx)
+	ps := s.ensurePeerLocked(epochKey{peer: peer, epoch: f.GetEpoch()}, now, rel)
+	ps.lastRx.Store(now.UnixNano())
+	if rel {
+		// No tombstone and no watermark bump in reliable mode — nothing
+		// retransmits, so nothing needs deduping (§9.2) — but the container
+		// and the peer's connection-window ledger DO exist from here on
+		// (§9.4): the OPEN was validated, and the client's raise rides right
+		// behind it (§4.2.1). Bounded by MaxDeadPeers like any container.
+		s.ensurePeerFlowLocked(peer)
+	} else {
 		if ps.hwm < f.GetSid() {
 			ps.hwm = f.GetSid()
 		}
 		ps.addTombLocked(f.GetSid(), t, now.Add(s.mode.timing.Tombstone))
-		s.mu.Unlock()
-		s.kickSweep()
 	}
+	s.mu.Unlock()
+	s.kickSweep()
 	return s.tx.Handle(ctx, t)
+}
+
+// ensurePeerFlowLocked returns the connection-window ledger for a transport
+// peer, creating it at MaxPeerWindow (§4.2.1, §15). It also holds the sender
+// positions of this peer's evicted containers, as many as MaxDeadPeers keeps
+// containers (§9.4). Server.mu held.
+func (s *Server) ensurePeerFlowLocked(peer any) *peerFlowRx {
+	pf := s.peerFlow[peer]
+	if pf == nil {
+		pf = &peerFlowRx{}
+		pf.enable(uint32(s.limits.MaxPeerWindow), s.limits.MaxDeadPeers)
+		s.peerFlow[peer] = pf
+	}
+	return pf
+}
+
+// peerTxCtx is the ctx this side's frames to one transport peer go out on:
+// the root, with the peer attached for the adapter (§4.4).
+func (s *Server) peerTxCtx(peer any) context.Context {
+	if peer == nil {
+		return s.root
+	}
+	return NewPeerContext(s.root, peer)
+}
+
+// grantPeer transmits a connection-window grant to one client incarnation:
+// sid 0, seq 0, no payload, peer_epoch naming the incarnation (§4.2.1, §7).
+// A control frame like any other — sent outside every lock, so a blocking
+// adapter never wedges Handle for every peer — and pointless once stopped.
+func (s *Server) grantPeer(ps *peerState, n uint32) {
+	s.grantOn(ps.txCtx, ps.epoch, n)
+}
+
+// grantEpoch is grantPeer for an incarnation with no container — one whose
+// sender position the ledger holds (§9.4): the grant goes out on the ctx the
+// container's would have.
+func (s *Server) grantEpoch(peer any, epoch, n uint32) {
+	s.grantOn(s.peerTxCtx(peer), epoch, n)
+}
+
+func (s *Server) grantOn(txCtx context.Context, epoch, n uint32) {
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return
+	}
+	f := &Frame{}
+	f.SetEpoch(s.epoch)
+	f.SetPeerEpoch(epoch)
+	f.SetFlags(FlagWindow)
+	f.SetWindow(n)
+	s.tx.Handle(txCtx, f)
 }
 
 func (s *Server) runUnary(st *serverStream, open *Frame) {
@@ -723,6 +853,10 @@ func (s *Server) finish(st *serverStream, term *Frame) {
 	}
 	s.mu.Unlock()
 	st.flowTx.release()
+	// Whatever the handler left buffered is discarded with the call: its
+	// connection credit goes back in one grant, here, outside the endpoint
+	// lock like every transmit (§4.2.1).
+	st.releasePinned()
 	st.cancel(status.Error(codes.Canceled, "call finished"))
 	if st.cancelTimeout != nil {
 		st.cancelTimeout()
@@ -783,11 +917,16 @@ func (s *Server) DisconnectPeer(peer any, err error) {
 	// peer of a connection-oriented gateway would leak its container (the
 	// sweep never GCs reliable ones, and the §15 dead-container cap only
 	// evicts among containers of the *same* key).
-	for k := range s.peers {
+	var senders []*flowSender
+	for k, ps := range s.peers {
 		if k.peer == peer {
+			senders = append(senders, &ps.connTx)
 			delete(s.peers, k)
 		}
 	}
+	// The connection-window ledger lives exactly as long as the peer's
+	// containers (§4.2.1).
+	delete(s.peerFlow, peer)
 	for k := range s.pendingResets {
 		if k.peer == peer {
 			delete(s.pendingResets, k)
@@ -807,6 +946,11 @@ func (s *Server) DisconnectPeer(peer any, err error) {
 	}
 	for _, st := range targets {
 		st.cancel(cause)
+	}
+	// A handler parked on connection credit has no grant coming (§4.2.1);
+	// its ctx already ended above, this just makes the wake-up explicit.
+	for _, tx := range senders {
+		tx.release()
 	}
 }
 

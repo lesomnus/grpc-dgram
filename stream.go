@@ -185,6 +185,14 @@ type clientStream struct {
 	rxWin       rxWindow
 	srvEpoch    uint32 // server incarnation this stream is locked to
 	srvEpochSet bool
+	// pinned counts this call's data frames charged to the connection window
+	// and sitting in rx (§4.2.1) — never len(rx): every one of them returns
+	// exactly one credit, when consumed or in bulk at release, and a count
+	// the two paths share under rxMu is what makes that exactly once.
+	// rxReleased marks the bulk return done: a frame arriving after it is
+	// credited on the spot instead of pinned. Guarded by rxMu.
+	pinned     uint32
+	rxReleased bool
 
 	rx        chan *Frame
 	rxCfg     rxConfig
@@ -406,12 +414,55 @@ func (s *clientStream) grantWindow(n uint32) {
 	s.transmit(context.WithoutCancel(s.ctx), f)
 }
 
+// pin charges one data frame about to enter rx to this call's connection
+// pin count, or refuses when the bulk return already ran (§4.2.1). It runs
+// BEFORE the enqueue, so the consumer can never unpin a frame that was not
+// yet pinned.
+func (s *clientStream) pin() bool {
+	s.rxMu.Lock()
+	defer s.rxMu.Unlock()
+	if s.rxReleased {
+		return false
+	}
+	s.pinned++
+	return true
+}
+
+// unpin takes one frame off the pin count: it left rx, or never made it in.
+// False means the bulk return at release already covered it — its credit
+// went back with the call's, and must not go back twice.
+func (s *clientStream) unpin() bool {
+	s.rxMu.Lock()
+	defer s.rxMu.Unlock()
+	if s.pinned == 0 {
+		return false
+	}
+	s.pinned--
+	return true
+}
+
+// undoCredit refunds the credit a data frame took from both windows: it
+// never reached the wire (§4.2.1, §4.4).
+func (s *clientStream) undoCredit() {
+	s.flowTx.undo()
+	if s.conn.mode.reliable {
+		s.conn.connTx.undo()
+	}
+}
+
 // handleRx processes one server frame for this stream. Called by Conn.Handle;
 // serialized per stream via rxMu for the window state. In reliable mode it
 // may block on a full buffer, bounded by the rx ctx (PROTOCOL.md §4.2).
 func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 	select {
 	case <-s.done:
+		// The call ended under it (done, not yet retired): never buffered.
+		// The frame still answers one of this Conn's calls, so the Conn
+		// locks to its incarnation as Handle's no-live-stream path does —
+		// the server's raise may ride right behind it — and the server
+		// spent a connection credit on it if it is data (§4.2.1).
+		s.conn.lockServerEpoch(ctx, f.GetEpoch())
+		s.conn.creditUnbuffered(ctx, f)
 		return
 	default:
 	}
@@ -424,6 +475,7 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 		err := status.Errorf(codes.Internal, "drpc: frame carries unsupported flags %#x", f.GetFlags())
 		s.sendAbort(codes.Internal)
 		s.finishLocal(err)
+		s.conn.creditUnbuffered(ctx, f)
 		return
 	}
 
@@ -449,11 +501,22 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 
 	s.rxMu.Lock()
 	v := s.rxWin.check(f.GetSeq())
-	if v == rxAccept && !s.srvEpochSet {
+	first := v == rxAccept && !s.srvEpochSet
+	if first {
 		s.srvEpoch = f.GetEpoch()
 		s.srvEpochSet = true
 	}
 	s.rxMu.Unlock()
+	if first {
+		// A stream locks to one incarnation, so the Conn can only hear a
+		// new one here: this is where the connection sender starts over
+		// after a server restart (§4.2.1, §10.6) — before the confirm below.
+		s.conn.lockServerEpoch(ctx, f.GetEpoch())
+	}
+	if v != rxAccept {
+		// Never buffered, whatever the verdict (§4.2.1).
+		s.conn.creditUnbuffered(ctx, f)
+	}
 
 	switch v {
 	case rxDup:
@@ -488,6 +551,13 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 		// advertises the server's receive window and replaces the assumed one
 		// (§4.2). Absent means the peer does no flow control.
 		s.flowTx.observe(f.GetWindow())
+		if first && f.isHeaderFrame() && (s.clientStreams || s.serverStreams) {
+			// The same advertisement settles the connection window, once
+			// per Conn (§4.2.1) — and ONLY a streaming call's creation ack
+			// does: a unary T or a SendHeader-flushed H carries no window,
+			// and would switch it off while the server enforces.
+			s.conn.connTx.confirm(f.GetWindow())
+		}
 	}
 
 	switch {
@@ -506,14 +576,36 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 			// Off-shape: unary/client-streaming has no server data frames.
 			s.rxDropped.Add(1)
 			s.protoEvent(ProtocolEvent{Kind: EventOffShape, Count: 1})
+			s.conn.creditUnbuffered(ctx, f)
 			return
 		}
 		s.latchHeader(f)
 		if s.conn.mode.reliable {
+			// The connection window first (§4.2.1): the server may not have
+			// more than MaxPeerWindow buffered here across all its calls. A
+			// conforming sender never gets here; one that does fails THIS
+			// call, never the peer, and its frame's credit goes back like
+			// any never-buffered frame's (§4.2, §15).
+			if !s.conn.connRx.admit() {
+				err := status.Error(codes.Internal, "drpc: peer exceeded the connection flow-control window")
+				s.sendAbort(codes.Internal)
+				s.finishLocal(err)
+				s.conn.creditUnbuffered(ctx, f)
+				return
+			}
+			if !s.pin() {
+				// The call ended between the done check above and here:
+				// the frame is never delivered.
+				s.conn.retirePeer(ctx, 1, f.GetEpoch())
+				return
+			}
 			if s.flowRx.active() {
 				if !enqueueRxFlow(s.rx, f) {
 					// The peer sent past its window: fail loud instead of
 					// stalling the channel for every other call (§4.2).
+					if s.unpin() {
+						s.conn.retirePeer(ctx, 1, f.GetEpoch())
+					}
 					err := status.Error(codes.Internal, "drpc: peer exceeded the advertised flow-control window")
 					s.sendAbort(codes.Internal)
 					s.finishLocal(err)
@@ -522,6 +614,9 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 				// The rx ctx died mid-delivery: the transport is tearing down
 				// (§4.5). The frame is gone and the window advanced — end the
 				// call rather than leave a silent gap (§14).
+				if s.unpin() {
+					s.conn.retirePeer(ctx, 1, f.GetEpoch())
+				}
 				s.rxDropped.Add(1)
 				s.finishLocal(status.Error(codes.Unavailable, "transport closed during delivery"))
 			}
@@ -600,7 +695,13 @@ func (s *clientStream) sendOpen() error {
 	}
 	f := s.openFrame()
 	s.txMu.Unlock()
-	return s.transmit(s.ctx, f)
+	if err := s.transmit(s.ctx, f); err != nil {
+		return err
+	}
+	// The raise rides right behind the first OPEN (§4.2.1): from here on the
+	// server has a container for this incarnation to credit.
+	s.conn.raise(context.WithoutCancel(s.ctx))
+	return nil
 }
 
 // send marshals and transmits one message, returning any error. The public
@@ -644,13 +745,29 @@ func (s *clientStream) send(m any) error {
 	// Flow control (§4.2): the OPEN creates the call and is never credited;
 	// every later message waits for the peer's window. Parking here — not in
 	// the receiver's Handle — is what keeps one slow consumer from stalling
-	// the whole channel.
+	// the whole channel. In reliable mode a message needs one credit from
+	// the stream window AND one from the server's connection window
+	// (§4.2.1); the stall events say which of the two ran dry.
 	if !opening {
-		stalled, ferr := s.flowTx.acquire(s.ctx, s.done, s.conn.mode.timing.Stall, func() {
-			s.protoEvent(ProtocolEvent{Kind: EventFlowStall})
+		var conn *flowSender
+		if s.conn.mode.reliable {
+			conn = &s.conn.connTx
+		}
+		stalled, peer := false, false
+		ferr := acquire2(&s.flowTx, conn, s.ctx, s.done, s.conn.mode.timing.Stall, func(p bool) {
+			stalled, peer = true, p
+			if p {
+				s.protoEvent(ProtocolEvent{Kind: EventPeerFlowStall})
+			} else {
+				s.protoEvent(ProtocolEvent{Kind: EventFlowStall})
+			}
 		})
 		if stalled && ferr == nil {
-			s.protoEvent(ProtocolEvent{Kind: EventFlowResume})
+			if peer {
+				s.protoEvent(ProtocolEvent{Kind: EventPeerFlowResume})
+			} else {
+				s.protoEvent(ProtocolEvent{Kind: EventFlowResume})
+			}
 		}
 		if ferr != nil {
 			if ferr == errCallEnded {
@@ -663,6 +780,13 @@ func (s *clientStream) send(m any) error {
 	s.txMu.Lock()
 	select {
 	case <-s.done:
+		if !opening {
+			// Ended between acquire2 and here (a terminal, an abort, a
+			// ctx cancel racing the grant that woke it): the credit taken
+			// from both windows never reaches the wire. The stream's is
+			// moot, the Conn's is shared and cumulative (§4.2.1).
+			s.undoCredit()
+		}
 		s.txMu.Unlock()
 		return io.EOF
 	default:
@@ -692,7 +816,7 @@ func (s *clientStream) send(m any) error {
 			s.txOpened, s.txClosed = false, false
 			s.retxOpen = nil
 		} else {
-			s.flowTx.undo() // the message never reached the wire (§4.2)
+			s.undoCredit() // the message never reached the wire (§4.2)
 		}
 		s.txMu.Unlock()
 		return cerr
@@ -704,6 +828,11 @@ func (s *clientStream) send(m any) error {
 	if err := s.transmit(s.ctx, f); err != nil {
 		s.undoRefused(f, err)
 		return err
+	}
+	if opening {
+		// The piggybacked OPEN of a unary / server-streaming call is the
+		// Conn's first OPEN as often as the eager one is (§4.2.1).
+		s.conn.raise(context.WithoutCancel(s.ctx))
 	}
 	grpcStats(s.conn.stats).payloadOut(s.statsCtx, true, m, payload, len(wire))
 	return nil
@@ -726,7 +855,7 @@ func (s *clientStream) undoRefused(f *Frame, err error) {
 	}
 	s.txMu.Unlock()
 	if f.isData() {
-		s.flowTx.undo()
+		s.undoCredit()
 	}
 }
 
@@ -812,6 +941,12 @@ func (s *clientStream) RecvMsg(m any) error {
 // recvBuffered delivers a frame taken out of the rx buffer and returns the
 // slot to the peer as flow-control credit.
 func (s *clientStream) recvBuffered(f *Frame, m any) error {
+	if s.unpin() {
+		// The connection credit goes back the moment the frame leaves the
+		// buffer, delivered or not (§4.2.1); the stream credit below only
+		// when it was delivered, since a failed delivery ends the call.
+		s.conn.retirePeer(context.WithoutCancel(s.ctx), 1, f.GetEpoch())
+	}
 	if err := s.recvInto(f, m); err != nil {
 		// A failed delivery ended the call; granting now would only draw a
 		// RESET for a sid the peer has already forgotten (§4.2).
@@ -967,6 +1102,16 @@ func (s *clientStream) release() {
 	s.flowTx.release()
 	s.stopAfter()
 	s.conn.retire(s)
+	// Whatever is still buffered is discarded with the call: its connection
+	// credit goes back in one grant, after the Conn's lock is dropped and
+	// outside every other — a blocking adapter must not wedge Handle
+	// (§4.2.1). Frames the caller keeps draining past the terminal find
+	// pinned at zero and return nothing twice.
+	s.rxMu.Lock()
+	pinned, epoch := s.pinned, s.srvEpoch
+	s.pinned, s.rxReleased = 0, true
+	s.rxMu.Unlock()
+	s.conn.retirePeer(context.WithoutCancel(s.ctx), pinned, epoch)
 	s.hdrOnce.Do(func() { close(s.hdrReady) })
 	s.cancel()
 	if s.clientStreams || s.serverStreams {
@@ -1014,6 +1159,9 @@ type serverStream struct {
 	server *Server
 	key    callKey
 	ps     *peerState // container of this client incarnation; set at open
+	// pf is the transport peer's connection-window ledger (§4.2.1), set at
+	// open beside ps in reliable mode; nil otherwise.
+	pf *peerFlowRx
 
 	// reliable is the mode of the channel this call arrived on
 	// (PROTOCOL.md §4.3): it selects strict sequencing, and gates the
@@ -1058,6 +1206,15 @@ type serverStream struct {
 	// (peer, epoch, sid) in the demux — so no per-stream epoch gate here.
 	rxMu  sync.Mutex
 	rxWin rxWindow
+	// pinned counts this call's data frames charged to the peer's connection
+	// window and sitting in rx (§4.2.1) — never len(rx), which also holds the
+	// uncredited server-streaming OPEN: every one of them returns exactly one
+	// credit, when consumed or in bulk at finish, and a count the two paths
+	// share under rxMu is what makes that exactly once. rxReleased marks the
+	// bulk return done: a frame arriving after it is credited on the spot
+	// instead of pinned. Guarded by rxMu.
+	pinned     uint32
+	rxReleased bool
 
 	rx        chan *Frame
 	rxCfg     rxConfig
@@ -1110,6 +1267,7 @@ func (s *serverStream) handleRx(ctx context.Context, f *Frame) {
 		// See the client twin: an unimplemented modifier bit or an illegal
 		// shape fails the call rather than corrupting or gapping it (§7.1).
 		s.cancel(status.Errorf(codes.Internal, "drpc: frame carries unsupported flags %#x", f.GetFlags()))
+		s.creditUnbuffered(f)
 		return
 	}
 	if f.shape() == FlagWindow {
@@ -1148,6 +1306,10 @@ func (s *serverStream) handleRx(ctx context.Context, f *Frame) {
 	s.rxMu.Lock()
 	v := s.rxWin.check(f.GetSeq())
 	s.rxMu.Unlock()
+	if v != rxAccept {
+		// Never buffered, whatever the verdict (§4.2.1).
+		s.creditUnbuffered(f)
+	}
 
 	switch v {
 	case rxDup:
@@ -1177,17 +1339,40 @@ func (s *serverStream) handleRx(ctx context.Context, f *Frame) {
 		s.eofOnce.Do(func() { close(s.rxEOF) })
 	case f.isData():
 		if s.desc.IsUnary() || !s.desc.stream.ClientStreams {
+			// Off-shape: unary/server-streaming has no client data frames.
 			s.rxDropped.Add(1)
+			s.creditUnbuffered(f)
 			return
 		}
 		if s.reliable {
+			// The connection window first (§4.2.1): the peer may not have
+			// more than MaxPeerWindow buffered here across all of its calls.
+			// A conforming sender never gets here; one that does fails THIS
+			// call, never the peer, and its frame's credit goes back like
+			// any never-buffered frame's (§4.2, §15).
+			if s.pf != nil && !s.pf.admit() {
+				s.cancel(status.Error(codes.Internal, "drpc: peer exceeded the connection flow-control window"))
+				s.creditUnbuffered(f)
+				return
+			}
+			if !s.pin() {
+				// The call finished under it: never delivered.
+				s.retirePeer(1)
+				return
+			}
 			if s.flowRx.active() {
 				if !enqueueRxFlow(s.rx, f) {
+					if s.unpin() {
+						s.retirePeer(1)
+					}
 					s.cancel(status.Error(codes.Internal, "drpc: peer exceeded the advertised flow-control window"))
 				}
 			} else if !enqueueRxReliable(ctx, s.rx, f, s.ctx.Done()) {
 				// See the client twin: teardown ate the frame — fail loud
 				// rather than leave a silent gap on a reliable channel (§14).
+				if s.unpin() {
+					s.retirePeer(1)
+				}
 				s.rxDropped.Add(1)
 				s.cancel(status.Error(codes.Unavailable, "transport closed during delivery"))
 			}
@@ -1404,13 +1589,38 @@ func (s *serverStream) SendMsg(m any) error {
 	buf.Free()
 
 	if s.desc.stream.ServerStreams {
+		if s.ctx.Err() != nil {
+			// The call is over (client abort, deadline, finish): a handler's
+			// last Send must not spend the connection window toward that
+			// client — shared by every call to it and cumulative — on a
+			// frame that will never go out (§4.2.1). grpc-go returns the
+			// status describing why the stream ended.
+			return ctxErr(s.ctx)
+		}
 		// Flow control (§4.2): park until the client has room, instead of
-		// letting its full buffer stall every call on the channel.
-		stalled, ferr := s.flowTx.acquire(s.ctx, s.ctx.Done(), s.server.mode.timing.Stall, func() {
-			s.protoEvent(ProtocolEvent{Kind: EventFlowStall})
+		// letting its full buffer stall every call on the channel. In
+		// reliable mode a message needs one credit from the stream window
+		// AND one from the client's connection window (§4.2.1); the stall
+		// events say which of the two ran dry.
+		var conn *flowSender
+		if s.reliable && s.ps != nil {
+			conn = &s.ps.connTx
+		}
+		stalled, peer := false, false
+		ferr := acquire2(&s.flowTx, conn, s.ctx, s.ctx.Done(), s.server.mode.timing.Stall, func(p bool) {
+			stalled, peer = true, p
+			if p {
+				s.protoEvent(ProtocolEvent{Kind: EventPeerFlowStall})
+			} else {
+				s.protoEvent(ProtocolEvent{Kind: EventFlowStall})
+			}
 		})
 		if stalled && ferr == nil {
-			s.protoEvent(ProtocolEvent{Kind: EventFlowResume})
+			if peer {
+				s.protoEvent(ProtocolEvent{Kind: EventPeerFlowResume})
+			} else {
+				s.protoEvent(ProtocolEvent{Kind: EventFlowResume})
+			}
 		}
 		if ferr != nil {
 			if ferr == errCallEnded {
@@ -1433,6 +1643,14 @@ func (s *serverStream) SendMsg(m any) error {
 		s.txMu.Unlock()
 		return nil
 	}
+	if s.ctx.Err() != nil {
+		// Ended while acquire2 held the credit: refund both windows, before
+		// a seq is taken or the header is attached to a frame that will
+		// never go out (§4.2.1).
+		s.undoCredit()
+		s.txMu.Unlock()
+		return ctxErr(s.ctx)
+	}
 	f := s.nextFrameLocked()
 	wire, cerr := setPayload(f, s.comp, payload)
 	if cerr == nil {
@@ -1440,17 +1658,13 @@ func (s *serverStream) SendMsg(m any) error {
 	}
 	if cerr != nil {
 		s.txSeq.undo(f.GetSeq())
-		s.flowTx.undo() // the message never reached the wire (§4.2)
+		s.undoCredit() // the message never reached the wire (§4.2)
 		s.txMu.Unlock()
 		return cerr
 	}
 	s.attachHeaderLocked(f, false)
 	s.txMu.Unlock()
 
-	if s.ctx.Err() != nil {
-		// grpc-go returns the status describing why the stream ended.
-		return ctxErr(s.ctx)
-	}
 	if err := s.transmit(s.ctx, f); err != nil {
 		// A synchronous adapter refusal reclaims the seq so the terminal
 		// carrying the handler's real status stays gap-free (see txSeq.undo).
@@ -1471,7 +1685,16 @@ func (s *serverStream) undoRefused(f *Frame, err error) {
 	s.txSeq.undo(f.GetSeq())
 	s.txMu.Unlock()
 	if f.isData() {
-		s.flowTx.undo()
+		s.undoCredit()
+	}
+}
+
+// undoCredit refunds the credit a data frame took from both windows: it
+// never reached the wire (§4.2.1, §4.4).
+func (s *serverStream) undoCredit() {
+	s.flowTx.undo()
+	if s.reliable && s.ps != nil {
+		s.ps.connTx.undo()
 	}
 }
 
@@ -1569,11 +1792,98 @@ func (s *serverStream) recvInto(f *Frame, m any) error {
 // recvBuffered delivers a frame taken out of the rx buffer and returns the
 // slot to the client as flow-control credit (§4.2).
 func (s *serverStream) recvBuffered(f *Frame, m any) error {
+	if !f.isOpen() && s.unpin() {
+		// The connection credit goes back the moment the frame leaves the
+		// buffer, delivered or not (§4.2.1); the stream credit below only
+		// when it was delivered, since a failed delivery ends the call. The
+		// server-streaming request rode the OPEN, which the client never
+		// charged: it returns nothing.
+		s.retirePeer(1)
+	}
 	if err := s.recvInto(f, m); err != nil {
 		return err
 	}
 	s.grantWindow(1)
 	return nil
+}
+
+// pin charges one data frame about to enter rx to this call's connection
+// pin count, or refuses when the bulk return already ran (§4.2.1). It runs
+// BEFORE the enqueue, so the consumer can never unpin a frame that was not
+// yet pinned.
+func (s *serverStream) pin() bool {
+	s.rxMu.Lock()
+	defer s.rxMu.Unlock()
+	if s.rxReleased {
+		return false
+	}
+	s.pinned++
+	return true
+}
+
+// unpin takes one frame off the pin count: it left rx, or never made it in.
+// False means the bulk return at finish already covered it — its credit went
+// back with the call's, and must not go back twice.
+func (s *serverStream) unpin() bool {
+	s.rxMu.Lock()
+	defer s.rxMu.Unlock()
+	if s.pinned == 0 {
+		return false
+	}
+	s.pinned--
+	return true
+}
+
+// releasePinned returns the connection credit of everything still buffered
+// when the call finished, in one grant (§4.2.1). Frames that arrive after it
+// find rxReleased and are credited on the spot. Called outside every lock.
+func (s *serverStream) releasePinned() {
+	s.rxMu.Lock()
+	pinned := s.pinned
+	s.pinned, s.rxReleased = 0, true
+	s.rxMu.Unlock()
+	s.retirePeer(pinned)
+}
+
+// creditUnbuffered returns the connection credit of a data frame this side
+// received and will never buffer — off-shape, unknown flag, seq failure, an
+// overrun refusal (§4.2.1). It never touched outstanding. Anything but a
+// reliable-mode data frame spent no credit.
+func (s *serverStream) creditUnbuffered(f *Frame) {
+	if !s.reliable || s.pf == nil || !f.isData() {
+		return
+	}
+	if g := s.pf.unadmitted(s.key.epoch, 1); g > 0 {
+		s.server.grantPeer(s.ps, g)
+	}
+}
+
+// retirePeer returns the connection credit of n admitted frames of this call
+// that stopped occupying its buffer: consumed, or discarded with the call
+// (§4.2.1).
+func (s *serverStream) retirePeer(n uint32) {
+	if n == 0 || s.pf == nil {
+		return
+	}
+	if g := s.pf.retire(s.key.epoch, n, true); g > 0 {
+		s.server.grantPeer(s.ps, g)
+	}
+}
+
+// raisePeer lifts the client's assumed W_conn to this side's MaxPeerWindow,
+// once per client incarnation (§4.2.1): a sid-0 grant of the difference,
+// right behind the first H sent to that incarnation, so on an ordered channel
+// the client's settle precedes it. It is a MUST, not an optimisation: this
+// side's grant cadence is computed against MaxPeerWindow, so a sender left at
+// W_conn against a larger window would park before any batched grant fired.
+// Best-effort against a draining peer, like the H it follows.
+func (s *serverStream) raisePeer() {
+	if !s.reliable || s.pf == nil || !s.ps.raised.CompareAndSwap(false, true) {
+		return
+	}
+	if g := s.pf.excess(); g > 0 {
+		s.server.grantPeer(s.ps, g)
+	}
 }
 
 // grantWindow sends flow-control credit for consumed messages.

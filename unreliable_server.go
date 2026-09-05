@@ -62,6 +62,18 @@ type peerState struct {
 	maxTombs     int // §15 caps, copied from the Server at creation
 	maxTombBytes int
 
+	// connTx is the connection window toward this client incarnation
+	// (PROTOCOL.md §4.2.1): assumed at wConn when the container is created
+	// on a reliable channel, settled by its first admitted OPEN, credited
+	// by sid-0 WINDOWs routed on (peer, epoch). Per incarnation, not per
+	// transport peer: a restarted client at the same key counts from zero,
+	// and a sender that kept counting the dead incarnation's frames would
+	// park every call to the new one forever. raised latches the one sid-0
+	// raise this incarnation is owed (§4.2.1) — the receiver's ledger is per
+	// transport peer, so the latch cannot live there. Self-synchronised.
+	connTx flowSender
+	raised atomic.Bool
+
 	lastRx   atomic.Int64 // validated frames only (§9.1)
 	lastTx   atomic.Int64
 	lastPing atomic.Int64
@@ -181,6 +193,23 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time, reliable bool) *pe
 		return ps
 	}
 
+	// An incarnation coming back takes the sender position the ledger kept
+	// for it (§9.4) out BEFORE the cap below puts the container it evicts
+	// in: the ledger is capped too, oldest dropped first, and with it full
+	// and this incarnation its oldest entry, the eviction's stash would drop
+	// this very position one statement before it was looked for — the
+	// incarnation would start over with exactly 2 × MaxDeadPeers idle
+	// incarnations on the key, where §16 says only more than that does.
+	// Taken out first, the ledger goes N → N−1 → N and the trim never runs
+	// on the one coming back.
+	var held senderState
+	var heldRaised, restored bool
+	if reliable {
+		if pf := s.peerFlow[ek.peer]; pf != nil {
+			held, heldRaised, restored = pf.unstash(ek.epoch)
+		}
+	}
+
 	// Cap dead containers of this transport peer.
 	dead := make([]*peerState, 0, 4)
 	for k, p := range s.peers {
@@ -195,17 +224,22 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time, reliable bool) *pe
 				oldest = p
 			}
 		}
+		if oldest.reliable {
+			// The incarnation may only be idle: its connection sender's
+			// position — credit, settle, the raise it already got — is kept
+			// in the peer's ledger, so that its next OPEN continues it rather
+			// than starting over at wConn against a client that raised it
+			// (§4.2.1, §15). Bounded there like the containers are here.
+			pf := s.ensurePeerFlowLocked(oldest.peer)
+			pf.stash(oldest.epoch, oldest.connTx.state(), oldest.raised.Load())
+		}
 		delete(s.peers, epochKey{peer: oldest.peer, epoch: oldest.epoch})
 	}
 
-	txCtx := s.root
-	if ek.peer != nil {
-		txCtx = NewPeerContext(txCtx, ek.peer)
-	}
 	ps = &peerState{
 		peer:         ek.peer,
 		epoch:        ek.epoch,
-		txCtx:        txCtx,
+		txCtx:        s.peerTxCtx(ek.peer),
 		reliable:     reliable,
 		tombs:        map[uint32]*srvTomb{},
 		created:      now,
@@ -214,6 +248,19 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time, reliable bool) *pe
 	}
 	ps.lastRx.Store(now.UnixNano())
 	ps.lastTx.Store(now.UnixNano())
+	if reliable {
+		// This side paces itself toward the new incarnation by W_conn from
+		// its first data frame (§4.2.1) — unless the incarnation was here
+		// before and the cap evicted its container: then it continues from
+		// the position the ledger held for it (taken out above). Unreliable
+		// mode has no connection window, as it has no per-stream one.
+		if restored {
+			ps.connTx.restore(held)
+			ps.raised.Store(heldRaised)
+		} else {
+			ps.connTx.assume(wConn)
+		}
+	}
 	s.peers[ek] = ps
 	if !reliable {
 		s.sawUnreliable.Store(true)

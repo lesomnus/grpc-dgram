@@ -802,6 +802,72 @@ func TestStats_CountersFlowStall(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// §4.2.1 / §14 connection window: a sender out of CONNECTION credit is a
+// peer-flow stall, never a flow stall — the remedies differ ("this consumer
+// stopped" vs "raise MaxPeerWindow or find the other slow consumer") and an
+// operator must be able to tell them apart in one counter — and it is
+// observable WHILE parked, with the parked call's sid and method. The resume
+// is its own event, so a stuck sender is distinguishable from one that
+// recovered.
+// ---------------------------------------------------------------------------
+
+// Pins §14: "flow-stall counters (per stream and per peer, §4.2.1)".
+func TestStats_CountersPeerFlow(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		counters := &drpc.Counters{}
+		log := &stEventLog{}
+		gate := make(chan struct{})
+		client, stop := PipeOption{
+			ConnOpts: []drpc.ConnOption{
+				drpc.WithReliable(true),
+				drpc.WithProtocolStats(counters), drpc.WithProtocolStats(log),
+			},
+			ServerOpts: []drpc.ServerOption{drpc.WithReliable(true), gateStreams(gate)},
+		}.Use(t)
+		defer stop()
+
+		// W_conn/W_init calls each fill exactly their own window: the whole
+		// connection window is spent and no stream window ever was.
+		streams := spendWConn(t, client)
+		x.Equal(t, uint64(0), counters.Snapshot().FlowStall)
+
+		// One more call, one more message: its stream window is untouched,
+		// the connection window is empty. With the handlers gated shut
+		// nothing returns credit: the sender is parked right now, and the
+		// stall is already visible — as a PEER stall.
+		extra, err := client.Buff(t.Context())
+		x.NoError(t, err)
+		sent := make(chan error, 1)
+		go func() { sent <- extra.Send(echo.EchoRequest_builder{Message: "m"}.Build()) }()
+		synctest.Wait()
+		snap := counters.Snapshot()
+		x.Equal(t, uint64(1), snap.PeerFlowStall)
+		x.Equal(t, uint64(0), snap.FlowStall, "the stream window had credit")
+		x.Equal(t, uint64(0), snap.PeerFlowResume, "a parked sender has not resumed")
+		x.Equal(t, 0, len(log.of(drpc.EventFlowStall)))
+
+		ev := log.first(t, drpc.EventPeerFlowStall)
+		x.Equal(t, uint32(len(streams)+1), ev.Sid, "the parked call's sid")
+		x.Equal(t, echo.EchoService_Buff_FullMethodName, ev.Method)
+
+		// Draining the buffers returns credit on sid 0, which unparks the
+		// sender.
+		close(gate)
+		x.NoError(t, <-sent)
+		for _, s := range append(streams, extra) {
+			_, err := s.CloseAndRecv()
+			x.NoError(t, err)
+		}
+		snap = counters.Snapshot()
+		x.Equal(t, uint64(1), snap.PeerFlowResume)
+		x.Equal(t, uint64(0), snap.FlowStall)
+		x.Equal(t, uint64(0), snap.FlowResume)
+		x.Equal(t, echo.EchoService_Buff_FullMethodName, log.first(t, drpc.EventPeerFlowResume).Method)
+		x.True(t, countMatch(client.rxFrames(), isPeerGrant) > 0, "the credit came back on sid 0")
+	})
+}
+
+// ---------------------------------------------------------------------------
 // §4.2 / §14: the rx buffer's DROP POLICY discards messages in unreliable
 // mode, and §14 promises that loss is counted ("per-stream drop ... counters"
 // alongside the skipped counter) — a drop is otherwise invisible: the frame

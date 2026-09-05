@@ -282,10 +282,10 @@ calls do exactly that; a busy spin wedges the process.
 - **No keepalive, deliberately.** Two endpoints in one process cannot be
   partitioned, and an unanswered ping would only measure how busy the peer is.
 - **`postMessage` applies no backpressure**, and that is fine: in reliable mode
-  per-stream flow control (§4.2.1) bounds what a conforming peer can put in
-  flight, so the receive queue cannot grow without limit. A received message is
-  never dropped — in reliable mode a gap is a protocol error, not a lost
-  datagram.
+  flow control (§4.2.1) bounds what a conforming peer can put in flight — per
+  stream by the advertised window, in all by `Limits.MaxPeerWindow` — so the
+  receive queue cannot grow without limit. A received message is never dropped
+  — in reliable mode a gap is a protocol error, not a lost datagram.
 - **`Close` closes the port.** On a `MessagePort` that detaches it; on a
   dedicated worker's global scope `close()` ends the worker — which is what
   "this endpoint is going away" means there, but do not call it expecting the

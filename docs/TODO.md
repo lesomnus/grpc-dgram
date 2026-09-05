@@ -33,9 +33,11 @@ message rate is the entry condition.
 
 **Interaction with flow control (new in v1.1).** Credit is accounted in
 *messages* (§4.2.1); a batch is a *transport message*. Open questions: if a
-sender runs out of credit mid-batch, does it flush the partial batch or park
-holding it? May a `WINDOW` grant ride the same batch as data — and if it does,
-can a credit update end up waiting behind the very frames it would release?
+sender runs out of credit mid-batch — on its stream window or on the peer's
+connection window — does it flush the partial batch or park holding it? May a
+`WINDOW` grant, per-stream or `sid = 0`, ride the same batch as data — and if
+it does, can a credit update end up waiting behind the very frames it would
+release?
 
 **Interaction with compression (new in v1.1).** Per-frame compression (§12.1) or
 per-batch? Per-batch compresses better across small similar messages but makes
@@ -72,11 +74,21 @@ The port deliberately stops short of the Go feature set in three places
   grpc-go `stats.Handler` type has no TS counterpart and is not mirrored;
 - **`Envelop` batching**, which follows item 1 in both languages.
 
+And one gap that is not deliberate, only sequenced: the **connection window**
+(`WINDOW sid=0`, §4.2.1) is in the Go core and the spec (Appendix A, entry
+11), not yet in the port. Until the mirror lands a TS endpoint neither grants
+on sid 0 nor assumes `W_conn`, so a Go streaming sender talking to it parks
+after 1024 cumulative data frames (the Direction A failure Appendix A
+states); the existing cross-language cases stay well below that. The mirror
+is `W_CONN`, `FlowSender.confirm`, `acquireBoth`, `PeerFlowRx`,
+`maxPeerWindow`, the two `peer-flow-*` event kinds, and then a conformance
+case that moves more than `W_conn` messages each way across three streams —
+which also needs `ts/test/wasm.test.ts`'s `grantsOf` split into per-stream
+and `sid = 0` grants, since the shared Go instance's peer ledger is
+cumulative across cases.
+
 ## 4. Smaller, unowned
 
-- **Connection-level flow control.** §4.2.1 bounds a *stream*; the aggregate a
-  peer can pin is still `MaxLiveCalls × window`. A per-peer window (HTTP/2 has
-  one) would make the memory bound meaningful, and `Limits` is where it belongs.
 - **A `Peer()` for the pion adapter that names the ICE candidate pair** instead
   of the DataChannel label, so `peer.FromContext` reports a routable address.
 - **Reserved wire space.** §5 lists what is reserved for future work: the `ack`

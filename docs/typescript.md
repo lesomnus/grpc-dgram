@@ -148,6 +148,15 @@ type; the drpc half, `ProtocolStats`/`Counters`, is ported — see
 batching** — the last one is unbuilt in Go too ([TODO.md](./TODO.md)). These
 are gaps, not divergences: the wire is identical either way.
 
+One more gap is sequenced rather than deliberate, and until it closes it *is*
+a behavioral divergence: the **connection window** (`WINDOW sid = 0`,
+§4.2.1) is in the Go core and the spec but not yet in the port. A TS endpoint
+neither grants on sid 0 nor assumes `W_conn`, so a Go streaming sender
+talking to it parks after 1024 cumulative data frames per connection and
+fails `UNAVAILABLE` at `T_stall` on that send and on every later one
+(PROTOCOL.md Appendix A, entry 11); the existing cross-language cases stay
+well below that. [TODO.md §3](./TODO.md) lists what the mirror consists of.
+
 One genuine environmental difference: a browser `RTCDataChannel` cannot pause
 delivery, so inbound messages queue in the adapter while a slow consumer
 drains. Since v1.1 the protocol paces the *sender* instead

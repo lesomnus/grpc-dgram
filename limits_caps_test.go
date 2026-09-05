@@ -475,3 +475,98 @@ func TestLimits_LivenessExpirySideEffects(t *testing.T) {
 		x.Equal(t, 0, len(ls.drain()), "key-only tombstone: straggler draws silence")
 	})
 }
+
+// ---------------------------------------------------------------------------
+// §4.2.1 / §15 connection-window scope: the receiver's bound is per TRANSPORT
+// PEER across client epochs — an epoch-spoofing peer pins no more — while the
+// sender's credit is per (peer, client-epoch) container: each incarnation's
+// first admitted OPEN settles its own sender and draws its own raise. A
+// different transport peer has its own bound.
+// ---------------------------------------------------------------------------
+
+// Pins §4.2.1 Scope: "the receiver's bound is per transport peer, across
+// client epochs on the server ... the sender's credit is per peer
+// incarnation".
+func TestLimits_PeerWindowScope(t *testing.T) {
+	const window = 2048 // above the W_conn floor, so the raise is observable
+	// Reliable (the connection window is reliable-only), per-stream buffers
+	// of a whole window so only the connection window can trip, handlers
+	// that never read so everything stays buffered.
+	ls := newLcServer(t,
+		drpc.WithReliable(true),
+		drpc.WithRxBuffer(window, drpc.DropNewest),
+		drpc.WithLimits(drpc.Limits{MaxPeerWindow: window}),
+		drpc.StreamInterceptor(func(_ any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, _ grpc.StreamHandler) error {
+			<-ss.Context().Done()
+			return nil
+		}))
+	const peerA = "peer-window-a"
+	const peerB = "peer-window-b"
+	const epochA uint32 = 0x4A
+	const epochB uint32 = 0x4B // a "fresh incarnation" of the same transport peer
+	const epochC uint32 = 0x4C
+
+	isPeerGrantFor := func(epoch uint32) func(*drpc.Frame) bool {
+		return func(f *drpc.Frame) bool { return isPeerGrant(f) && f.GetPeerEpoch() == epoch }
+	}
+
+	// Two bidi calls under epoch A: the first H is followed by A's raise
+	// (window − W_conn, naming A), the second draws none.
+	for sid := uint32(1); sid <= 2; sid++ {
+		ls.handleAs(peerA, lcLiveOpen(epochA, sid))
+		h := ls.recv(t)
+		x.True(t, h != nil && h.GetFlags() == 0 && !h.HasPayload(), "creation ack H (§8)")
+		if sid == 1 {
+			raise := ls.recv(t)
+			x.True(t, raise != nil && isPeerGrantFor(epochA)(raise), "the raise rides behind the first H, got ", raise)
+			x.Equal(t, uint32(window-wConnTest), raise.GetWindow())
+		}
+	}
+	// Fill peerA's whole bound across the two calls: nothing is refused.
+	for i := range uint32(window / 2) {
+		ls.handleAs(peerA, lcData(epochA, 1, 2+i, nil))
+		ls.handleAs(peerA, lcData(epochA, 2, 2+i, nil))
+	}
+	ls.expectNone(t, "exactly the window fits")
+
+	// A call under a DIFFERENT client epoch of the SAME peer: its own sender
+	// (settled by its OPEN, raised behind its H, naming B)...
+	ls.handleAs(peerA, lcLiveOpen(epochB, 1))
+	h := ls.recv(t)
+	x.True(t, h != nil && h.GetFlags() == 0 && !h.HasPayload(), "creation ack H for the new incarnation")
+	raise := ls.recv(t)
+	x.True(t, raise != nil && isPeerGrantFor(epochB)(raise), "each incarnation is owed its own raise, got ", raise)
+	// ...but the SAME receive bound: one more frame from this peer is one
+	// too many, and it fails its own call INTERNAL, naming the window.
+	// The refused frame's credit comes straight back beside the terminal:
+	// the window was full, so the starvation clause grants it at once
+	// (§4.2.1) — to B, whose call it was — from the receive path, while the
+	// T follows from the handler as it unwinds. Epoch A's calls are
+	// untouched.
+	ls.handleAs(peerA, lcData(epochB, 1, 2, nil))
+	var term, g *drpc.Frame
+	for range 2 {
+		switch f := ls.recv(t); {
+		case f == nil:
+			t.Fatal("expected a terminal and a grant")
+		case isTerminal(f):
+			term = f
+		case isPeerGrant(f):
+			g = f
+		}
+	}
+	x.True(t, term != nil, "the overrun fails the offending call")
+	x.Equal(t, codes.Internal, codes.Code(term.GetCode()))
+	x.Equal(t, epochB, term.GetPeerEpoch())
+	x.True(t, strings.Contains(term.GetDesc(), "connection flow-control window"), term.GetDesc())
+	x.True(t, g != nil && isPeerGrantFor(epochB)(g) && g.GetWindow() == 1, "got ", g)
+	ls.expectNone(t, "epoch A's calls are untouched")
+
+	// A different transport peer is under ITS OWN bound: admitted, buffered.
+	ls.handleAs(peerB, lcLiveOpen(epochC, 1))
+	h = ls.recv(t)
+	x.True(t, h != nil && h.GetFlags() == 0 && !h.HasPayload(), "creation ack for the other peer")
+	_ = ls.recv(t) // its raise
+	ls.handleAs(peerB, lcData(epochC, 1, 2, nil))
+	ls.expectNone(t, "the other peer's frame is buffered")
+}

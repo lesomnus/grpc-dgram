@@ -22,8 +22,9 @@ side you are on.
   (deadlines, retransmission, tombstones, liveness, probes) that guarantees no
   call hangs.
 - **[Reliable mode](./reliable-mode.md)** — WebSocket and reliable
-  DataChannel: strict sequencing, and the per-stream flow control that keeps
-  one slow consumer from stalling every call on the channel.
+  DataChannel: strict sequencing, the per-stream flow control that keeps one
+  slow consumer from stalling every call on the channel, and the per-peer
+  connection window that bounds what one peer can pin across all of them.
 
 ## Reference
 

@@ -18,8 +18,9 @@ const (
 	FlagReset
 	// FlagPing is a liveness keepalive (sid 0) or stream probe (sid != 0).
 	FlagPing
-	// FlagWindow is a stateless flow-control grant for the frame's sid: its
-	// window field adds that many messages of credit (reliable mode, §4.2).
+	// FlagWindow is a stateless flow-control grant: its window field adds
+	// that many messages of credit — for the call named by sid, or for the
+	// peer's connection window when sid is 0 (reliable mode, §4.2.1).
 	FlagWindow
 	// FlagCompressed marks a frame whose payload is compressed with the
 	// call's compressor (§12.1). Orthogonal to the shape flags.

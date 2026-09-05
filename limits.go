@@ -31,6 +31,7 @@ const (
 	defaultMaxResets      = 1024
 	defaultMaxLiveCalls   = 4096
 	defaultMaxReplies     = 64
+	defaultMaxPeerWindow  = 1024 // = wConn (flow.go)
 	defaultRxDropNewest   = DropNewest
 	defaultMaxHandlerZero = 0
 )
@@ -56,7 +57,8 @@ func (c rxConfig) withReliableFloor(reliable bool) rxConfig {
 }
 
 // Limits bounds the server's per-peer bookkeeping (PROTOCOL.md §15). Zero
-// fields keep their defaults. On a Conn only MaxPendingResets applies.
+// fields keep their defaults. On a Conn only MaxPendingResets and
+// MaxPeerWindow apply.
 type Limits struct {
 	// MaxTombstones caps stored tombstone entries per peer incarnation. Past
 	// it the lowest sid is evicted and the container's floor rises: evicted
@@ -80,6 +82,15 @@ type Limits struct {
 	// server volunteers within one RTI — tombstone/creation-ack replays and
 	// RESETs — on top of the per-object 1/RTI limits (anti-amplification).
 	MaxRepliesPerRTI int
+	// MaxPeerWindow caps, in messages, what one transport peer may have
+	// buffered here across all of its calls and client epochs — the
+	// connection flow-control window (§4.2.1, reliable mode only); on a Conn
+	// it bounds the one peer the Conn talks to. Values below W_conn (1024)
+	// are raised to it: a sender assumes W_conn before any sid-0 grant, so a
+	// receiver holding less would be overrun by a conforming sender — the
+	// same reason the rx buffer is floored at W_init. Past it, the frame that
+	// overruns fails its own call with INTERNAL, never the peer.
+	MaxPeerWindow int
 }
 
 func (l Limits) withDefaults() Limits {
@@ -100,6 +111,12 @@ func (l Limits) withDefaults() Limits {
 	}
 	if l.MaxRepliesPerRTI <= 0 {
 		l.MaxRepliesPerRTI = defaultMaxReplies
+	}
+	if l.MaxPeerWindow <= 0 {
+		l.MaxPeerWindow = defaultMaxPeerWindow
+	}
+	if l.MaxPeerWindow < int(wConn) {
+		l.MaxPeerWindow = int(wConn) // the sender's assumption, see above
 	}
 	return l
 }

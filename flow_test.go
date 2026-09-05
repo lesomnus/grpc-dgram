@@ -17,7 +17,14 @@ package drpc_test
 //     is refunded (§4.4) so a handler that ignores the error never parks
 //     forever;
 //   - the reliable-mode rx-buffer floor of W_init that makes the sender's
-//     assumption safe (§4.2.1, Appendix B).
+//     assumption safe (§4.2.1, Appendix B);
+//   - the connection window beside the per-stream one (§4.2.1, §15), end to
+//     end and cross-cutting: sid 0 silent in unreliable mode and stateless in
+//     reliable mode, the raise, the single T_stall budget across both windows,
+//     no credit held while parked on the other window, and the leak test —
+//     one credit back for every data frame, over a long-lived Conn. The client
+//     and server halves against scripted peers are flow_peer_client_test.go
+//     and flow_peer_server_test.go.
 
 import (
 	"context"
@@ -35,6 +42,7 @@ import (
 	"github.com/lesomnus/grpc-dgram/internal/x"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -636,4 +644,722 @@ func TestFlow_ReliableRxBufferFloorAndOverrun(t *testing.T) {
 	x.True(t, term != nil, "the overrun must fail the call")
 	x.Equal(t, drpc.FlagClose, term.GetFlags())
 	x.Equal(t, codes.Internal, codes.Code(term.GetCode()))
+}
+
+// ---------------------------------------------------------------------------
+// Connection window (§4.2.1, §15): the end-to-end and cross-cutting twins on
+// this file's harnesses — the pipe, the crafted peer, the inject server. Each
+// pins one sentence of §4.2.1 and says which.
+// ---------------------------------------------------------------------------
+
+// gateStreams is a stream interceptor that holds every streaming handler
+// until gate is closed — a consumer that has not started reading yet — and
+// then runs it.
+func gateStreams(gate <-chan struct{}) drpc.ServerOption {
+	return drpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		select {
+		case <-gate:
+			return handler(srv, ss)
+		case <-ss.Context().Done():
+			return nil
+		}
+	})
+}
+
+// spendWConn opens W_conn/W_init client-streaming calls and sends exactly
+// W_init on each: the whole connection window, with no stream window ever
+// full — so whatever parks next parks on the connection window alone, and
+// the events say so unambiguously.
+func spendWConn(t *testing.T, client echo.EchoServiceClient) []echo.EchoService_BuffClient {
+	t.Helper()
+	streams := make([]echo.EchoService_BuffClient, 0, wConnTest/wInitTest)
+	for range wConnTest / wInitTest {
+		s, err := client.Buff(t.Context())
+		x.NoError(t, err)
+		sendN(t, s, int(wInitTest))
+		streams = append(streams, s)
+	}
+	return streams
+}
+
+// halfCloseFrame builds a client half-close: CLOSE without a code (§8).
+func halfCloseFrame(epoch, sid, seq uint32) *drpc.Frame {
+	f := &drpc.Frame{}
+	f.SetEpoch(epoch)
+	f.SetSid(sid)
+	f.SetSeq(seq)
+	f.SetFlags(drpc.FlagClose)
+	return f
+}
+
+// Pins §4.2.1 Unreliable mode: "no assumption, no ledger, no raise, and a
+// WINDOW sid = 0 is dropped like every other WINDOW there."
+func TestPeerWindow_SilentInUnreliableMode(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		// A sid-0 grant of one message forged in each direction, right behind
+		// the first frame each way. The OPEN names the client incarnation and
+		// the creation ack echoes it (§6.1), so neither forgery is dropped for
+		// its epoch: only the mode can drop them.
+		forge := func(once *atomic.Bool) func(drpc.FrameHandler) drpc.FrameHandler {
+			return func(next drpc.FrameHandler) drpc.FrameHandler {
+				return drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
+					if err := next.Handle(ctx, f); err != nil {
+						return err
+					}
+					if !once.CompareAndSwap(false, true) {
+						return nil
+					}
+					return next.Handle(ctx, windowFrame(f.GetEpoch(), f.GetPeerEpoch(), 0, 1))
+				})
+			}
+		}
+		var c2s, s2c atomic.Bool
+		clientEvents, serverEvents := &flowEvents{}, &flowEvents{}
+		client, stop := PipeOption{
+			ConnOpts: []drpc.ConnOption{
+				drpc.WithReliable(false), drpc.WithTiming(fastTiming), drpc.WithProtocolStats(clientEvents),
+			},
+			ServerOpts: []drpc.ServerOption{
+				drpc.WithReliable(false), drpc.WithTiming(fastTiming), drpc.WithProtocolStats(serverEvents),
+			},
+			C2S: forge(&c2s),
+			S2C: forge(&s2c),
+		}.Use(t)
+		defer stop()
+
+		stream, err := client.Buff(t.Context())
+		x.NoError(t, err)
+		synctest.Wait() // the OPEN, its ack and both forgeries have landed
+		x.True(t, c2s.Load() && s2c.Load(), "both forgeries must have been delivered")
+
+		// Well past what a (wrongly) adopted one-message window would allow,
+		// in the client's direction...
+		const burst = 40
+		sendN(t, stream, burst)
+		_, err = stream.CloseAndRecv()
+		x.NoError(t, err)
+		// ...and in the server's.
+		many, err := client.Many(t.Context(), echo.EchoRequest_builder{Message: "m", Repeat: burst}.Build())
+		x.NoError(t, err)
+		n := 0
+		for {
+			if _, err := many.Recv(); err == io.EOF {
+				break
+			} else {
+				x.NoError(t, err)
+			}
+			n++
+		}
+		x.Equal(t, burst, n)
+		for _, ev := range []*flowEvents{clientEvents, serverEvents} {
+			x.Equal(t, 0, ev.count(drpc.EventPeerFlowStall), "no connection window to park on")
+			x.Equal(t, 0, ev.count(drpc.EventFlowStall))
+		}
+
+		// Neither side answered its forgery (§9.3), and neither grants on sid
+		// 0 itself: the forgery is the only WINDOW on the wire each way.
+		tx, rx := client.txFrames(), client.rxFrames()
+		x.Equal(t, 0, countMatch(tx, isResetFrame), "the server must not RESET a stray sid-0 grant")
+		x.Equal(t, 0, countMatch(rx, isResetFrame), "the client must not RESET a stray sid-0 grant")
+		x.Equal(t, 1, countMatch(tx, isWindowFrame), "unreliable mode sends no WINDOW frames")
+		x.Equal(t, 1, countMatch(rx, isWindowFrame))
+		x.True(t, isPeerGrant(firstMatch(tx, isWindowFrame)) && isPeerGrant(firstMatch(rx, isWindowFrame)),
+			"the one WINDOW each way is the forgery")
+	})
+}
+
+// Pins §4.2.1 Grants: a sid-0 WINDOW the receiver holds no container for is
+// dropped "never validated (§9.1), never answered with a RESET (§9.3), never
+// creating state" — and it never enables: the call that follows runs on its
+// per-stream window exactly as it would have without the stray grant. (The
+// white-box half, no container and no ledger, is server_internal_test.go.)
+func TestPeerWindow_Sid0NeverEnablesOrCreatesState(t *testing.T) {
+	is := newInjectServer(t) // reliable: replies are immediate and synchronous
+	const epoch, sid = uint32(0xC0FFEE), uint32(3)
+
+	// Before any OPEN: silence.
+	is.handle(windowFrame(epoch, 0, 0, 4))
+	select {
+	case f := <-is.out:
+		t.Fatalf("a sid-0 WINDOW before any OPEN must be silent, got: %v", f)
+	default:
+	}
+
+	// The OPEN that follows is admitted as usual...
+	is.handle(flowBuffOpen(epoch, sid, wInitTest))
+	ack := is.recv(t)
+	x.True(t, ack != nil && isAckH(ack), "the call must be acked, got ", ack)
+	x.Equal(t, wInitTest, ack.GetWindow())
+
+	// ...and its 40-message Buff runs on per-stream grants alone — one per
+	// half window consumed, on the call's own sid, which this scripted client
+	// honours like a real one — with nothing on sid 0: at the default
+	// MaxPeerWindow there is no raise, and 40 consumed is far from a batch.
+	const n = 40
+	item, err := proto.Marshal(echo.EchoRequest_builder{Message: "m", Repeat: 1}.Build())
+	x.NoError(t, err)
+	for i := range wInitTest {
+		is.handle(lcData(epoch, sid, 2+i, item)) // exactly the advertised window
+	}
+	g := is.recv(t)
+	x.True(t, g != nil && isWindowFrame(g), "half a window consumed grants half a window, got ", g)
+	x.Equal(t, sid, g.GetSid(), "a per-stream grant, on the call's own sid")
+	x.Equal(t, wInitTest/2, g.GetWindow())
+	for i := wInitTest; i < n; i++ {
+		is.handle(lcData(epoch, sid, 2+i, item)) // within the grant
+	}
+	is.handle(halfCloseFrame(epoch, sid, 2+n))
+	grants := []*drpc.Frame{g}
+	var term *drpc.Frame
+	for term == nil {
+		f := is.recv(t)
+		x.True(t, f != nil, "the call must complete")
+		switch {
+		case isTerminal(f):
+			term = f
+		case isWindowFrame(f):
+			grants = append(grants, f)
+		default:
+			t.Fatalf("unexpected frame: %v", f)
+		}
+	}
+	x.Equal(t, codes.OK, codes.Code(term.GetCode()))
+	res := &echo.EchoBatchResponse{}
+	x.NoError(t, proto.Unmarshal(term.GetPayload(), res))
+	x.Equal(t, n, len(res.GetItems()))
+	x.Equal(t, 2, len(grants), "40 consumed against a window of 32: two grants of 16, none on sid 0")
+	for _, g := range grants {
+		x.Equal(t, sid, g.GetSid(), "every grant is a per-stream one")
+		x.Equal(t, wInitTest/2, g.GetWindow())
+	}
+}
+
+// Pins §4.2.1 Raise: "A receiver whose MaxPeerWindow exceeds W_conn MUST lift
+// the sender's assumption once per peer incarnation with a sid = 0 grant of
+// MaxPeerWindow − W_conn" — the server right behind its first H, the client
+// right behind its first OPEN — and "A receiver at the floor sends none."
+func TestPeerWindow_Raise(t *testing.T) {
+	const window = 2 * wConnTest
+	limits := drpc.WithLimits(drpc.Limits{MaxPeerWindow: window})
+	isOpen := func(f *drpc.Frame) bool { return f.GetFlags()&drpc.FlagOpen != 0 }
+
+	t.Run("server: behind the first H, naming the client incarnation", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			client, stop := PipeOption{
+				ConnOpts:   []drpc.ConnOption{drpc.WithReliable(true)},
+				ServerOpts: []drpc.ServerOption{drpc.WithReliable(true), limits},
+			}.Use(t)
+			defer stop()
+
+			a, err := client.Buff(t.Context())
+			x.NoError(t, err)
+			b, err := client.Buff(t.Context())
+			x.NoError(t, err)
+			synctest.Wait()
+
+			// Exactly: the first call's ack, the raise, the second call's ack.
+			rx := client.rxFrames()
+			x.Equal(t, 3, len(rx), "got ", rx)
+			x.True(t, isAckH(rx[0]) && rx[0].GetSid() == 1, "the first H, got ", rx[0])
+			raise := rx[1]
+			x.True(t, isPeerGrant(raise), "the raise rides right behind the first H, got ", raise)
+			x.Equal(t, uint32(window-wConnTest), raise.GetWindow())
+			x.Equal(t, rx[0].GetEpoch(), raise.GetEpoch(), "the server's own epoch")
+			x.Equal(t, firstMatch(client.txFrames(), isOpen).GetEpoch(), raise.GetPeerEpoch(),
+				"names the client incarnation it lifts (§6.1)")
+			x.True(t, isAckH(rx[2]) && rx[2].GetSid() == 2, "the second H draws no raise, got ", rx[2])
+
+			for _, s := range []echo.EchoService_BuffClient{a, b} {
+				_, err := s.CloseAndRecv()
+				x.NoError(t, err)
+			}
+		})
+	})
+	t.Run("client: behind the first OPEN", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			client, stop := PipeOption{
+				ConnOpts:   []drpc.ConnOption{drpc.WithReliable(true), limits},
+				ServerOpts: []drpc.ServerOption{drpc.WithReliable(true)},
+			}.Use(t)
+			defer stop()
+
+			a, err := client.Buff(t.Context())
+			x.NoError(t, err)
+			b, err := client.Buff(t.Context())
+			x.NoError(t, err)
+			synctest.Wait()
+
+			// Exactly: the first OPEN, the raise, the second OPEN.
+			tx := client.txFrames()
+			x.Equal(t, 3, len(tx), "got ", tx)
+			x.True(t, isOpen(tx[0]) && tx[0].GetSid() == 1, "the first OPEN, got ", tx[0])
+			raise := tx[1]
+			x.True(t, isPeerGrant(raise), "the raise rides right behind the first OPEN, got ", raise)
+			x.Equal(t, uint32(window-wConnTest), raise.GetWindow())
+			x.Equal(t, tx[0].GetEpoch(), raise.GetEpoch(), "the client's own epoch")
+			x.True(t, isOpen(tx[2]) && tx[2].GetSid() == 2, "the second OPEN draws no raise, got ", tx[2])
+
+			for _, s := range []echo.EchoService_BuffClient{a, b} {
+				_, err := s.CloseAndRecv()
+				x.NoError(t, err)
+			}
+		})
+	})
+	t.Run("honoured: exactly MaxPeerWindow frames go out unparked", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			events := &flowEvents{}
+			client, stop := PipeOption{
+				ConnOpts: []drpc.ConnOption{drpc.WithReliable(true), drpc.WithProtocolStats(events)},
+				// A per-stream window above MaxPeerWindow and a handler that
+				// never reads: only the connection window can bind, and the
+				// park is unambiguously its.
+				ServerOpts: []drpc.ServerOption{
+					drpc.WithReliable(true), limits, drpc.WithRxBuffer(2*window, drpc.DropNewest), blockStreams(),
+				},
+			}.Use(t)
+			defer stop()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			stream, err := client.Buff(ctx)
+			x.NoError(t, err)
+			synctest.Wait() // the ack and the raise have landed
+			sendN(t, stream, window)
+			x.Equal(t, 0, events.count(drpc.EventPeerFlowStall), "W_conn + the raise go out unparked")
+			x.Equal(t, 0, events.count(drpc.EventFlowStall))
+
+			done := make(chan error, 1)
+			go func() { done <- stream.Send(echo.EchoRequest_builder{Message: "m"}.Build()) }()
+			defer func() { <-done }()
+			synctest.Wait()
+			x.Equal(t, 1, events.count(drpc.EventPeerFlowStall), "the next one parks: the lifted window is exact")
+			x.Equal(t, 0, events.count(drpc.EventFlowStall))
+			x.Equal(t, window, countMatch(client.txFrames(), isDataFrame))
+			cancel() // releases the parked send
+		})
+	})
+	t.Run("at the floor: none, and W_conn still fits", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			// MaxPeerWindow below W_conn on both sides is raised to it: a
+			// receiver holding less than a sender assumes would be overrun
+			// by a conforming sender (§4.2.1 Assumption).
+			floored := drpc.WithLimits(drpc.Limits{MaxPeerWindow: 100})
+			events := &flowEvents{}
+			gate := make(chan struct{})
+			client, stop := PipeOption{
+				ConnOpts:   []drpc.ConnOption{drpc.WithReliable(true), floored, drpc.WithProtocolStats(events)},
+				ServerOpts: []drpc.ServerOption{drpc.WithReliable(true), floored, gateStreams(gate)},
+			}.Use(t)
+			defer stop()
+
+			streams := spendWConn(t, client) // W_conn messages buffered across 32 calls
+			synctest.Wait()
+			x.Equal(t, 0, countMatch(client.txFrames(), isPeerGrant), "nothing to raise by")
+			x.Equal(t, 0, countMatch(client.rxFrames(), isPeerGrant))
+			x.Equal(t, 0, countMatch(client.rxFrames(), isTerminal), "W_conn unread messages fit: no INTERNAL")
+			x.Equal(t, 0, events.count(drpc.EventPeerFlowStall))
+			x.Equal(t, 0, events.count(drpc.EventFlowStall))
+
+			close(gate)
+			for _, s := range streams {
+				_, err := s.CloseAndRecv()
+				x.NoError(t, err)
+			}
+		})
+	})
+}
+
+// Pins §4.2.1 Raise: the client raises "right behind its first OPEN (the OPEN
+// creates the container the grant addresses, admitted or rejected — §9.4)".
+func TestPeerWindow_RaiseLandsAfterARejectedFirstOpen(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		const window = 2 * wConnTest
+		events := &flowEvents{}
+		client, stop := PipeOption{
+			ConnOpts: []drpc.ConnOption{
+				drpc.WithReliable(true),
+				drpc.WithLimits(drpc.Limits{MaxPeerWindow: window}),
+				drpc.WithRxBuffer(window, drpc.DropNewest), // the stream window never binds
+			},
+			ServerOpts: []drpc.ServerOption{drpc.WithReliable(true), drpc.WithProtocolStats(events)},
+		}.Use(t)
+		defer stop()
+
+		// The Conn's first OPEN names a streaming method the server does not
+		// have: T{UNIMPLEMENTED}, no call — and, since the OPEN was validated,
+		// a container for this incarnation (§9.4).
+		nope, err := client.conn.NewStream(t.Context(),
+			&grpc.StreamDesc{StreamName: "Nope", ServerStreams: true}, "/echo.EchoService/Nope")
+		x.NoError(t, err)
+		x.NoError(t, nope.SendMsg(&echo.EchoRequest{}))
+		err = nope.RecvMsg(&echo.EchoResponse{})
+		x.Equal(t, codes.Unimplemented, status.Code(err))
+		synctest.Wait() // the pump has delivered everything the client sent
+		tx := client.txFrames()
+		x.True(t, len(tx) >= 2 && tx[0].GetFlags()&drpc.FlagOpen != 0 && isPeerGrant(tx[1]),
+			"the raise rides right behind the rejected OPEN, got ", tx)
+
+		// 1500 unread responses: past W_conn, within the lifted window. The
+		// server's sender toward this incarnation runs on the raise the
+		// rejection gave a home to — a server that had dropped it would park
+		// at 1024.
+		const burst = wConnTest + 476
+		many, err := client.Many(t.Context(), echo.EchoRequest_builder{Message: "m", Repeat: burst}.Build())
+		x.NoError(t, err)
+		synctest.Wait()
+		x.Equal(t, burst, countMatch(client.rxFrames(), isDataFrame))
+		x.Equal(t, 0, events.count(drpc.EventPeerFlowStall), "no park at W_conn")
+
+		n := 0
+		for {
+			if _, err := many.Recv(); err == io.EOF {
+				break
+			} else {
+				x.NoError(t, err)
+			}
+			n++
+		}
+		x.Equal(t, burst, n)
+	})
+}
+
+// readHalfWindowWhenMarked is a stream interceptor: the call carrying the
+// metadata key waits for gate, reads half a window and stops; every other
+// call never reads at all.
+func readHalfWindowWhenMarked(key string, gate <-chan struct{}) drpc.ServerOption {
+	return drpc.StreamInterceptor(func(_ any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, _ grpc.StreamHandler) error {
+		if md, _ := metadata.FromIncomingContext(ss.Context()); len(md.Get(key)) > 0 {
+			select {
+			case <-gate:
+			case <-ss.Context().Done():
+				return nil
+			}
+			for range wInitTest / 2 {
+				if err := ss.RecvMsg(&echo.EchoRequest{}); err != nil {
+					return nil
+				}
+			}
+		}
+		<-ss.Context().Done()
+		return nil
+	})
+}
+
+// Pins §4.2.1 Sending: "One park, one bound: the same T_stall (§10.1), armed
+// at the first park, measures the whole wait across both windows, and on
+// expiry the call fails UNAVAILABLE naming the window it was parked on."
+func TestPeerWindow_SingleStallBudget(t *testing.T) {
+	const stall = 2 * time.Second
+	msg := echo.EchoRequest_builder{Message: "m"}.Build()
+	// The server never grants on sid 0: its connection grants are dropped on
+	// the wire, so W_conn is all the connection credit the client ever has.
+	noPeerGrants := dropEvery(isPeerGrant)
+
+	t.Run("parked on the connection window", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			events := &flowEvents{}
+			gate := make(chan struct{})
+			client, stop := PipeOption{
+				ConnOpts: []drpc.ConnOption{
+					drpc.WithReliable(true), drpc.WithTiming(drpc.Timing{Stall: stall}), drpc.WithProtocolStats(events),
+				},
+				ServerOpts: []drpc.ServerOption{drpc.WithReliable(true), gateStreams(gate)},
+				S2C:        noPeerGrants,
+			}.Use(t)
+			defer stop()
+
+			streams := spendWConn(t, client)
+			x.Equal(t, 0, events.count(drpc.EventFlowStall))
+			x.Equal(t, 0, events.count(drpc.EventPeerFlowStall))
+
+			// The 1025th streamed send, on a fresh call whose own window is
+			// untouched: it parks on the connection window and nothing else.
+			extra, err := client.Buff(t.Context())
+			x.NoError(t, err)
+			start := time.Now()
+			err = extra.Send(msg)
+			x.Equal(t, codes.Unavailable, status.Code(err))
+			x.True(t, strings.Contains(status.Convert(err).Message(), "connection credit"),
+				"the error must name the window that starved it, got: ", err)
+			x.Equal(t, stall, time.Since(start), "the park ends exactly at T_stall")
+			x.Equal(t, 1, events.count(drpc.EventPeerFlowStall))
+			x.Equal(t, 0, events.count(drpc.EventFlowStall), "the stream window had credit")
+
+			// The failed send aborted its call (gRPC: a SendMsg error is
+			// terminal); the 32 others complete once their consumers read.
+			close(gate)
+			for _, s := range streams {
+				_, err := s.CloseAndRecv()
+				x.NoError(t, err)
+			}
+		})
+	})
+	t.Run("a park that moves from the stream window to the connection window", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			const key = "flow-later"
+			events := &flowEvents{}
+			gate := make(chan struct{})
+			client, stop := PipeOption{
+				ConnOpts: []drpc.ConnOption{
+					drpc.WithReliable(true), drpc.WithTiming(drpc.Timing{Stall: stall}), drpc.WithProtocolStats(events),
+				},
+				ServerOpts: []drpc.ServerOption{drpc.WithReliable(true), readHalfWindowWhenMarked(key, gate)},
+				S2C:        noPeerGrants,
+			}.Use(t)
+			defer stop()
+
+			// 31 stuck consumers hold 992; the marked call's own 32 make it
+			// W_conn: both windows are now empty for it, and a park short on
+			// both is the connection window's — the peer's whole budget is
+			// what it waits on, not one consumer (§14).
+			for range wConnTest/wInitTest - 1 {
+				s, err := client.Buff(t.Context())
+				x.NoError(t, err)
+				sendN(t, s, int(wInitTest))
+			}
+			marked, err := client.Buff(metadata.AppendToOutgoingContext(t.Context(), key, "1"))
+			x.NoError(t, err)
+			sendN(t, marked, int(wInitTest))
+			synctest.Wait()
+
+			// The 33rd parks on its stream window's waiter, holding no credit
+			// at all, and the event names the connection window.
+			start := time.Now()
+			done := make(chan error, 1)
+			go func() { done <- marked.Send(msg) }()
+			synctest.Wait()
+			x.Equal(t, 1, events.count(drpc.EventPeerFlowStall), "short on both: the connection one is reported")
+			x.Equal(t, 0, events.count(drpc.EventFlowStall))
+
+			// Half-way through the budget its consumer reads half a window:
+			// the per-stream grant lands, the connection grant is dropped, and
+			// the send moves to the connection park — the budget does not
+			// restart.
+			time.Sleep(stall / 2)
+			close(gate)
+			synctest.Wait()
+			select {
+			case err := <-done:
+				t.Fatalf("still short on the connection window, must stay parked, got %v", err)
+			default:
+			}
+			x.True(t, firstMatch(client.rxFrames(), func(f *drpc.Frame) bool {
+				return isWindowFrame(f) && f.GetSid() != 0
+			}) != nil, "the per-stream grant did land")
+
+			err = <-done
+			x.Equal(t, codes.Unavailable, status.Code(err))
+			x.True(t, strings.Contains(status.Convert(err).Message(), "connection credit"),
+				"the error names the window it was parked on at expiry, got: ", err)
+			x.Equal(t, stall, time.Since(start), "one budget, from the FIRST park")
+			x.Equal(t, 1, events.count(drpc.EventPeerFlowStall), "one park, one stall event")
+			x.Equal(t, 0, events.count(drpc.EventFlowStall))
+			x.Equal(t, 0, events.count(drpc.EventFlowResume)+events.count(drpc.EventPeerFlowResume), "it never resumed")
+		})
+	})
+}
+
+// Pins §4.2.1 Sending: "A sender MUST NOT hold one window's credit while
+// parked on the other".
+func TestPeerWindow_AcquireHoldsNoCreditWhileParked(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		events := &flowEvents{}
+		// Every stream window is one message; the connection window is at
+		// the floor.
+		srv, conn, client := clientFixture(t, srvEpochA, 1, events)
+		defer conn.Close(nil)
+		msg := echo.EchoRequest_builder{Message: "m"}.Build()
+
+		stuck, err := client.Buff(t.Context())
+		x.NoError(t, err)
+		healthy, err := client.Buff(t.Context())
+		x.NoError(t, err)
+		sidHealthy := srv.lastOpen()
+
+		// The stuck stream spends its one credit and parks on its own window.
+		x.NoError(t, stuck.Send(msg))
+		stuckDone := make(chan error, 1)
+		go func() { stuckDone <- stuck.Send(msg) }()
+		synctest.Wait()
+		x.Equal(t, 1, events.count(drpc.EventFlowStall))
+		x.Equal(t, 0, events.count(drpc.EventPeerFlowStall))
+
+		// The healthy one, granted a message at a time by its consumer, gets
+		// every connection credit the stuck one did not spend: W_conn − 1 of
+		// them. Had the parked send kept the connection credit it took before
+		// finding its stream window empty, the healthy stream would park one
+		// message early.
+		for i := range wConnTest - 1 {
+			if err := healthy.Send(msg); err != nil {
+				t.Fatalf("send %d: %v", i, err)
+			}
+			x.NoError(t, conn.Handle(t.Context(), windowFrame(srvEpochA, srv.client(), sidHealthy, 1)))
+		}
+		x.Equal(t, 0, events.count(drpc.EventPeerFlowStall), "W_conn − 1 sends: no connection credit was hoarded")
+		x.Equal(t, wConnTest, countMatch(srv.txFrames(), isDataFrame))
+
+		// Now the connection window is genuinely empty: the healthy stream,
+		// with a stream credit in hand, parks on it — not one frame past
+		// W_conn.
+		healthyDone := make(chan error, 1)
+		go func() { healthyDone <- healthy.Send(msg) }()
+		synctest.Wait()
+		x.Equal(t, 1, events.count(drpc.EventPeerFlowStall))
+		x.Equal(t, wConnTest, countMatch(srv.txFrames(), isDataFrame))
+
+		// A connection grant releases exactly the healthy stream; the stuck
+		// one is still short on its own window.
+		srv.grant(t, srvEpochA, srv.client(), 1)
+		x.NoError(t, <-healthyDone)
+		synctest.Wait()
+		select {
+		case err := <-stuckDone:
+			t.Fatalf("its stream window is still empty, must stay parked, got %v", err)
+		default:
+		}
+		x.Equal(t, wConnTest+1, countMatch(srv.txFrames(), isDataFrame))
+
+		conn.Close(nil)
+		<-stuckDone
+	})
+}
+
+// Pins §4.2.1 The receiver's ledger: a receiver "MUST return one credit for
+// every reliable-mode data frame it received from that peer, once". The slow
+// death this catches: over a long-lived Conn every frame a cancelled call left
+// buffered, or sent after its end and drew a RESET for, is a permanent shrink
+// unless it comes back — 32 cancelled calls of a stream window each would
+// drain W_conn for good.
+func TestPeerWindow_CancelledCallsLeakNoCredit(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		const cycles = 40 // × W_init = 1280 frames each way, past W_conn
+		client, stop := PipeOption{
+			ConnOpts: []drpc.ConnOption{drpc.WithReliable(true)},
+			ServerOpts: []drpc.ServerOption{
+				drpc.WithReliable(true),
+				// Client-streaming handlers never read: whatever such a call
+				// received is discarded with it at its end.
+				drpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+					if info.IsClientStream && !info.IsServerStream {
+						<-ss.Context().Done()
+						return nil
+					}
+					return handler(srv, ss)
+				}),
+			},
+		}.Use(t)
+		defer stop()
+
+		// The ledger equation, on the wire: credited ≤ received (never twice)
+		// and received − credited < MaxPeerWindow/2 (nothing lost — with
+		// nothing buffered, all a receiver may still hold back is a batch
+		// short of half its window).
+		balanced := func(dir string, received int, credited uint32) {
+			t.Helper()
+			x.True(t, int(credited) <= received, dir, ": over-credited: received ", received, ", credited ", credited)
+			x.True(t, received-int(credited) < wConnTest/2, dir, ": credit leaked: received ", received, ", credited ", credited)
+		}
+
+		// Client → server: a full stream window buffered at the server, then
+		// the call is cancelled. A consume-only ledger parks the 33rd cycle
+		// forever; this one may park briefly at the edge and resume.
+		for range cycles {
+			ctx, cancel := context.WithCancel(t.Context())
+			s, err := client.Buff(ctx)
+			x.NoError(t, err)
+			sendN(t, s, int(wInitTest))
+			cancel()
+		}
+		synctest.Wait()
+		sent := countMatch(client.txFrames(), isDataFrame)
+		x.Equal(t, cycles*int(wInitTest), sent)
+		_, credited := peerGrants(client.rxFrames())
+		balanced("client->server", sent, credited)
+
+		// Server → client: responses pile up at the client, one is consumed,
+		// then the call is cancelled — what is still buffered is discarded,
+		// what the server sends after that draws a RESET (§9.3) — and every
+		// one of them comes back.
+		for range cycles {
+			ctx, cancel := context.WithCancel(t.Context())
+			s, err := client.Many(ctx, echo.EchoRequest_builder{Message: "m", Repeat: 2 * wInitTest}.Build())
+			x.NoError(t, err)
+			_, err = s.Recv()
+			x.NoError(t, err)
+			cancel()
+		}
+		synctest.Wait()
+		received := countMatch(client.rxFrames(), isDataFrame)
+		x.True(t, received >= cycles, "the server did send: ", received)
+		_, credited = peerGrants(client.txFrames())
+		balanced("server->client", received, credited)
+
+		// And both senders are alive: a bidi call moves a window's worth
+		// each way after all of it.
+		live, err := client.Live(t.Context())
+		x.NoError(t, err)
+		for i := range wConnTest {
+			x.NoError(t, live.Send(echo.EchoRequest_builder{Message: fmt.Sprint(i), Repeat: 1}.Build()))
+			res, err := live.Recv()
+			x.NoError(t, err)
+			x.Equal(t, fmt.Sprint(i), res.GetMessage())
+		}
+		x.NoError(t, live.CloseSend())
+		_, err = live.Recv()
+		x.ErrorIs(t, err, io.EOF)
+	})
+}
+
+// Pins §4.2.1 Restart: the Conn "locks ... on the first sequenced frame it
+// hears from it, for a live call or for one it has already released" — so
+// the raise that rides behind the creation ack of a call the client cancelled
+// in the meantime still lands, end to end.
+func TestPeerWindow_RaiseSurvivesACancelledFirstCall(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		// Above 2 × W_conn: a lost raise would be a forever-park, not a slow
+		// one (no cadence of a 4096 receiver reaches a sender stuck at 1024).
+		const window = 4 * wConnTest
+		events := &flowEvents{}
+		gate := make(chan struct{})
+		// hold delays every server frame until the gate opens, in order.
+		hold := func(next drpc.FrameHandler) drpc.FrameHandler {
+			return drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
+				<-gate
+				return next.Handle(ctx, f)
+			})
+		}
+		client, stop := PipeOption{
+			ConnOpts: []drpc.ConnOption{drpc.WithReliable(true), drpc.WithProtocolStats(events)},
+			ServerOpts: []drpc.ServerOption{
+				drpc.WithReliable(true), drpc.WithLimits(drpc.Limits{MaxPeerWindow: window}),
+			},
+			S2C: hold,
+		}.Use(t)
+		defer stop()
+
+		// The Conn's first streaming call is cancelled before the server's
+		// creation ack — and the raise right behind it — reaches the client.
+		ctx, cancel := context.WithCancel(t.Context())
+		_, err := client.Buff(ctx)
+		x.NoError(t, err)
+		synctest.Wait() // the server answered: H(1) and the raise wait at the gate
+		cancel()
+		synctest.Wait()
+		close(gate)
+		synctest.Wait()
+		rx := client.rxFrames()
+		x.True(t, len(rx) >= 2 && isAckH(rx[0]) && rx[0].GetSid() == 1 && isPeerGrant(rx[1]),
+			"the H, then the raise, got ", rx)
+		x.Equal(t, uint32(window-wConnTest), rx[1].GetWindow())
+		x.True(t, countMatch(client.txFrames(), isResetFrame) >= 1, "the H found no call: a RESET")
+
+		// Past W_conn on the next call, nothing parks: the raise was honoured
+		// although the H it followed landed on no call.
+		s, err := client.Buff(t.Context())
+		x.NoError(t, err)
+		sendN(t, s, int(wConnTest+500))
+		x.Equal(t, 0, events.count(drpc.EventPeerFlowStall), "the raise landed")
+		_, err = s.CloseAndRecv()
+		x.NoError(t, err)
+	})
 }
