@@ -65,18 +65,20 @@ describe('FrameQueue.putBlocking FIFO (§14)', () => {
 describe('FrameQueue.putDrop', () => {
   it('DropNewest keeps the buffered prefix and counts the drop', () => {
     const q = new FrameQueue(2)
-    q.putDrop(F(1), 0 /* Newest */)
-    q.putDrop(F(2), 0)
-    q.putDrop(F(3), 0) // dropped
+    // The return value is what the caller reports as a 'dropped' event (§14):
+    // how many frames THIS put cost, whether or not it was admitted.
+    expect(q.putDrop(F(1), 0 /* Newest */)).toBe(0)
+    expect(q.putDrop(F(2), 0)).toBe(0)
+    expect(q.putDrop(F(3), 0)).toBe(1) // dropped
     expect([q.tryTake()!.seq, q.tryTake()!.seq]).toEqual([1, 2])
     expect(q.dropped).toBe(1)
   })
 
   it('DropOldest evicts the oldest to admit the newest', () => {
     const q = new FrameQueue(2)
-    q.putDrop(F(1), 1 /* Oldest */)
-    q.putDrop(F(2), 1)
-    q.putDrop(F(3), 1) // evicts F1
+    expect(q.putDrop(F(1), 1 /* Oldest */)).toBe(0)
+    expect(q.putDrop(F(2), 1)).toBe(0)
+    expect(q.putDrop(F(3), 1)).toBe(1) // evicts F1, admits F3: one frame lost
     expect([q.tryTake()!.seq, q.tryTake()!.seq]).toEqual([2, 3])
     expect(q.dropped).toBe(1)
   })

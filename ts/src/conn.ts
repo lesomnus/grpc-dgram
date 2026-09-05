@@ -11,6 +11,7 @@ import type { CallOptions, ForcedCodec, MethodDesc, PayloadCodec } from './desc'
 import { DropPolicy, resolveLimits, resolveRxConfig, type Limits, type ResolvedLimits, type ResolvedRxConfig, type RxBufferConfig } from './limits'
 import { validateMetadata, type Metadata } from './metadata'
 import { RxVerdict, RxWindow, TxSeq } from './seq'
+import { emit, statsSink, type ProtocolEventKind, type ProtocolStats } from './stats'
 import { abortCause, Code, isMessageTooLarge, StatusError, statusError, toStatusError } from './status'
 import { resolveTiming, type Mode, type Timing } from './timing'
 import { hasConnAttacher, hasTransportInfo, type FrameContext, type FrameHandler } from './seam'
@@ -119,6 +120,13 @@ export interface ConnOptions {
   // call with INTERNAL before it starts.
   compressors?: Record<string, Compressor>
   defaultCallOptions?: CallConfig
+  // Observers of the protocol events gRPC has no concept of — skipped
+  // messages, rx drops, RESETs, retransmissions, probes, liveness expiry,
+  // tombstone replays, flow-control stalls (PROTOCOL.md §14; stats.ts). One
+  // or several; each is called synchronously on the receive path and the
+  // sweep and must not block. A throw is contained and costs that observer
+  // the event, never the endpoint the step it was reporting.
+  protocolStats?: ProtocolStats | ProtocolStats[]
 }
 
 // CallInfo is the resolved per-call configuration (Go's callInfo).
@@ -180,6 +188,7 @@ export class Conn {
   private readonly maxRecv: number
   private readonly maxSend: number
   private readonly stallMs: number
+  /** @internal */ readonly pstats: readonly ProtocolStats[]
 
   private readonly ss = new Map<number, ClientStream<unknown, unknown>>()
   private readonly tombs = new Map<number, ClientTomb>()
@@ -213,6 +222,7 @@ export class Conn {
     this.maxRecv = sizeOr(opts.maxRecvMsgSize, DEFAULT_MAX_RECV_MSG_SIZE)
     this.maxSend = sizeOr(opts.maxSendMsgSize, DEFAULT_MAX_SEND_MSG_SIZE)
     this.stallMs = opts.timing?.stallMs ?? DEFAULT_STALL_MS
+    this.pstats = statsSink(opts.protocolStats)
 
     // Last, with the Conn fully usable: the transport may start delivering
     // frames from inside attachConn.
@@ -221,6 +231,14 @@ export class Conn {
 
   get reliable(): boolean {
     return this.mode.reliable
+  }
+
+  // protoEvent reports one peer-scope protocol event (stats.ts). A Conn is one
+  // channel to one peer, so none is named; sid is set where the event concerns
+  // a call this Conn no longer holds (a RESET for a tombstone).
+  private protoEvent(kind: ProtocolEventKind, sid = 0): void {
+    if (this.pstats.length === 0) return
+    emit(this.pstats, { kind, sid, method: '', count: 0 })
   }
 
   // handle delivers one server frame to this Conn. Adapters call it for each
@@ -232,6 +250,7 @@ export class Conn {
       // Act only if the echoed epoch is ours; RESET never refreshes
       // liveness (PROTOCOL.md §9.1, §9.3).
       if (f.epoch !== this.epoch) return
+      this.protoEvent('reset-received', sid)
       const s = this.ss.get(sid)
       if (s !== undefined) {
         s.finishReset()
@@ -484,6 +503,10 @@ export class Conn {
         tb.retxAt = now + tb.ivalMs
       }
       this.tombs.set(s.sid, tb)
+      // The tombstone owns the abort from here; the stream's own obligations
+      // are over, and a sweep that snapshotted it moments ago must find
+      // nothing left to retransmit under its name (as Go's retire clears).
+      s.dropRetx()
     }
     this.kickSweep()
   }
@@ -514,6 +537,7 @@ export class Conn {
       this.resetAt.set(sid, n)
       this.kickSweep()
     }
+    this.protoEvent('reset-sent', f.sid)
     try {
       await this.tx.handle(resetFor(f))
     } catch {
@@ -571,12 +595,14 @@ export class Conn {
     // Peer liveness (PROTOCOL.md §10.4): one peer per Conn.
     if (live) {
       if (now - this.lastRx >= t.livenessMs) {
+        this.protoEvent('liveness-expired')
         this.failAll(statusError(Code.UNAVAILABLE, 'peer lost'))
         return
       }
       if (now - this.lastTx >= t.probeMs && now - this.lastPing >= t.probeMs) {
         this.lastPing = now
         this.lastTx = now
+        this.protoEvent('keepalive-sent')
         void Promise.resolve(this.tx.handle(frame({ epoch: this.epoch, flags: FlagPing }))).catch(noop)
       }
     }
@@ -584,10 +610,12 @@ export class Conn {
     // Per-stream retransmissions and probes.
     for (const s of streams) {
       for (const f of s.sweepRetx(now, t.probeMs)) {
+        s.protoEvent('retransmit')
         void s.transmit(f).catch(noop)
       }
       const p = s.probeDue(now, t.probeMs)
       if (p !== undefined) {
+        s.protoEvent('probe-sent')
         // Probes feed the peer-keepalive cadence but not the stream's own
         // idle clocks (PROTOCOL.md §10.5).
         this.lastTx = now
@@ -596,6 +624,7 @@ export class Conn {
     }
     // Tombstoned aborts.
     for (const f of tombRetx) {
+      this.protoEvent('retransmit', f.sid)
       this.lastTx = now
       void Promise.resolve(this.tx.handle(f)).catch(noop)
     }
@@ -738,6 +767,17 @@ export class ClientStream<Req, Res> {
   // handleRx processes one server frame for this stream. Called by
   // Conn.handle. In reliable mode it may block on a full buffer, bounded by
   // the rx signal (PROTOCOL.md §4.2).
+
+  // protoEvent reports one protocol event for this call (stats.ts), named by
+  // its sid and method. /** @internal */: the Conn's sweep reports the
+  // retransmissions and probes it sends on the stream's behalf.
+  /** @internal */
+  protoEvent(kind: ProtocolEventKind, count = 0): void {
+    const sink = this.conn.pstats
+    if (sink.length === 0) return
+    emit(sink, { kind, sid: this.sid, method: this.desc.path, count })
+  }
+
   /** @internal */
   async handleRx(f: Frame, ctx: FrameContext): Promise<void> {
     if (this.done.tripped) return
@@ -785,6 +825,7 @@ export class ClientStream<Req, Res> {
       case RxVerdict.DataLoss: {
         // Window overrun on a live stream: fail loudly (PROTOCOL.md §6.3)
         // and abort so the server stops.
+        this.protoEvent('data-loss')
         const err = statusError(Code.DATA_LOSS, 'seq window overrun: >W_fwd consecutive frames lost')
         this.sendAbort(Code.DATA_LOSS)
         this.finishLocal(err)
@@ -799,6 +840,11 @@ export class ClientStream<Req, Res> {
       }
       case RxVerdict.Accept:
         break
+    }
+    const gap = this.rxWin.takeGap()
+    if (gap > 0) {
+      // The §14 skipped-message counter: how many messages the gap ate.
+      this.protoEvent('skipped', gap)
     }
     this.noteValidatedRx()
     if (this.conn.isReliable) {
@@ -818,6 +864,7 @@ export class ClientStream<Req, Res> {
       if (!this.desc.serverStreams) {
         // Off-shape: unary/client-streaming has no server data frames.
         this.rxDropped++
+        this.protoEvent('off-shape', 1)
         return
       }
       this.latchHeader(f)
@@ -841,8 +888,8 @@ export class ClientStream<Req, Res> {
           this.rxDropped++
           this.finishLocal(statusError(Code.UNAVAILABLE, 'transport closed during delivery'))
         }
-      } else {
-        this.rxq.putDrop(f, this.rxPolicy)
+      } else if (this.rxq.putDrop(f, this.rxPolicy) > 0) {
+        this.protoEvent('dropped', 1)
       }
     } else {
       this.rxDropped++
@@ -975,8 +1022,10 @@ export class ClientStream<Req, Res> {
     // the receiver's delivery path — is what keeps one slow consumer from
     // stalling every call on the channel.
     if (!opening && !this.flowTx.tryAcquire()) {
+      this.protoEvent('flow-stall')
       switch (await this.flowTx.acquire(this.done, this.ci.stallMs, this.callerSignal)) {
         case 'ok':
+          this.protoEvent('flow-resume')
           break
         case 'ended':
           throw new EndOfStreamError()
@@ -1290,6 +1339,15 @@ export class ClientStream<Req, Res> {
     this.retxIval = this.conn.timing.retransmitMs
     this.retxAt = nowMs() + this.retxIval
     this.conn.kickSweep()
+  }
+
+  // dropRetx ends this stream's retransmission obligations: it is retired,
+  // and any pending abort now lives on the tombstone (PROTOCOL.md §9.2).
+  /** @internal */
+  dropRetx(): void {
+    this.retxOpen = undefined
+    this.retxClose = undefined
+    this.retxAt = 0
   }
 
   // sweepRetx returns the control frames due for retransmission and advances

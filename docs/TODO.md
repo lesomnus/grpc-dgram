@@ -54,8 +54,8 @@ above, (3) a §4.1/§10.7 spec revision to match.
   the core is untagged, those adapters cannot be consumed from outside this
   repo. Tagging a release means: tag the core, drop the replace, require the
   real version, and re-tag the adapters.
-- **TypeScript packaging.** `ts/package.json` is still `"private": true` at
-  version `0.0.0`. Decide the published name and the versioning relationship to
+- **TypeScript packaging** — done (`@lesomnus/grpc-dgram` 0.0.1, Apache-2.0,
+  `publishConfig.access: public`). Still open: the versioning relationship to
   the Go modules (they share a wire version, not a release cadence).
 - **Wire freeze.** PROTOCOL.md is v1.1 and still pre-release, which is what
   makes breaking wire changes cheap. A release fixes that; anything the wire
@@ -67,9 +67,9 @@ The port deliberately stops short of the Go feature set in three places
 (`ts/STATUS.md` has the reasoning):
 
 - client/server **interceptors**;
-- the **observability surfaces** — Go has a `stats.Handler` bridge and
-  `ProtocolStats`/`Counters`; TS has neither, so a browser client cannot report
-  the §14 gap counter;
+- the **`stats.Handler` bridge** — `ProtocolStats`/`Counters` are ported
+  (`ts/src/stats.ts`, so a browser client reports the §14 gap counter), but the
+  grpc-go `stats.Handler` type has no TS counterpart and is not mirrored;
 - **`Envelop` batching**, which follows item 1 in both languages.
 
 ## 4. Smaller, unowned

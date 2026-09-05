@@ -204,9 +204,12 @@ else maps to `UNKNOWN`).
 | `drpc.ErrMessageTooLarge` | `MessageTooLargeError` (adapters throw it or set it as `cause`) |
 | `NewPeerContext` / `NewReliableContext` | `FrameContext { peer, reliable, signal }` argument to `handle` |
 | mutexes + atomics | none needed: state transitions are synchronous between `await` points |
+| `WithProtocolStats(obs)` (repeatable) | `protocolStats: obs` or `protocolStats: [obs, …]` on `ConnOptions` / `ServerOptions`; `Counters.observe` is the ready-made observer |
 
-Deliberately not ported (yet): client/server interceptors, the observability
-surface (Go's `stats.Handler` + `ProtocolStats`), and `Envelop` batching
+Deliberately not ported (yet): client/server interceptors, the `stats.Handler`
+bridge (a grpc-go type; the drpc half of the observability surface,
+`ProtocolStats`/`Counters`, is ported — `protocolStats` on `ConnOptions` and
+`ServerOptions`, `docs/observability.md`), and `Envelop` batching
 (`Coalescer` — deferred to M8 in Go; every envelop carries one frame, as the
 shipped Go adapters do).
 

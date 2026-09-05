@@ -16,6 +16,7 @@ import { isUnary } from './desc'
 import { resolveLimits, resolveRxConfig, type Limits, type ResolvedLimits, type ResolvedRxConfig, type RxBufferConfig } from './limits'
 import { metadataJoin, validateMetadata, type Metadata } from './metadata'
 import { RxVerdict, RxWindow, TxSeq } from './seq'
+import { emit, statsSink, type ProtocolEventKind, type ProtocolStats } from './stats'
 import { abortCause, Code, isMessageTooLarge, StatusError, statusError, toStatusError } from './status'
 import { resolveTiming, type Mode } from './timing'
 import { hasTransportInfo, type FrameContext, type FrameHandler } from './seam'
@@ -103,6 +104,13 @@ export interface ServerOptions {
   // would turn a deliberate lockdown into an open door.
   maxRecvMsgSize?: number
   maxSendMsgSize?: number
+  // Observers of the protocol events gRPC has no concept of (PROTOCOL.md
+  // §14; stats.ts) — the twin of ConnOptions.protocolStats. Every event a
+  // server emits names the transport peer it concerns, which is what makes a
+  // RESET storm attributable (§15). One or several; called synchronously on
+  // the receive path and the sweep, and must not block. A throw is contained
+  // and costs that observer the event, never the endpoint the step.
+  protocolStats?: ProtocolStats | ProtocolStats[]
 }
 
 // EMPTY stands in for an absent payload: a frame without one decodes as the
@@ -375,6 +383,7 @@ export class Server {
   private readonly maxRecv: number
   private readonly maxSend: number
   private readonly stallMs: number
+  /** @internal */ readonly pstats: readonly ProtocolStats[]
 
   private readonly services = new Map<string, Registration>()
   // serving flips on the first handle; the registry is immutable after that
@@ -415,6 +424,15 @@ export class Server {
     this.maxRecv = sizeOr(opts.maxRecvMsgSize, DEFAULT_MAX_RECV_MSG_SIZE)
     this.maxSend = sizeOr(opts.maxSendMsgSize, DEFAULT_MAX_SEND_MSG_SIZE)
     this.stallMs = opts.timing?.stallMs ?? DEFAULT_STALL_MS
+    this.pstats = statsSink(opts.protocolStats)
+  }
+
+  // protoEvent reports one peer-scope protocol event (stats.ts): the transport
+  // peer it concerns, and the sid where the event is about a call this server
+  // does not hold (a RESET, a tombstone replay).
+  private protoEvent(kind: ProtocolEventKind, peer: unknown, sid = 0): void {
+    if (this.pstats.length === 0) return
+    emit(this.pstats, { kind, peer, sid, method: '', count: 0 })
   }
 
   register<Req, Res>(desc: MethodDesc<Req, Res> & { clientStreams: false; serverStreams: false }, handler: UnaryHandler<Req, Res>): void
@@ -446,6 +464,7 @@ export class Server {
       // Act only if the echoed epoch is ours; RESET never refreshes
       // liveness (PROTOCOL.md §9.1, §9.3).
       if (f.epoch !== this.epoch) return
+      this.protoEvent('reset-received', ctx.peer, f.sid)
       this.resetByPeerSid(ctx.peer, f.sid, f.peerEpoch)
       return
     }
@@ -469,6 +488,7 @@ export class Server {
         if (ps.replayDue(tb, now, rti) && this.allowReply(slot!, now)) {
           const replay = ps.replayTomb(tb, now, rti)
           if (replay !== undefined) {
+            this.protoEvent('tombstone-replay', peer, sid)
             await this.send(replay, ctx)
             return
           }
@@ -503,7 +523,10 @@ export class Server {
         const rti = this.mode.timing.retransmitMs
         if (ps.replayDue(tb, now, rti) && this.allowReply(slot!, now)) {
           const replay = ps.replayTomb(tb, now, rti)
-          if (replay !== undefined) await this.send(replay, ctx)
+          if (replay !== undefined) {
+            this.protoEvent('tombstone-replay', peer, sid)
+            await this.send(replay, ctx)
+          }
         }
         return
       }
@@ -841,6 +864,7 @@ export class Server {
       this.sawUnreliable = true
       this.kickSweep()
     }
+    this.protoEvent('reset-sent', ctx.peer, f.sid)
     await this.send(resetFor(f), ctx)
   }
 
@@ -1053,6 +1077,7 @@ export class Server {
         }
         slot.pendingResets.delete(k)
         this.pendingResetTotal--
+        this.protoEvent('reset-sent', slot.peer, pr.sid)
         jobs.push({
           f: frame({ flags: FlagReset, epoch: pr.echo, peerEpoch: pr.peerEcho, sid: pr.sid }),
           ctx: this.txFor(slot.peer),
@@ -1101,6 +1126,7 @@ export class Server {
           if (now - ps.lastRx >= t.livenessMs) {
             // Peer lost (§10.4): cancel its calls, degrade tombstones.
             ps.dead = true
+            this.protoEvent('liveness-expired', slot.peer)
             for (const st of ps.calls.values()) {
               st.suppressTerm = true
               lost.push(st)
@@ -1113,6 +1139,7 @@ export class Server {
           } else if (now - ps.lastTx >= t.probeMs && now - ps.lastPing >= t.probeMs) {
             ps.lastPing = now
             ps.lastTx = now
+            this.protoEvent('keepalive-sent', slot.peer)
             jobs.push({
               f: frame({ epoch: this.epoch, flags: FlagPing, peerEpoch: epoch }), // name the incarnation (§6.1)
               ctx: this.txFor(slot.peer),
@@ -1128,12 +1155,14 @@ export class Server {
         }
       }
 
-      // Stream probes (§10.5). Calls on reliable channels are not probed.
+      // Stream probes (§10.5). Calls on reliable channels are not probed —
+      // gated on the call's own mode, as Go does, not the container's.
       for (const ps of slot.epochs.values()) {
-        if (ps.reliable) continue
         for (const st of ps.calls.values()) {
+          if (st.reliable) continue
           const f = st.probeDue(now, t.probeMs, this.epoch)
           if (f !== undefined) {
+            st.protoEvent('probe-sent')
             ps.lastTx = now
             jobs.push({ f, ctx: this.txFor(slot.peer) })
           }
@@ -1268,7 +1297,9 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
         } catch {
           // Invalid metadata is dropped, as grpc-go does (the signature has
           // no error to return) — validating here is what keeps it from
-          // failing the terminal frame's encode (§11).
+          // failing the terminal frame's encode (§11). Reported as off-shape,
+          // the one drop of this kind Go reports too.
+          this.protoEvent('off-shape', 1)
           return
         }
         this.trailerMd = metadataJoin(this.trailerMd, md)
@@ -1296,6 +1327,17 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   // handleRx processes one client frame for this live call. Called by
   // Server.handle. In reliable mode it may block on a full buffer, bounded
   // by the rx signal (PROTOCOL.md §4.2).
+
+  // protoEvent reports one protocol event for this call (stats.ts): the
+  // transport peer it arrived from, its sid, and its method. /** @internal */:
+  // the Server's sweep reports the probes it sends on the stream's behalf.
+  /** @internal */
+  protoEvent(kind: ProtocolEventKind, count = 0): void {
+    const sink = this.server.pstats
+    if (sink.length === 0) return
+    emit(sink, { kind, peer: this.peer, sid: this.sid, method: this.reg.desc.path, count })
+  }
+
   /** @internal */
   async handleRx(f: Frame, ctx: FrameContext): Promise<void> {
     if (hasUnknownFlags(f) || !legalShape(shapeOf(f))) {
@@ -1342,6 +1384,7 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
       case RxVerdict.Beyond:
         return
       case RxVerdict.DataLoss:
+        this.protoEvent('data-loss')
         this.cancel(statusError(Code.DATA_LOSS, 'seq window overrun: >W_fwd consecutive frames lost'))
         return
       case RxVerdict.ProtocolError:
@@ -1350,6 +1393,8 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
       case RxVerdict.Accept:
         break
     }
+    const gap = this.rxWin.takeGap()
+    if (gap > 0) this.protoEvent('skipped', gap) // §14
     this.noteValidatedRx()
 
     if (isTerminal(f)) {
@@ -1379,8 +1424,8 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
           this.rxDropped++
           this.cancel(statusError(Code.UNAVAILABLE, 'transport closed during delivery'))
         }
-      } else {
-        this.rxq.putDrop(f, this.rxCfg.policy)
+      } else if (this.rxq.putDrop(f, this.rxCfg.policy) > 0) {
+        this.protoEvent('dropped', 1)
       }
     } else {
       this.rxDropped++
@@ -1562,8 +1607,10 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
     // bounded by the call ending and by T_stall — nothing else could break it
     // in reliable mode.
     if (!this.flowTx.tryAcquire()) {
+      this.protoEvent('flow-stall')
       switch (await this.flowTx.acquire(this.endLatch, this.stallMs)) {
         case 'ok':
+          this.protoEvent('flow-resume')
           break
         case 'stalled':
           throw statusError(Code.UNAVAILABLE, `drpc: flow-control stall: the peer granted no credit for ${this.stallMs}ms`)

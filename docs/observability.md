@@ -358,15 +358,78 @@ table above (`skipped`, `dropped`, `off-shape`, `reset-sent`,
 `OffShape` and adds 1 for everything else, so a raw event handler that ignores
 `Count` will under-report gaps.
 
+## TypeScript
+
+The TS port carries the dRPC half of this page and not the gRPC half:
+`ProtocolStats` and `Counters` are in `@lesomnus/grpc-dgram` (`ts/src/stats.ts`),
+installed with `protocolStats` on `ConnOptions` or `ServerOptions`; there is no
+`stats.Handler` bridge, because that is a grpc-go type.
+
+```ts
+import { Conn, Counters } from '@lesomnus/grpc-dgram'
+
+const counters = new Counters()
+const conn = new Conn(transport, { protocolStats: counters.observe })
+
+const stream = conn.newStream(Readings, {}) // a server-streaming MethodDesc
+await stream.send(req)
+for await (const reading of stream) { /* ... */ }
+counters.snapshot().skipped // readings the wire ate (§14)
+```
+
+```ts
+type ProtocolStats = (ev: ProtocolEvent) => void   // Go's ProtocolStatsFunc collapses into the type
+
+interface ProtocolEvent {
+  kind: ProtocolEventKind   // 'skipped' | 'dropped' | 'off-shape' | 'reset-sent' | … — the strings Go's String() fixes
+  peer?: unknown            // FrameContext.peer; absent on a client
+  sid: number               // 0 for peer-scope events
+  method: string            // '' where the frame names no call
+  count: number             // magnitude where one exists, else 0
+}
+```
+
+(Every field is `readonly`: an observer sees a record, not a handle.)
+
+Everything in [Every event](#every-event) holds verbatim: the same kinds, emitted
+from the same decision points, with the same fields — `peer` on every
+server-side event, `sid` and `method` on every call-scope one, `count` only for
+`skipped`, `dropped` and `off-shape`. `protocolStats` accepts one observer or an
+array, which is the TS spelling of "`WithProtocolStats` may be given more than
+once". `Counters.observe` is an arrow property, so it can be handed over
+unbound, and `snapshot()` returns a copy.
+
+One input is TS-only: a `-bin` trailer value that is not base64 is dropped by
+`setTrailer` and reported as `off-shape`, next to the invalid-key case Go
+reports too. Go has no such input — its `-bin` values are raw bytes, and any
+Go string is valid octets — while a JS string holding octets must be base64
+(§11), so the check exists only here.
+
+An observer that throws is contained: `emit` swallows it and the protocol's
+step proceeds. The contract is Go's — do arithmetic and return — but the
+consequence of breaking it is not a half-taken step (a liveness window that
+expired and failed no call, a frame the window moved past and nobody received),
+because the endpoint's correctness must not be one exception away from a
+metrics hook.
+
+The receiver that most needs this is the one this port runs in: on the lossy
+path — a WebRTC data channel into a page — the browser is the receiving end of
+a server-streaming call, so every gap happens there, and the Go server across
+from it observes nothing about them. This is what lets a page tell 244 of 400
+readings from 400 of 400.
+
 ## Limits
 
 - **No tracing spans.** dRPC emits no spans of its own; a `stats.Handler` that
   builds them from `Begin`/`End` (as `otelgrpc` does) works, but there is no
   trace context propagated on the wire beyond the metadata you put there
   yourself (§11).
-- **The TypeScript port has neither surface.** `ts/` implements the wire, not
-  the observability API, so a browser client cannot report gaps to you. Only
-  the Go end of a browser↔Go call is instrumented.
+- **The TypeScript port has `ProtocolStats` but not `stats.Handler`.** The
+  datagram-specific events — the §14 gap counter first among them — are
+  emitted from the same decision points on both ends, so a browser client
+  reports its own gaps (see [TypeScript](#typescript) above). The
+  `stats.Handler` bridge is grpc-go's type and has no TS counterpart; a
+  Connect-ES client has Connect's own instrumentation story.
 - **Server off-shape frame drops are not all reported.** Data frames arriving
   on a server call shape that has none, and payload on an eager OPEN, are
   dropped into a per-stream counter without emitting `OffShape`; only the

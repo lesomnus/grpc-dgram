@@ -49,6 +49,16 @@ export class RxWindow {
   strict = false // reliable mode: require exactly l+1, else fail loud
   private beyondN = 0 // length of the current consistent beyond-window run
   private beyondLast = 0 // last beyond-window seq seen
+  private gap = 0 // frames skipped by the last accepted step (§14)
+
+  // takeGap returns and clears the size of the gap the last accepted frame
+  // jumped over — the skipped-message count PROTOCOL.md §14 promises. Read it
+  // right after the Accept that set it, as the emitters do.
+  takeGap(): number {
+    const g = this.gap
+    this.gap = 0
+    return g
+  }
 
   check(seq: number): RxVerdict {
     if (seq === 0) {
@@ -72,6 +82,7 @@ export class RxWindow {
       return RxVerdict.Dup
     }
     if (d <= W_FWD) {
+      this.gap = d - 1
       this.l = seq
       this.beyondN = 0
       return RxVerdict.Accept

@@ -26,6 +26,7 @@ ts/src/
   wire.ts     frame/envelop/metadata codec, flags, shape helpers
   conn.ts     Conn + ClientStream          server.ts  Server + streams
   seq.ts      tx seq + rx window           flow (in util.ts) credit windows
+  stats.ts    ProtocolStats observer + Counters (the §14 gap counter)
   transport/  webrtc · websocket · port · node-udp · protobuf-es · connect
   wasm/       open() — a Go server compiled to js/wasm, started in a worker
 ```
@@ -141,10 +142,11 @@ bytes on the wire — the conformance test above is what proves it.
 
 ## What the port deliberately does not have
 
-Client/server **interceptors**, the **observability surfaces** (Go's
-`stats.Handler` bridge and `ProtocolStats`), and **`Envelop` batching** — the
-last one is unbuilt in Go too ([TODO.md](./TODO.md)). These are gaps, not
-divergences: the wire is identical either way.
+Client/server **interceptors**, the **`stats.Handler` bridge** (grpc-go's
+type; the drpc half, `ProtocolStats`/`Counters`, is ported — see
+[observability.md](./observability.md#typescript)), and **`Envelop`
+batching** — the last one is unbuilt in Go too ([TODO.md](./TODO.md)). These
+are gaps, not divergences: the wire is identical either way.
 
 One genuine environmental difference: a browser `RTCDataChannel` cannot pause
 delivery, so inbound messages queue in the adapter while a slow consumer

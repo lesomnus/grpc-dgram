@@ -96,14 +96,17 @@ export class FrameQueue {
 
   // putDrop delivers f under the configured drop policy (unreliable mode,
   // PROTOCOL.md §4.2): Newest discards the arrival on a full buffer; Oldest
-  // evicts the oldest to admit it.
-  putDrop(f: Frame, policy: DropPolicy): void {
-    if (this.tryPut(f)) return
+  // evicts the oldest to admit it. Returns how many frames this put dropped
+  // — 0 or 1 — which is what the caller reports as a 'dropped' event (§14);
+  // `dropped` keeps the running total.
+  putDrop(f: Frame, policy: DropPolicy): number {
+    if (this.tryPut(f)) return 0
     if (policy === DropPolicy.Oldest) {
       if (this.buf.shift() !== undefined) this.dropped++
-      if (this.tryPut(f)) return
+      if (this.tryPut(f)) return 1
     }
     this.dropped++
+    return 1
   }
 
   // putBlocking delivers f, blocking until there is room: dropping would
@@ -322,28 +325,31 @@ export class FlowSender {
   // park is bounded by the call ending, by the caller's signal, and by
   // T_stall — the last one is load-bearing in reliable mode, where nothing
   // else would ever break it (§4.2.1).
+  //
+  // Which bound woke the park decides the outcome, the way Go's select does:
+  // only a grant loops back to take credit. The distinction matters because
+  // release() — the call ending — also wakes a parked sender and leaves
+  // tryAcquire() willing, so without it a sender unparked by its call's END
+  // would read 'ok', carry on as if credited, and be reported as a flow
+  // resume (§14) that never happened. Ends are checked before credit for the
+  // same reason: a call that is over has no send to make.
   async acquire(done: Latch, stallMs: number, signal?: AbortSignal): Promise<FlowAcquire> {
     let timer: ReturnType<typeof setTimeout> | undefined
     let dispose = noop
-    let expired = false
-    let bounds: Promise<unknown>[] | undefined
+    let bounds: Promise<FlowAcquire>[] | undefined
     try {
       for (;;) {
-        if (this.tryAcquire()) return 'ok'
         if (done.tripped) return 'ended'
         if (signal?.aborted) return 'aborted'
-        if (expired) return 'stalled'
+        if (this.tryAcquire()) return 'ok'
         if (bounds === undefined) {
           // Armed once, at the first park: T_stall measures the whole wait,
           // not the interval between two partial grants.
-          bounds = [done.wait()]
+          bounds = [done.wait().then(() => 'ended' as const)]
           if (stallMs > 0) {
             bounds.push(
-              new Promise<void>((res) => {
-                const t = setTimeout(() => {
-                  expired = true
-                  res()
-                }, stallMs)
+              new Promise<FlowAcquire>((res) => {
+                const t = setTimeout(() => res('stalled'), stallMs)
                 unrefTimer(t)
                 timer = t
               }),
@@ -351,13 +357,14 @@ export class FlowSender {
           }
           if (signal !== undefined) {
             bounds.push(
-              new Promise<void>((res) => {
-                dispose = abortListener(signal, res)
+              new Promise<FlowAcquire>((res) => {
+                dispose = abortListener(signal, () => res('aborted'))
               }),
             )
           }
         }
-        await Promise.race([this.parked(), ...bounds])
+        const why = await Promise.race([this.parked().then(() => 'grant' as const), ...bounds])
+        if (why !== 'grant') return why
       }
     } finally {
       if (timer !== undefined) clearTimeout(timer)
