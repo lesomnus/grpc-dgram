@@ -140,6 +140,25 @@ func (o PipeOption) Use(t *testing.T) (*Client, func()) {
 	return c, stop
 }
 
+// recorder is an append-only string log safe to write from the server's
+// handler goroutines and the test goroutine at once.
+type recorder struct {
+	mu sync.Mutex
+	ss []string
+}
+
+func (r *recorder) add(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ss = append(r.ss, fmt.Sprintf(format, args...))
+}
+
+func (r *recorder) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.ss...)
+}
+
 type Client struct {
 	echo.EchoServiceClient
 
@@ -485,29 +504,32 @@ func TestE2E(t *testing.T) {
 		t.Run("Unary interceptor", func(t *testing.T) {
 			ctx := t.Context()
 
-			msgs := []string{}
+			// The server interceptor runs on the server's handler goroutine and
+			// the client one on this goroutine; a plain slice appended from both
+			// is a data race the detector reports on the right scheduling.
+			msgs := &recorder{}
 			client, stop := PipeOption{
 				ServerOpts: []drpc.ServerOption{
 					drpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
-						msgs = append(msgs, fmt.Sprintf("[S] %s", req.(*echo.EchoRequest).GetMessage()))
+						msgs.add("[S] %s", req.(*echo.EchoRequest).GetMessage())
 						res, err := handler(ctx, req)
 						if err != nil {
 							return nil, err
 						}
 
-						msgs = append(msgs, fmt.Sprintf("[S] %s", res.(*echo.EchoResponse).GetMessage()))
+						msgs.add("[S] %s", res.(*echo.EchoResponse).GetMessage())
 						return res, nil
 					}),
 				},
 				ConnOpts: []drpc.ConnOption{
 					drpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-						msgs = append(msgs, fmt.Sprintf("[C] %s", req.(*echo.EchoRequest).GetMessage()))
+						msgs.add("[C] %s", req.(*echo.EchoRequest).GetMessage())
 						err := invoker(ctx, method, req, reply, cc, opts...)
 						if err != nil {
 							return err
 						}
 
-						msgs = append(msgs, fmt.Sprintf("[C] %s", reply.(*echo.EchoResponse).GetMessage()))
+						msgs.add("[C] %s", reply.(*echo.EchoResponse).GetMessage())
 						return nil
 					}),
 				},
@@ -535,30 +557,30 @@ func TestE2E(t *testing.T) {
 				"[S] Le Big Mac",
 				"[S] Big MacLe ",
 				"[C] Big MacLe ",
-			}, msgs)
+			}, msgs.all())
 		})
 		t.Run("Stream interceptor", func(t *testing.T) {
 			ctx := t.Context()
 
-			msgs := []string{}
+			msgs := &recorder{} // see the unary case
 			client, stop := PipeOption{
 				ServerOpts: []drpc.ServerOption{
 					drpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-						msgs = append(msgs, fmt.Sprintf("[S:I] %s", info.FullMethod))
+						msgs.add("[S:I] %s", info.FullMethod)
 						err := handler(srv, ss)
-						msgs = append(msgs, fmt.Sprintf("[S:O] %s", info.FullMethod))
+						msgs.add("[S:O] %s", info.FullMethod)
 						return err
 					}),
 				},
 				ConnOpts: []drpc.ConnOption{
 					drpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-						msgs = append(msgs, fmt.Sprintf("[C:I] %s", method))
+						msgs.add("[C:I] %s", method)
 						stream, err := streamer(ctx, desc, cc, method, opts...)
 						if err != nil {
 							return nil, err
 						}
 
-						msgs = append(msgs, fmt.Sprintf("[C:O] %s", method))
+						msgs.add("[C:O] %s", method)
 						return stream, nil
 					}),
 				},
@@ -599,7 +621,7 @@ func TestE2E(t *testing.T) {
 				"[C:O] /echo.EchoService/Live",
 				"[S:I] /echo.EchoService/Live",
 				"[S:O] /echo.EchoService/Live",
-			}, msgs)
+			}, msgs.all())
 		})
 	})
 	t.Run("metadata", func(t *testing.T) {
