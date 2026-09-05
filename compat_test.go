@@ -203,14 +203,34 @@ func TestCompat_MaxRecvMsgSize(t *testing.T) {
 	})
 
 	t.Run("gRPC's 4 MiB default", func(t *testing.T) {
-		client, stop := PipeOption{}.Use(t)
+		// Reliable mode on both ends, as czPipe does: the cap is the same
+		// check in either mode (recvInto), but the pipe defaults to unreliable
+		// (Wrap1 hides TransportInfo), and that wraps this one 4 MiB unary in
+		// every protocol timer there is — T_call (5 s) on the call, then T_live
+		// (15 s) once a starved server stops answering probes. Under -race on
+		// a loaded machine the race-instrumented copies of 4 MiB alone can
+		// outlast both; a longer ctx only moves the failure from
+		// DeadlineExceeded to Unavailable. With the timers off, nothing but
+		// the cap can end this call.
+		client, stop := PipeOption{
+			ConnOpts:   []drpc.ConnOption{drpc.WithReliable(true)},
+			ServerOpts: []drpc.ServerOption{drpc.WithReliable(true)},
+		}.Use(t)
 		defer stop()
 
-		// Just past 4 MiB with nothing configured anywhere: the default cap
-		// (Appendix B) has to be the one that fires.
-		_, err := client.Once(t.Context(),
+		// Just past 4 MiB with no cap configured anywhere: the default cap
+		// (Appendix B) has to be the one that fires. The deadline is only a
+		// safety net against a hang — reliable mode injects no T_call — and
+		// a healthy run never comes near it.
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		_, err := client.Once(ctx,
 			echo.EchoRequest_builder{Message: strings.Repeat("a", 4*1024*1024+16)}.Build())
 		x.Equal(t, codes.ResourceExhausted, status.Code(err))
+		// The DEFAULT limit, by value: any other ResourceExhausted would pass
+		// the code check alone.
+		x.True(t, strings.Contains(status.Convert(err).Message(), "vs. 4194304)"),
+			"the default 4 MiB cap must be the one that fired: ", status.Convert(err).Message())
 	})
 
 	t.Run("the cap measures the decompressed message", func(t *testing.T) {
