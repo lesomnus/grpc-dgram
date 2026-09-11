@@ -26,6 +26,7 @@ import { hasTransportInfo, type FrameContext, type FrameHandler } from './seam'
 // so the server pulls in no client code.
 import type { DetailedStatusError, FlowTiming } from './conn'
 import {
+  acquireBoth,
   checkRecvSize,
   checkSendSize,
   compressPayload,
@@ -40,12 +41,16 @@ import {
   nonzeroEpoch,
   noop,
   nowMs,
+  PeerFlowRx,
   rawPayload,
   reliableRxSize,
   sizeOr,
   Sweeper,
+  tryAcquireBoth,
   unrefTimer,
+  W_CONN,
   type Compressor,
+  type EvictedSender,
   type WirePayload,
 } from './util'
 import {
@@ -256,6 +261,18 @@ class PeerState {
   readonly calls = new Map<number, ServerStream<unknown, unknown>>()
   liveCalls = 0
 
+  // connTx is the connection window toward this client incarnation
+  // (PROTOCOL.md §4.2.1): assumed at W_CONN when the container is created
+  // on a reliable channel, settled by its first admitted OPEN, credited by
+  // sid-0 WINDOWs routed on (peer, epoch). Per incarnation, not per
+  // transport peer: a restarted client at the same key counts from zero,
+  // and a sender that kept counting the dead incarnation's frames would
+  // park every call to the new one forever. raised latches the one sid-0
+  // raise this incarnation is owed (§4.2.1) — the receiver's ledger is per
+  // transport peer, so the latch cannot live there.
+  readonly connTx = new FlowSender()
+  raised = false
+
   lastRx: number
   lastTx: number
   lastPing = 0
@@ -367,6 +384,14 @@ class PeerSlot {
   replyBudget: { windowStart: number; n: number } | undefined
   readonly resetAt = new Map<string, number>() // `${epoch}:${sid}` → last immediate RESET
   readonly pendingResets = new Map<string, PendingReset>()
+  // flow is the receiving half of the connection window per transport peer
+  // (§4.2.1, §15): what this peer may have buffered here across all of its
+  // calls AND client epochs — on the slot like liveCalls and for the same
+  // reason, since only a key the peer cannot mint bounds anything. Created
+  // by the peer's first validated reliable-mode OPEN, admitted or rejected,
+  // so the peer's raise and every credit return have a home; deleted with
+  // the peer's containers in disconnectPeer, never swept.
+  flow: PeerFlowRx | undefined
 
   constructor(readonly peer: unknown) {}
 }
@@ -517,6 +542,23 @@ export class Server {
       return this.sendReset(slot, f, ctx)
     }
 
+    if (sid === 0 && shapeOf(f) === FlagWindow) {
+      // A connection grant (§4.2.1): additive credit for this side's sends
+      // to the client incarnation it names, routed on (peer, epoch). It
+      // credits only a container that exists — or the held position of one
+      // the maxDeadPeers cap evicted (§9.4, §15), which the same
+      // incarnation's next OPEN recreates from — and only in reliable mode;
+      // anything else is dropped in silence — never validated, never
+      // answered with a RESET, and it creates no state (§9.1, §9.3): a grant
+      // never enables, and a frame no OPEN preceded must not cost a
+      // container.
+      if (this.rxReliable(ctx)) {
+        if (ps !== undefined) ps.connTx.grant(windowOf(f))
+        else slot?.flow?.creditEvicted(f.epoch, windowOf(f))
+      }
+      return
+    }
+
     const st = ps?.calls.get(sid)
     if (st !== undefined) {
       await st.handleRx(f, ctx)
@@ -574,6 +616,23 @@ export class Server {
     // late (PROTOCOL.md §9.3). A reliable channel has no reordering:
     // immediate.
     if (this.rxReliable(ctx)) {
+      // A data frame for a call this side no longer has — pipelined behind
+      // an abort, say, or in flight when the handler ended — spent one
+      // connection credit at the client and is never buffered: return it,
+      // or the window shrinks for good (§4.2.1). Only for an incarnation
+      // this side holds flow state for — a container, or the sender
+      // position the ledger kept when the cap evicted one (§9.4): the grant
+      // has nowhere else to go, and junk must not draw one.
+      const pf = slot?.flow
+      if (pf !== undefined && isData(f)) {
+        if (ps !== undefined) {
+          const g = pf.unadmitted(f.epoch, 1)
+          if (g > 0) this.grantPeer(ps, g)
+        } else {
+          const g = pf.unadmittedEvicted(f.epoch, 1)
+          if (g > 0) this.grantEpoch(peer, f.epoch, g)
+        }
+      }
       return this.sendReset(slot, f, ctx)
     }
     const s = this.ensureSlot(peer)
@@ -682,6 +741,16 @@ export class Server {
     if (ps.hwm < f.sid) ps.hwm = f.sid
     ps.dead = false // the peer is evidently back
     ps.lastRx = now
+    if (rel) {
+      // The peer's connection window (§4.2.1): its ledger, per transport
+      // peer, and — on the container's first admitted OPEN — the settle of
+      // this side's sender toward that incarnation by the advertisement the
+      // OPEN carries: > 0 confirms the assumed W_CONN, 0 means the client
+      // does no flow control and turns it off. confirm is once-only, so
+      // every later OPEN is a no-op here.
+      st.pf = this.ensurePeerFlow(slot)
+      ps.connTx.confirm(windowOf(f))
+    }
     // The OPEN arrived after all: cancel any RESET scheduled for its sid.
     if (slot.pendingResets.delete(eksid(f.epoch, f.sid))) this.pendingResetTotal--
     this.liveTasks++
@@ -699,6 +768,7 @@ export class Server {
       // Creation ack (§8): without it, a slow producer would leave the
       // client's OPEN|CLOSE — full request payload — retransmitting.
       st.sendH()
+      st.raisePeer()
       void this.runStream(st)
     } else {
       // CS/bidi OPENs are eager and bare: payload or CLOSE here is
@@ -706,6 +776,7 @@ export class Server {
       if (f.payload !== undefined || isClose(f)) st.rxDropped++
       // Creation ack (PROTOCOL.md §8).
       st.sendH()
+      st.raisePeer()
       void this.runStream(st)
     }
   }
@@ -724,15 +795,23 @@ export class Server {
     })
     t.code = code
 
-    if (!this.rxReliable(ctx)) {
-      const now = nowMs()
-      const slot = this.ensureSlot(ctx.peer)
-      const ps = this.ensurePeer(slot, f.epoch, now, false)
-      ps.lastRx = now
+    const now = nowMs()
+    const rel = this.rxReliable(ctx)
+    const slot = this.ensureSlot(ctx.peer)
+    const ps = this.ensurePeer(slot, f.epoch, now, rel)
+    ps.lastRx = now
+    if (rel) {
+      // No tombstone and no watermark bump in reliable mode — nothing
+      // retransmits, so nothing needs deduping (§9.2) — but the container
+      // and the peer's connection-window ledger DO exist from here on
+      // (§9.4): the OPEN was validated, and the client's raise rides right
+      // behind it (§4.2.1). Bounded by maxDeadPeers like any container.
+      this.ensurePeerFlow(slot)
+    } else {
       if (ps.hwm < f.sid) ps.hwm = f.sid
       ps.addTomb(f.sid, t, now + this.mode.timing.tombstoneMs)
-      this.kickSweep()
     }
+    this.kickSweep()
     await this.send(t, ctx)
   }
 
@@ -841,6 +920,10 @@ export class Server {
     // Unpark anything still waiting for flow-control credit before the cancel
     // it would otherwise only observe through the abort (§4.2.1).
     st.flowTx.release()
+    // Whatever the handler left buffered is discarded with the call: its
+    // connection credit goes back in one grant, here, after the endpoint's
+    // own bookkeeping (§4.2.1).
+    st.releasePinned()
     st.cancel(statusError(Code.CANCELLED, 'call finished'))
     if (st.deadlineTimer !== undefined) {
       clearTimeout(st.deadlineTimer)
@@ -960,12 +1043,16 @@ export class Server {
     const slot = this.slots.get(peer)
     if (slot === undefined) return
     const targets: ServerStream<unknown, unknown>[] = []
+    const senders: FlowSender[] = []
     for (const ps of slot.epochs.values()) {
       for (const st of ps.calls.values()) targets.push(st)
+      senders.push(ps.connTx)
     }
     this.pendingResetTotal -= slot.pendingResets.size
     this.resetAtTotal -= slot.resetAt.size
     if (slot.replyBudget !== undefined) this.replyBudgetTotal--
+    // The slot goes with its containers — and with them the connection-window
+    // ledger, which lives exactly as long as they do (§4.2.1).
     this.slots.delete(peer)
 
     const cause =
@@ -973,6 +1060,9 @@ export class Server {
         ? statusError(Code.UNAVAILABLE, 'transport closed')
         : statusError(Code.UNAVAILABLE, `transport closed: ${err instanceof Error ? err.message : String(err)}`)
     for (const st of targets) st.cancel(cause)
+    // A handler parked on connection credit has no grant coming (§4.2.1);
+    // its call already ended above, this just makes the wake-up explicit.
+    for (const tx of senders) tx.release()
   }
 
   private waitIdle(): Promise<void> {
@@ -1040,6 +1130,18 @@ export class Server {
     let ps = slot.epochs.get(epoch)
     if (ps !== undefined) return ps
 
+    // An incarnation coming back takes the sender position the ledger kept
+    // for it (§9.4) out BEFORE the cap below puts the container it evicts
+    // in: the ledger is capped too, oldest dropped first, and with it full
+    // and this incarnation its oldest entry, the eviction's stash would drop
+    // this very position one statement before it was looked for — the
+    // incarnation would start over with exactly 2 × maxDeadPeers idle
+    // incarnations on the key, where §16 says only more than that does.
+    // Taken out first, the ledger goes N → N−1 → N and the trim never runs
+    // on the one coming back.
+    let held: EvictedSender | undefined
+    if (reliable) held = slot.flow?.unstash(epoch)
+
     // Cap dead containers of this transport peer.
     const dead: PeerState[] = []
     for (const p of slot.epochs.values()) {
@@ -1050,13 +1152,71 @@ export class Server {
       for (const p of dead) {
         if (p.createdAt < oldest.createdAt) oldest = p
       }
+      if (oldest.reliable) {
+        // The incarnation may only be idle: its connection sender's
+        // position — credit, settle, the raise it already got — is kept in
+        // the peer's ledger, so that its next OPEN continues it rather than
+        // starting over at W_CONN against a client that raised it (§4.2.1,
+        // §15). Bounded there like the containers are here.
+        this.ensurePeerFlow(slot).stash(oldest.epoch, oldest.connTx.state(), oldest.raised)
+      }
       slot.epochs.delete(oldest.epoch)
     }
 
     ps = new PeerState(slot.peer, epoch, reliable, now, this.limits.maxTombstones, this.limits.maxTombstoneBytes)
+    if (reliable) {
+      // This side paces itself toward the new incarnation by W_CONN from
+      // its first data frame (§4.2.1) — unless the incarnation was here
+      // before and the cap evicted its container: then it continues from
+      // the position the ledger held for it (taken out above). Unreliable
+      // mode has no connection window, as it has no per-stream one.
+      if (held !== undefined) {
+        ps.connTx.restore(held.state)
+        ps.raised = held.raised
+      } else {
+        ps.connTx.assume(W_CONN)
+      }
+    }
     slot.epochs.set(epoch, ps)
     if (!reliable) this.sawUnreliable = true
     return ps
+  }
+
+  // ensurePeerFlow returns the connection-window ledger for a transport
+  // peer, creating it at maxPeerWindow (§4.2.1, §15). It also holds the
+  // sender positions of this peer's evicted containers, as many as
+  // maxDeadPeers keeps containers (§9.4).
+  private ensurePeerFlow(slot: PeerSlot): PeerFlowRx {
+    let pf = slot.flow
+    if (pf === undefined) {
+      pf = new PeerFlowRx()
+      pf.enable(this.limits.maxPeerWindow, this.limits.maxDeadPeers)
+      slot.flow = pf
+    }
+    return pf
+  }
+
+  // grantPeer transmits a connection-window grant to one client incarnation:
+  // sid 0, seq 0, no payload, peer_epoch naming the incarnation (§4.2.1,
+  // §7). A control frame like any other — handed to the tx and not awaited,
+  // so a slow adapter never wedges handle for every peer — and pointless
+  // once stopped. It feeds no clock: reliable mode, the only mode it exists
+  // in, runs none.
+  /** @internal */
+  grantPeer(ps: PeerState, n: number): void {
+    this.grantOn(ps.peer, ps.epoch, n)
+  }
+
+  // grantEpoch is grantPeer for an incarnation with no container — one whose
+  // sender position the ledger holds (§9.4): the grant goes out on the peer
+  // the container's would have.
+  private grantEpoch(peer: unknown, epoch: number, n: number): void {
+    this.grantOn(peer, epoch, n)
+  }
+
+  private grantOn(peer: unknown, epoch: number, n: number): void {
+    if (this.closed) return
+    void this.send(frame({ epoch: this.epoch, peerEpoch: epoch, flags: FlagWindow, window: n }), this.txFor(peer))
   }
 
   /** @internal */
@@ -1200,12 +1360,16 @@ export class Server {
         }
       }
 
+      // A slot holding a connection-window ledger is the peer's to tear down
+      // (disconnectPeer), never the sweep's (§4.2.1): a reliable peer's
+      // containers are never GC'd above, so it never empties here anyway.
       if (
         slot.epochs.size === 0 &&
         slot.liveCalls === 0 &&
         slot.pendingResets.size === 0 &&
         slot.resetAt.size === 0 &&
-        slot.replyBudget === undefined
+        slot.replyBudget === undefined &&
+        slot.flow === undefined
       ) {
         this.slots.delete(peerKey)
       }
@@ -1225,6 +1389,9 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   readonly context: ServerContext
 
   /** @internal */ ps: PeerState | undefined
+  // pf is the transport peer's connection-window ledger (§4.2.1), set at
+  // open beside ps in reliable mode; undefined otherwise.
+  /** @internal */ pf: PeerFlowRx | undefined
   // The PeerSlot this call was created on. finish() decrements ITS liveCalls,
   // not whatever slot the peer key currently maps to: a disconnectPeer can
   // delete the slot and a reused key can install a fresh one before this call
@@ -1265,6 +1432,15 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   // calls are keyed by (peer, epoch, sid) in the demux — so no per-stream
   // epoch gate here.
   private readonly rxWin = new RxWindow()
+  // pinned counts this call's data frames charged to the peer's connection
+  // window and sitting in rxq (§4.2.1) — never rxq.size, which also holds
+  // the uncredited server-streaming OPEN: every one of them returns exactly
+  // one credit, when consumed or in bulk at finish, and a count the two
+  // paths share is what makes that exactly once. rxReleased marks the bulk
+  // return done: a frame arriving after it is credited on the spot instead
+  // of pinned.
+  private pinned = 0
+  private rxReleased = false
   /** @internal */ readonly rxq: FrameQueue
   private readonly rxCfg: ResolvedRxConfig
   /** @internal */ rxDropped = 0
@@ -1378,6 +1554,7 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
       // combination is not a frame we can route — delivering either would be
       // a silent corruption, dropping it a silent gap (§7.1, §8).
       this.cancel(statusError(Code.INTERNAL, `drpc: frame carries unsupported flags 0x${f.flags.toString(16)}`))
+      this.creditUnbuffered(f)
       return
     }
     if (shapeOf(f) === FlagWindow) {
@@ -1409,6 +1586,10 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
     }
 
     const v = this.rxWin.check(f.seq)
+    if (v !== RxVerdict.Accept) {
+      // Never buffered, whatever the verdict (§4.2.1).
+      this.creditUnbuffered(f)
+    }
     switch (v) {
       case RxVerdict.Dup:
         this.noteValidatedRx()
@@ -1437,10 +1618,27 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
       this.rxEOF.trip()
     } else if (isData(f)) {
       if (isUnary(this.reg.desc) || !this.reg.desc.clientStreams) {
+        // Off-shape: unary/server-streaming has no client data frames.
         this.rxDropped++
+        this.creditUnbuffered(f)
         return
       }
       if (this.reliable) {
+        // The connection window first (§4.2.1): the peer may not have more
+        // than maxPeerWindow buffered here across all of its calls. A
+        // conforming sender never gets here; one that does fails THIS call,
+        // never the peer, and its frame's credit goes back like any
+        // never-buffered frame's (§4.2, §15).
+        if (this.pf !== undefined && !this.pf.admit()) {
+          this.cancel(statusError(Code.INTERNAL, 'drpc: peer exceeded the connection flow-control window'))
+          this.creditUnbuffered(f)
+          return
+        }
+        if (!this.pin()) {
+          // The call finished under it: never delivered.
+          this.retirePeer(1)
+          return
+        }
         if (this.flowRx.active) {
           // A conforming peer never exceeds the window it was granted, so a
           // full buffer here is a contract violation — and blocking on it
@@ -1448,11 +1646,13 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
           // that would unpark the peer travels the very read loop this would
           // stall (§4.2, §4.2.1).
           if (!this.rxq.tryPut(f)) {
+            if (this.unpin()) this.retirePeer(1)
             this.cancel(statusError(Code.INTERNAL, 'drpc: peer exceeded the advertised flow-control window'))
           }
         } else if (!(await this.rxq.putBlocking(f, this.endLatch, ctx.signal))) {
           // See the client twin: teardown ate the frame — fail loud rather
           // than leave a silent gap on a reliable channel (§14).
+          if (this.unpin()) this.retirePeer(1)
           this.rxDropped++
           this.cancel(statusError(Code.UNAVAILABLE, 'transport closed during delivery'))
         }
@@ -1475,17 +1675,93 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   async recv(): Promise<Req | undefined> {
     for (;;) {
       const f = this.rxq.tryTake()
-      if (f !== undefined) {
-        // A failed delivery ends the call; granting then would only draw a
-        // RESET for a sid the peer has already forgotten (§4.2.1).
-        const msg = (await this.decodeMessage(f)) as Req
-        this.grantWindow(1)
-        return msg
-      }
+      if (f !== undefined) return this.recvBuffered(f)
       if (this.rxEOF.tripped) return undefined
       if (this.ctrl.signal.aborted) throw abortCause(this.ctrl.signal)
       await Promise.race([this.rxq.readable(), this.rxEOF.wait(), this.endLatch.wait()])
     }
+  }
+
+  // recvBuffered delivers a frame taken out of the rx buffer and returns the
+  // slot to the client as flow-control credit (§4.2.1).
+  private async recvBuffered(f: Frame): Promise<Req> {
+    if (!isOpen(f) && this.unpin()) {
+      // The connection credit goes back the moment the frame leaves the
+      // buffer, delivered or not (§4.2.1); the stream credit below only when
+      // it was delivered, since a failed delivery ends the call and granting
+      // then would only draw a RESET for a sid the peer has already
+      // forgotten. The server-streaming request rode the OPEN, which the
+      // client never charged: it returns nothing.
+      this.retirePeer(1)
+    }
+    const msg = (await this.decodeMessage(f)) as Req
+    this.grantWindow(1)
+    return msg
+  }
+
+  // pin charges one data frame about to enter rxq to this call's connection
+  // pin count, or refuses when the bulk return already ran (§4.2.1). It runs
+  // BEFORE the enqueue, so the consumer can never unpin a frame that was not
+  // yet pinned.
+  private pin(): boolean {
+    if (this.rxReleased) return false
+    this.pinned++
+    return true
+  }
+
+  // unpin takes one frame off the pin count: it left rxq, or never made it
+  // in. False means the bulk return at finish already covered it — its
+  // credit went back with the call's, and must not go back twice.
+  private unpin(): boolean {
+    if (this.pinned === 0) return false
+    this.pinned--
+    return true
+  }
+
+  // releasePinned returns the connection credit of everything still buffered
+  // when the call finished, in one grant (§4.2.1). Frames that arrive after
+  // it find rxReleased and are credited on the spot.
+  /** @internal */
+  releasePinned(): void {
+    const pinned = this.pinned
+    this.pinned = 0
+    this.rxReleased = true
+    this.retirePeer(pinned)
+  }
+
+  // creditUnbuffered returns the connection credit of a data frame this side
+  // received and will never buffer — off-shape, unknown flag, seq failure,
+  // an overrun refusal (§4.2.1). It never touched outstanding. Anything but
+  // a reliable-mode data frame spent no credit.
+  private creditUnbuffered(f: Frame): void {
+    if (!this.reliable || this.pf === undefined || this.ps === undefined || !isData(f)) return
+    const g = this.pf.unadmitted(this.clientEpoch, 1)
+    if (g > 0) this.server.grantPeer(this.ps, g)
+  }
+
+  // retirePeer returns the connection credit of n admitted frames of this
+  // call that stopped occupying its buffer: consumed, or discarded with the
+  // call (§4.2.1).
+  private retirePeer(n: number): void {
+    if (n === 0 || this.pf === undefined || this.ps === undefined) return
+    const g = this.pf.retire(this.clientEpoch, n, true)
+    if (g > 0) this.server.grantPeer(this.ps, g)
+  }
+
+  // raisePeer lifts the client's assumed W_CONN to this side's
+  // maxPeerWindow, once per client incarnation (§4.2.1): a sid-0 grant of
+  // the difference, right behind the first H sent to that incarnation, so on
+  // an ordered channel the client's settle precedes it. It is a MUST, not an
+  // optimisation: this side's grant cadence is computed against
+  // maxPeerWindow, so a sender left at W_CONN against a larger window would
+  // park before any batched grant fired. Best-effort against a draining
+  // peer, like the H it follows.
+  /** @internal */
+  raisePeer(): void {
+    if (!this.reliable || this.pf === undefined || this.ps === undefined || this.ps.raised) return
+    this.ps.raised = true
+    const g = this.pf.excess()
+    if (g > 0) this.server.grantPeer(this.ps, g)
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<Req> {
@@ -1634,18 +1910,38 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
       throw statusError(Code.INTERNAL, 'send on a non-server-streaming call')
     }
 
+    if (this.ctrl.signal.aborted) {
+      // The call is over (client abort, deadline, finish): a handler's last
+      // send must not spend the connection window toward that client —
+      // shared by every call to it and cumulative — on a frame that will
+      // never go out (§4.2.1). grpc-go parity: the status describing why the
+      // stream ended.
+      throw abortCause(this.ctrl.signal)
+    }
     // Flow control (§4.2.1): park until the client has room, instead of
     // letting its full buffer stall every call on the channel. The park is
     // bounded by the call ending and by T_stall — nothing else could break it
-    // in reliable mode.
-    if (!this.flowTx.tryAcquire()) {
-      this.protoEvent('flow-stall')
-      switch (await this.flowTx.acquire(this.endLatch, this.stallMs)) {
+    // in reliable mode. A message needs one credit from the stream window
+    // AND one from the client's connection window; the stall events say
+    // which of the two ran dry.
+    const connTx = this.reliable && this.ps !== undefined ? this.ps.connTx : undefined
+    if (!tryAcquireBoth(this.flowTx, connTx)) {
+      let peer = false
+      const why = await acquireBoth(this.flowTx, connTx, this.endLatch, this.stallMs, undefined, (p) => {
+        // At the first park, before acquireBoth yields: the stall is
+        // observable while the sender is parked (§14), named by the window
+        // that ran dry — and the resume, if one comes, by the same one.
+        peer = p
+        this.protoEvent(p ? 'peer-flow-stall' : 'flow-stall')
+      })
+      switch (why) {
         case 'ok':
-          this.protoEvent('flow-resume')
+          this.protoEvent(peer ? 'peer-flow-resume' : 'flow-resume')
           break
         case 'stalled':
           throw statusError(Code.UNAVAILABLE, `drpc: flow-control stall: the peer granted no credit for ${this.stallMs}ms`)
+        case 'peer-stalled':
+          throw statusError(Code.UNAVAILABLE, `drpc: flow-control stall: the peer granted no connection credit for ${this.stallMs}ms`)
         default:
           // The call ended underneath the sender: report the status that
           // ended it, as grpc-go does.
@@ -1662,12 +1958,16 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
     try {
       enc = await this.encodePayload(raw)
     } catch (e) {
-      this.flowTx.undo() // the message never reached the wire (§4.2.1)
+      this.undoCredit() // the message never reached the wire (§4.2.1)
       throw e
     }
 
     if (this.ctrl.signal.aborted) {
-      // grpc-go parity: report the status describing why the stream ended.
+      // Ended while the credit was held: refund both windows, before a seq
+      // is taken or the header is attached to a frame that will never go out
+      // (§4.2.1). grpc-go parity: the status describing why the stream
+      // ended.
+      this.undoCredit()
       throw abortCause(this.ctrl.signal)
     }
     const f = this.nextFrame()
@@ -1697,7 +1997,16 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
     // The message never reached the wire, so its credit was never spent:
     // without the refund a handler that ignores the error leaks its whole
     // window and parks forever (§4.2.1, §4.4).
-    if (isData(f)) this.flowTx.undo()
+    if (isData(f)) this.undoCredit()
+  }
+
+  // undoCredit refunds the credit a data frame took from both windows: it
+  // never reached the wire (§4.2.1, §4.4). On the connection window, shared
+  // by every call to the client and cumulative for the incarnation's life,
+  // each such leak would be a permanent shrink.
+  private undoCredit(): void {
+    this.flowTx.undo()
+    if (this.reliable && this.ps !== undefined) this.ps.connTx.undo()
   }
 
   // ------------------------------------------------------------------

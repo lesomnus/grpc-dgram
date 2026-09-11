@@ -12,11 +12,12 @@
 //
 // The Go fixture announces TWO endpoints: the unreliable one (drpc's default
 // mode) and a second one whose per-frame mode annotation is overridden to
-// reliable, because per-stream flow control (§4.2.1) exists in reliable mode
-// only and cannot otherwise be exercised across implementations. Loopback UDP
-// carries the handful of small datagrams the reliable cases send without loss
-// or reordering, so no separate reliable transport (and no extra dependency)
-// is needed on either side.
+// reliable, because flow control (§4.2.1) — per stream, and per peer on sid 0
+// — exists in reliable mode only and cannot otherwise be exercised across
+// implementations. Loopback UDP carries the small datagrams the reliable cases
+// send, never more than a handful in flight, without loss or reordering, so
+// no separate reliable transport (and no extra dependency) is needed on
+// either side.
 //
 // Every case below is written so a Go/TS disagreement CANNOT pass: the bytes
 // each side expects are hard-coded on BOTH sides rather than compared against
@@ -201,7 +202,12 @@ const terminalOf = (fs: readonly Frame[]): Frame => {
   return f
 }
 
-const grantsOf = (fs: readonly Frame[]): Frame[] => fs.filter((f) => shapeOf(f) === FlagWindow)
+// The two kinds of WINDOW frame (§4.2.1, §7): a per-stream grant rides on
+// the call's sid; a connection grant is sid 0 — seq 0, no payload, the
+// sender's own epoch, and server→client the client incarnation in peer_epoch.
+const windowsOf = (fs: readonly Frame[]): Frame[] => fs.filter((f) => shapeOf(f) === FlagWindow)
+const streamGrantsOf = (fs: readonly Frame[]): Frame[] => windowsOf(fs).filter((f) => f.sid !== 0)
+const peerGrantsOf = (fs: readonly Frame[]): Frame[] => windowsOf(fs).filter((f) => f.sid === 0)
 
 // indexOfBytes finds needle in hay, or -1. Used to assert what the ENCODED
 // frame carries, which is the only place the metadata representation boundary
@@ -556,8 +562,8 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
     // And no frame of this session, in either direction, carries a window or
     // the WINDOW shape — including everything the Go server sent, so a server
     // that advertised one on its creation ack would be caught here.
-    expect(grantsOf(wire.tx)).toEqual([])
-    expect(grantsOf(wire.rx)).toEqual([])
+    expect(windowsOf(wire.tx)).toEqual([])
+    expect(windowsOf(wire.rx)).toEqual([])
     expect(wire.tx.filter((f) => f.window !== 0)).toEqual([])
     expect(wire.rx.filter((f) => f.window !== 0)).toEqual([])
   })
@@ -566,7 +572,7 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
   // reliable mode: the same Go service on the second endpoint (§4.2.1)
   // -------------------------------------------------------------------------
 
-  describe('reliable mode (per-stream flow control)', () => {
+  describe('reliable mode (per-stream and connection flow control)', () => {
     it('client→server: the OPEN advertises a window, the ack answers with one, Go grants credit', async () => {
       expect(relConn.reliable).toBe(true)
       const txAt = relWire.tx.length
@@ -597,7 +603,7 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
       expect(ack.window).toBe(32)
       expect(ack.header).toBeUndefined()
 
-      const grants = grantsOf(rx)
+      const grants = streamGrantsOf(rx)
       expect(grants.length).toBeGreaterThanOrEqual(1)
       for (const g of grants) {
         // A WINDOW frame is stateless: this sid, no seq, no payload, credit > 0.
@@ -621,7 +627,7 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
       expect(got).toHaveLength(40)
       expect(got.slice(0, 3)).toEqual(['ba', 'ab', 'ba'])
 
-      const grants = grantsOf(relWire.tx.slice(txAt))
+      const grants = streamGrantsOf(relWire.tx.slice(txAt))
       expect(grants.length).toBeGreaterThanOrEqual(2) // 40 consumed, batched at 16
       for (const g of grants) {
         expect(g.sid).toBe(stream.sid)
@@ -641,5 +647,68 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
       // mode timer (§10.2).
       expect(open.timeoutMs).toBeUndefined()
     })
+
+    it('both sides grant on sid 0 once the aggregate passes W_conn/2 (§4.2.1)', async () => {
+      const txAt = relWire.tx.length
+      const rxAt = relWire.rx.length
+      // Three bidi streams interleaved, 400 requests each answered 1:1: 1200
+      // data frames each way, past the W_conn = 1024 every sender assumes
+      // per peer (§4.2.1, Appendix B). Every per-stream window is refilled
+      // along the way, so the only thing that lets either side pass W_conn
+      // is the other side's sid-0 grant, batched at half its window: without
+      // one, the Go handlers park at 1024 replies and the TS sender at 1024
+      // requests, and the loop below never ends. One request is in flight
+      // at a time, so loopback UDP is never asked to queue more than a
+      // datagram and a grant or two.
+      const streams = 3
+      const each = 400
+      const live = Array.from({ length: streams }, () => relConn.newStream(Echo.live, {}))
+      for (let i = 0; i < each; i++) {
+        for (const [k, s] of live.entries()) {
+          await s.send(create(EchoRequestSchema, { message: `${k}/${i}`, repeat: 1 }))
+          expect((await s.recv())?.message).toBe(`${k}/${i}`)
+        }
+      }
+      for (const s of live) {
+        s.closeSend()
+        expect(await s.recv()).toBeUndefined()
+      }
+      const tx = relWire.tx.slice(txAt)
+      const rx = relWire.rx.slice(rxAt)
+      const sids = new Set(live.map((s) => s.sid))
+      expect(sids.size).toBe(streams)
+      expect(tx.filter((f) => f.payload !== undefined && shapeOf(f) === 0).length).toBeGreaterThanOrEqual(streams * each)
+      expect(rx.filter((f) => f.payload !== undefined && shapeOf(f) === 0).length).toBeGreaterThanOrEqual(streams * each)
+
+      // The Go server's connection grants: sid 0, seq 0, no payload, credit
+      // > 0, naming this Conn's incarnation (§6.1) — at least half of W_conn
+      // over 1200 requests consumed.
+      const fromGo = peerGrantsOf(rx)
+      expect(fromGo.length, 'the Go server granted on sid 0').toBeGreaterThan(0)
+      for (const g of fromGo) {
+        expect(g.seq).toBe(0)
+        expect(g.payload).toBeUndefined()
+        expect(g.window).toBeGreaterThan(0)
+        expect(g.peerEpoch).toBe(relConn.epoch)
+      }
+      expect(fromGo.reduce((n, g) => n + g.window, 0)).toBeGreaterThanOrEqual(512)
+      // And the TS client's, the other way: its own epoch.
+      const fromTs = peerGrantsOf(tx)
+      expect(fromTs.length, 'the TS client granted on sid 0').toBeGreaterThan(0)
+      for (const g of fromTs) {
+        expect(g.seq).toBe(0)
+        expect(g.payload).toBeUndefined()
+        expect(g.window).toBeGreaterThan(0)
+        expect(g.epoch).toBe(relConn.epoch)
+      }
+      expect(fromTs.reduce((n, g) => n + g.window, 0)).toBeGreaterThanOrEqual(512)
+      // The per-stream grants stayed on their own sids, both ways.
+      for (const g of [...streamGrantsOf(tx), ...streamGrantsOf(rx)]) expect(sids.has(g.sid), `a per-stream grant on a live sid, got ${g.sid}`).toBe(true)
+      // Neither side's per-stream advertisement moved: the connection
+      // window is a second window, not a bigger stream window.
+      const first = live[0]!.sid
+      expect(tx.find((f) => (f.flags & FlagOpen) !== 0 && f.sid === first)!.window).toBe(32)
+      expect(rx.find((f) => shapeOf(f) === 0 && f.payload === undefined && f.sid === first)!.window).toBe(32)
+    }, 60_000)
   })
 })

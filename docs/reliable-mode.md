@@ -296,7 +296,10 @@ stream buffers are deep enough that no stream window binds, and a unary `Once`
 that still returns while both producers park on the peer's window;
 `TestPeerWindow_GoToGoPastWConnBothWays` moves 1200 messages each way across
 three streams under the defaults, which completes only because both ends
-grant on sid 0.
+grant on sid 0 — and the [TypeScript port](./typescript.md) makes the same
+crossing against a real Go server on both of its cross-language channels, so
+a TS endpoint and a Go endpoint pace each other on sid 0 exactly as two Go
+endpoints do.
 
 ### What a parked sender looks like
 
@@ -558,3 +561,9 @@ conforming peer cannot post what it has no credit for.
   [`flow_peer_server_test.go`](../flow_peer_server_test.go) and
   [`flow_unit_test.go`](../flow_unit_test.go) — the connection window, from
   the ledger arithmetic up to a Go↔Go channel past `W_conn` both ways.
+- [`ts/test/flow_peer_client.test.ts`](../ts/test/flow_peer_client.test.ts)
+  and [`flow_peer_server.test.ts`](../ts/test/flow_peer_server.test.ts) — the
+  same claims pinned in the port, and
+  [`ts/test/wasm.test.ts`](../ts/test/wasm.test.ts) /
+  [`conformance.test.ts`](../ts/test/conformance.test.ts) for the crossing
+  past `W_conn` between the two implementations.

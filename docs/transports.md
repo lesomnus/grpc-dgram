@@ -270,8 +270,10 @@ nothing else ever fails them.
 Backpressure gets the browser DataChannel's answer. `postMessage` applies none,
 so received messages queue in the adapter — bounded not by the channel but by
 the protocol, since a conforming peer in reliable mode cannot put more in
-flight than the per-stream windows it was granted (§4.2.1). Never drop one to
-make room: a gap in reliable mode is a protocol error, not a lost datagram.
+flight than the windows it was granted — per stream by the advertisement, in
+all by `Limits.MaxPeerWindow` (§4.2.1), on either side of the port. Never drop
+one to make room: a gap in reliable mode is a protocol error, not a lost
+datagram.
 
 ## Checklist
 

@@ -73,18 +73,14 @@ The port deliberately stops short of the Go feature set in two places
   grpc-go `stats.Handler` type has no TS counterpart and is not mirrored;
 - **`Envelop` batching**, which follows item 1 in both languages.
 
-And one gap that is not deliberate, only sequenced: the **connection window**
-(`WINDOW sid=0`, §4.2.1) is in the Go core and the spec (Appendix A, entry
-11), not yet in the port. Until the mirror lands a TS endpoint neither grants
-on sid 0 nor assumes `W_conn`, so a Go streaming sender talking to it parks
-after 1024 cumulative data frames (the Direction A failure Appendix A
-states); the existing cross-language cases stay well below that. The mirror
-is `W_CONN`, `FlowSender.confirm`, `acquireBoth`, `PeerFlowRx`,
-`maxPeerWindow`, the two `peer-flow-*` event kinds, and then a conformance
-case that moves more than `W_conn` messages each way across three streams —
-which also needs `ts/test/wasm.test.ts`'s `grantsOf` split into per-stream
-and `sid = 0` grants, since the shared Go instance's peer ledger is
-cumulative across cases.
+That is the whole of it. The **connection window** (`WINDOW sid=0`, §4.2.1)
+that this section once listed as sequenced rather than deliberate is in the
+port: `W_CONN`, `FlowSender.confirm`, `acquireBoth`, `PeerFlowRx`,
+`maxPeerWindow` and the two `peer-flow-*` event kinds mirror `flow.go`, and
+both cross-language suites move more than `W_conn` messages each way across
+three streams with the `sid = 0` grants asserted in both directions — so the
+Direction A failure Appendix A entry 11 describes no longer has a peer in
+this repo to happen against, and issue #4 is complete on both sides.
 
 ## 4. Smaller, unowned
 

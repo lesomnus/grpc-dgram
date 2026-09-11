@@ -69,6 +69,7 @@ export {
   DEFAULT_MAX_SEND_MSG_SIZE,
   DEFAULT_STALL_MS,
   getCompressor,
+  W_CONN,
   W_INIT,
   type Compressor,
 } from './util'

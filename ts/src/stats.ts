@@ -46,6 +46,15 @@ export type ProtocolEventKind =
   // reliable mode).
   | 'flow-stall'
   | 'flow-resume'
+  // A sender parked because the peer's CONNECTION window was empty — whether
+  // or not its stream window had credit too: a send short on both waits on
+  // the peer's whole budget, and reports this pair (§4.2.1, §14) — and got
+  // some (reliable mode). Distinct from 'flow-stall' because the remedies
+  // differ: a stream stall is "this consumer stopped", a peer stall is
+  // "raise maxPeerWindow or find the other slow consumer". Both carry the
+  // parked call's sid and method.
+  | 'peer-flow-stall'
+  | 'peer-flow-resume'
 
 // ProtocolEvent describes one protocol event. sid is 0 and method '' for
 // peer-scope events; peer is set on every server-side event (the transport
@@ -82,8 +91,10 @@ export interface CounterSnapshot {
   livenessExpired: number
   tombstoneReplay: number
   dataLoss: number // calls failed by window overrun (§6.3)
-  flowStall: number // sends parked on flow-control credit
+  flowStall: number // sends parked on stream flow-control credit
   flowResume: number // parked sends that got credit and continued
+  peerFlowStall: number // sends parked on the peer's connection window (§4.2.1)
+  peerFlowResume: number // parked sends that got connection credit and continued
 }
 
 // Counters is a ready-made ProtocolStats that just counts, for applications
@@ -109,6 +120,8 @@ export class Counters {
     dataLoss: 0,
     flowStall: 0,
     flowResume: 0,
+    peerFlowStall: 0,
+    peerFlowResume: 0,
   }
 
   readonly observe: ProtocolStats = (ev) => {
@@ -154,6 +167,12 @@ export class Counters {
         break
       case 'flow-resume':
         this.n.flowResume++
+        break
+      case 'peer-flow-stall':
+        this.n.peerFlowStall++
+        break
+      case 'peer-flow-resume':
+        this.n.peerFlowResume++
         break
     }
   }

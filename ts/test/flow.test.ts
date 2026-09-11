@@ -21,7 +21,7 @@ import { Server } from '../src/server'
 import { Code, MessageTooLargeError, type StatusError } from '../src/status'
 import { W_INIT } from '../src/util'
 import { FlagClose, FlagOpen, FlagWindow, frame, isData, isHeaderFrame, isOpen, isReset, isTerminal, shapeOf, type Frame } from '../src/wire'
-import { echo, makeNet, registerEcho, tick, wireClone, type TestRes } from '../src/testing'
+import { echo, makeLoopNet, makeNet, registerEcho, tick, wireClone, type TestRes } from '../src/testing'
 
 const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v))
 const dec = (f: Frame): TestRes => JSON.parse(new TextDecoder().decode(f.payload ?? new Uint8Array())) as TestRes
@@ -29,88 +29,6 @@ const dec = (f: Frame): TestRes => JSON.parse(new TextDecoder().decode(f.payload
 // isGrant recognizes a well-formed WINDOW frame: shape WINDOW alone, seq 0,
 // no payload (PROTOCOL.md §7, §9.1).
 const isGrant = (f: Frame): boolean => shapeOf(f) === FlagWindow && f.seq === 0 && f.payload === undefined
-
-// ---------------------------------------------------------------------------
-// a single-delivery-loop transport
-// ---------------------------------------------------------------------------
-
-// Loop is one direction of a reliable adapter: frames are queued and handed
-// to the peer by ONE pump, in order, awaiting each delivery (§4.2). That
-// single loop is what makes head-of-line blocking possible at all — and
-// therefore what the flow-control fix has to be measured against. makeNet's
-// direct hand-off could never show it: there every call has its own caller.
-class Loop {
-  private readonly q: Frame[] = []
-  private pumping = false
-  private deliver: (f: Frame) => Promise<void> = async () => {}
-  // Every frame offered to this direction, and how many the pump has handed
-  // over so far (the quiescence signal `settle` waits on).
-  readonly sent: Frame[] = []
-  delivered = 0
-
-  to(deliver: (f: Frame) => Promise<void>): void {
-    this.deliver = deliver
-  }
-
-  get pending(): number {
-    return this.q.length
-  }
-
-  push(f: Frame): void {
-    const g = wireClone(f)
-    this.sent.push(g)
-    this.q.push(g)
-    if (!this.pumping) void this.pump()
-  }
-
-  private async pump(): Promise<void> {
-    this.pumping = true
-    try {
-      for (;;) {
-        const f = this.q.shift()
-        if (f === undefined) return
-        try {
-          await this.deliver(f)
-        } catch {
-          // Frame-level errors never tear the channel down (§4.2).
-        }
-        this.delivered++
-      }
-    } finally {
-      this.pumping = false
-    }
-  }
-}
-
-interface LoopNet {
-  conn: Conn
-  server: Server
-  counts: ReturnType<typeof registerEcho>
-  c2s: Loop
-  s2c: Loop
-  // settle runs microtask turns until both loops are drained and idle.
-  settle: () => Promise<void>
-}
-
-function makeLoopNet(): LoopNet {
-  const peer = 'peer-1'
-  const c2s = new Loop()
-  const s2c = new Loop()
-  const server = new Server({ handle: (f: Frame) => s2c.push(f) }, { reliable: true })
-  const counts = registerEcho(server)
-  const conn = new Conn({ handle: (f: Frame) => c2s.push(f) }, { reliable: true })
-  c2s.to((f) => server.handle(f, { peer }))
-  s2c.to((f) => conn.handle(f, {}))
-
-  const settle = async (): Promise<void> => {
-    for (let i = 0; i < 500; i++) {
-      const before = c2s.delivered + s2c.delivered
-      await tick()
-      if (c2s.pending === 0 && s2c.pending === 0 && c2s.delivered + s2c.delivered === before) return
-    }
-  }
-  return { conn, server, counts, c2s, s2c, settle }
-}
 
 // ---------------------------------------------------------------------------
 // §4.2 / §4.2.1: the head-of-line fix. A reliable adapter delivers every

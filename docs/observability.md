@@ -399,10 +399,14 @@ interface ProtocolEvent {
 Everything in [Every event](#every-event) holds verbatim: the same kinds, emitted
 from the same decision points, with the same fields — `peer` on every
 server-side event, `sid` and `method` on every call-scope one, `count` only for
-`skipped`, `dropped` and `off-shape`. (The `peer-flow-stall` /
-`peer-flow-resume` pair arrives with the port's connection window, which
-follows the Go core; until then a TS endpoint has no connection window to
-stall on.) `protocolStats` accepts one observer or an
+`skipped`, `dropped` and `off-shape`. That includes the `peer-flow-stall` /
+`peer-flow-resume` pair: the port has the connection window (§4.2.1), so a
+send short on the peer's whole budget reports this pair — with the parked
+call's `sid` and `method`, on either end — and a send short on only its
+stream window reports `flow-stall` / `flow-resume`, kept apart in
+`Counters.snapshot()` as `peerFlowStall` / `peerFlowResume` beside
+`flowStall` / `flowResume`, with the same reading as
+[the table above](#every-event). `protocolStats` accepts one observer or an
 array, which is the TS spelling of "`WithProtocolStats` may be given more than
 once". `Counters.observe` is an arrow property, so it can be handed over
 unbound, and `snapshot()` returns a copy.

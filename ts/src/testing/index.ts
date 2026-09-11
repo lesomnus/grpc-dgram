@@ -130,6 +130,90 @@ export async function tick(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// a single-delivery-loop transport
+// ---------------------------------------------------------------------------
+
+// Loop is one direction of a reliable adapter: frames are queued and handed
+// to the peer by ONE pump, in order, awaiting each delivery (§4.2). That
+// single loop is what makes head-of-line blocking possible at all — and
+// therefore what the flow-control fix has to be measured against. makeNet's
+// direct hand-off could never show it: there every call has its own caller —
+// nor can it let a sender outrun the grants coming back to it, since each
+// grant is delivered before the next send can start.
+export class Loop {
+  private readonly q: Frame[] = []
+  private pumping = false
+  private deliver: (f: Frame) => Promise<void> = async () => {}
+  // Every frame offered to this direction, and how many the pump has handed
+  // over so far (the quiescence signal `settle` waits on).
+  readonly sent: Frame[] = []
+  delivered = 0
+
+  to(deliver: (f: Frame) => Promise<void>): void {
+    this.deliver = deliver
+  }
+
+  get pending(): number {
+    return this.q.length
+  }
+
+  push(f: Frame): void {
+    const g = wireClone(f)
+    this.sent.push(g)
+    this.q.push(g)
+    if (!this.pumping) void this.pump()
+  }
+
+  private async pump(): Promise<void> {
+    this.pumping = true
+    try {
+      for (;;) {
+        const f = this.q.shift()
+        if (f === undefined) return
+        try {
+          await this.deliver(f)
+        } catch {
+          // Frame-level errors never tear the channel down (§4.2).
+        }
+        this.delivered++
+      }
+    } finally {
+      this.pumping = false
+    }
+  }
+}
+
+export interface LoopNet {
+  conn: Conn
+  server: Server
+  counts: ReturnType<typeof registerEcho>
+  c2s: Loop
+  s2c: Loop
+  // settle runs microtask turns until both loops are drained and idle.
+  settle: () => Promise<void>
+}
+
+export function makeLoopNet(opts: { connOpts?: ConnOptions; serverOpts?: ServerOptions; peer?: string } = {}): LoopNet {
+  const peer = opts.peer ?? 'peer-1'
+  const c2s = new Loop()
+  const s2c = new Loop()
+  const server = new Server({ handle: (f: Frame) => s2c.push(f) }, { reliable: true, ...opts.serverOpts })
+  const counts = registerEcho(server)
+  const conn = new Conn({ handle: (f: Frame) => c2s.push(f) }, { reliable: true, ...opts.connOpts })
+  c2s.to((f) => server.handle(f, { peer }))
+  s2c.to((f) => conn.handle(f, {}))
+
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 500; i++) {
+      const before = c2s.delivered + s2c.delivered
+      await tick()
+      if (c2s.pending === 0 && s2c.pending === 0 && c2s.delivered + s2c.delivered === before) return
+    }
+  }
+  return { conn, server, counts, c2s, s2c, settle }
+}
+
+// ---------------------------------------------------------------------------
 // wasm (src/wasm)
 // ---------------------------------------------------------------------------
 

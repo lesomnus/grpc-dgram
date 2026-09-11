@@ -17,7 +17,8 @@ is, how interoperability is proven, and where the two languages differ.
 - **Both endpoints**, with the full datagram machinery: seq windows and dedup,
   epoch/`peer_epoch` incarnation isolation, control retransmission, tombstones
   and the aged watermark, PING/probe liveness, the §15 caps — and, in reliable
-  mode, per-stream flow control.
+  mode, flow control per stream and per peer (the connection window,
+  §4.2.1).
 - **Browser-safe.** `AbortSignal`, `setTimeout`, `crypto`, `TextEncoder`,
   `CompressionStream`. No Node built-ins outside the `node-udp` adapter.
 
@@ -25,7 +26,7 @@ is, how interoperability is proven, and where the two languages differ.
 ts/src/
   wire.ts     frame/envelop/metadata codec, flags, shape helpers
   conn.ts     Conn + ClientStream          server.ts  Server + streams
-  seq.ts      tx seq + rx window           flow (in util.ts) credit windows
+  seq.ts      tx seq + rx window           flow (in util.ts) stream + connection credit windows
   stats.ts    ProtocolStats observer + Counters (the §14 gap counter)
   transport/  webrtc · websocket · port · node-udp · protobuf-es · connect
   wasm/       open() — a Go server compiled to js/wasm, started in a worker
@@ -53,8 +54,11 @@ process and drives it over a `MessageChannel`
 ([`transport/port`](../ts/src/transport/port) ↔
 [`transport/jsport`](../transport/jsport)): a genuinely reliable channel
 between the two implementations, which is what the flow-control cases (§4.2.1,
-reliable mode only) and both teardown paths need. Both skip themselves when
-`go` is absent; CI installs Go so they always run.
+reliable mode only) and both teardown paths need. The flow-control cases go
+past `W_conn` each way across three streams, so the run completes only if
+both ends grant on `sid = 0`; the UDP suite runs the same case on the Go
+fixture's reliable-annotated endpoint. Both skip themselves when `go` is
+absent; CI installs Go so they always run.
 
 The distinction matters for one case in particular. Binary metadata is the only
 place where the two languages' *idiomatic representations* differ, so a
@@ -133,6 +137,8 @@ serializer. If you already use Connect-ES, `createDrpcTransport(conn)` keeps
 | `TransportInfo` / `ConnAttacher` | the same seams, structural (`reliable()`, `attachConn()`) |
 | `drpc.ErrMessageTooLarge` | `MessageTooLargeError` |
 | `NewPeerContext` / `NewReliableContext` | a `FrameContext { peer, reliable, signal }` argument |
+| `WithLimits(Limits{MaxPeerWindow: n})` — the §4.2.1 connection window | `limits: { maxPeerWindow: n }` on `ConnOptions` / `ServerOptions`; same floor (`W_CONN` = 1024), same default, same `sid = 0` grants on the wire |
+| `EventPeerFlowStall` / `EventPeerFlowResume` (with the stream pair) | `'peer-flow-stall'` / `'peer-flow-resume'` — see [observability.md](./observability.md#typescript) |
 | mutexes and atomics | none: state transitions are synchronous between `await` points |
 
 The metadata row is the one to remember. Go keeps the raw octets of a `-bin`
@@ -197,15 +203,6 @@ The **`stats.Handler` bridge** (grpc-go's type; the drpc half,
 [observability.md](./observability.md#typescript)) and **`Envelop`
 batching** — the latter is unbuilt in Go too ([TODO.md](./TODO.md)). These
 are gaps, not divergences: the wire is identical either way.
-
-One more gap is sequenced rather than deliberate, and until it closes it *is*
-a behavioral divergence: the **connection window** (`WINDOW sid = 0`,
-§4.2.1) is in the Go core and the spec but not yet in the port. A TS endpoint
-neither grants on sid 0 nor assumes `W_conn`, so a Go streaming sender
-talking to it parks after 1024 cumulative data frames per connection and
-fails `UNAVAILABLE` at `T_stall` on that send and on every later one
-(PROTOCOL.md Appendix A, entry 11); the existing cross-language cases stay
-well below that. [TODO.md §3](./TODO.md) lists what the mirror consists of.
 
 One genuine environmental difference: a browser `RTCDataChannel` cannot pause
 delivery, so inbound messages queue in the adapter while a slow consumer

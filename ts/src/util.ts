@@ -3,8 +3,9 @@
 // locks — an await point is the only place interleaving can happen.
 //
 // It also holds the two pieces of wire v1.1 both endpoints share, so the
-// client and the server cannot drift apart on them: per-stream flow control
-// (PROTOCOL.md §4.2.1, Go's flow.go) and message compression with the
+// client and the server cannot drift apart on them: flow control — the
+// per-stream window and, beside it, the per-peer connection window
+// (PROTOCOL.md §4.2.1, Go's flow.go) — and message compression with the
 // per-call size caps (§12.1, §16 — Go's frame.go/callinfo.go).
 
 import { DropPolicy } from './limits'
@@ -207,7 +208,7 @@ export class Sweeper {
 }
 
 // ---------------------------------------------------------------------------
-// per-stream flow control (PROTOCOL.md §4.2.1) — reliable mode only
+// flow control (PROTOCOL.md §4.2.1) — reliable mode only
 // ---------------------------------------------------------------------------
 //
 // HTTP/2's per-stream windows, counted in messages. Without it the only
@@ -217,6 +218,15 @@ export class Sweeper {
 // than head-of-line blocking: the event loop the stalled delivery runs on is
 // the same one that would have to produce the grant, so a blocking receive
 // path is a deadlock, never a delay.
+//
+// Beside the per-stream windows sits the connection window (§4.2.1, §15),
+// one per peer, bounding what that peer can pin across ALL of its calls as
+// RFC 9113 §6.9.1's does: a data frame needs one credit from its stream
+// window AND one from the peer's connection window. It is never advertised —
+// every sender assumes W_CONN per peer and the peer's first per-stream
+// advertisement settles it (confirm): > 0 keeps the assumption, 0 turns it
+// off. WINDOW sid=0 adds credit; a receiver returns one credit for every data
+// frame it received once that frame stops occupying a buffer (PeerFlowRx).
 
 // W_INIT is the initial per-stream window a sender assumes before the peer's
 // advertisement arrives — the same value as the default rx buffer, so the
@@ -224,6 +234,13 @@ export class Sweeper {
 // buffer floor: a receiver that buffered less could be overrun before its own
 // advertisement landed.
 export const W_INIT = 32
+
+// W_CONN is the connection window a sender assumes per peer before any sid-0
+// grant (§4.2.1, §10.1, Appendix B), and the floor of Limits.maxPeerWindow
+// for the same reason W_INIT floors the rx buffer: a receiver holding less
+// than a sender assumes is overrun by a conforming sender. A fixed protocol
+// constant, 32 × W_INIT.
+export const W_CONN = 1024
 
 // DEFAULT_STALL_MS is T_stall (§10.1): how long a send may park for credit
 // before the call fails UNAVAILABLE. Unlike the other timers it runs in
@@ -249,6 +266,21 @@ export type FlowAcquire =
   | 'aborted'
   // T_stall elapsed with no grant: the call fails UNAVAILABLE.
   | 'stalled'
+
+// FlowAcquireBoth is acquireBoth's outcome: FlowAcquire plus which window a
+// T_stall expiry found the sender parked on — 'stalled' names the stream,
+// 'peer-stalled' the peer's connection window (§4.2.1, §14).
+export type FlowAcquireBoth = FlowAcquire | 'peer-stalled'
+
+// SenderState is a connection sender's position — on, settled, granted and
+// sent — carried across its container's eviction (PeerFlowRx.stash, §9.4,
+// §15) so a recreated container continues where it left off.
+export interface SenderState {
+  on: boolean
+  observed: boolean
+  granted: number
+  sent: number
+}
 
 // FlowSender is the sending half: how much the peer has allowed, how much has
 // been sent, and a parking spot for the difference.
@@ -284,6 +316,35 @@ export class FlowSender {
     wake(this.waiters)
   }
 
+  // confirm settles a connection window by the peer's first per-stream
+  // advertisement (§4.2.1): 0 means the peer does no flow control and turns
+  // it OFF; anything else confirms the assumption as it stands. Unlike
+  // observe it keeps the credit already granted — a sid-0 grant that raced
+  // ahead of the settle (the peer's raise rides right behind its
+  // advertisement) must not be clobbered by a replace. Once only, like
+  // observe. A sender that was never assumed stays off: an advertisement is
+  // not a grant, and nothing was assumed that could be confirmed.
+  confirm(window: number): void {
+    if (this.observed) return
+    this.observed = true
+    if (window <= 0) this.on = false
+    wake(this.waiters)
+  }
+
+  // reassume restarts a connection window from scratch for a new peer
+  // incarnation (§4.2.1, §10.6): assumed at window, unsettled, nothing sent.
+  // A server that restarted on a surviving channel counts from zero, so the
+  // cumulative sent count and any credit of the dead incarnation would never
+  // line up with its grants again — a forever-park. Anyone parked is woken to
+  // re-race on the fresh credit.
+  reassume(window: number): void {
+    this.on = window > 0
+    this.observed = false
+    this.granted = Math.max(window, 0)
+    this.sent = 0
+    wake(this.waiters)
+  }
+
   // grant adds credit and wakes anyone parked. A grant never turns flow
   // control ON by itself: only an advertisement does (assume/observe).
   // Otherwise a stray, duplicated or injected WINDOW frame could park a
@@ -298,8 +359,12 @@ export class FlowSender {
   }
 
   // undo returns one message of credit: the frame it was taken for never
-  // reached the wire (a synchronous adapter refusal, §4.4). Without it a
-  // caller that ignores such errors leaks its whole window and parks forever.
+  // reached the wire (a synchronous adapter refusal, §4.4, or a call that
+  // ended between taking the credit and transmitting). Without it a caller
+  // that ignores such errors leaks its whole window and parks forever — and
+  // on the connection window, shared by every call to the peer and cumulative
+  // for the incarnation's life, each such leak is a permanent shrink
+  // (§4.2.1).
   undo(): void {
     if (this.sent > 0) this.sent--
     wake(this.waiters)
@@ -319,6 +384,28 @@ export class FlowSender {
     if (this.on && this.sent >= this.granted) return false
     this.sent++
     return true
+  }
+
+  // empty reports, taking nothing, whether a send would park here right now:
+  // flow control is on and the credit is spent. acquireBoth asks the
+  // connection window this when the stream window is short, so that a park
+  // short on both is reported as the connection one (§4.2.1, §14).
+  empty(): boolean {
+    return this.on && this.sent >= this.granted
+  }
+
+  // state reads the position for a stash (SenderState); restore continues a
+  // fresh sender from one. Nothing is parked on a fresh sender, so restore
+  // has no one to wake.
+  state(): SenderState {
+    return { on: this.on, observed: this.observed, granted: this.granted, sent: this.sent }
+  }
+
+  restore(st: SenderState): void {
+    this.on = st.on
+    this.observed = st.observed
+    this.granted = st.granted
+    this.sent = st.sent
   }
 
   // acquire consumes one message of credit, parking until there is some. The
@@ -372,8 +459,113 @@ export class FlowSender {
     }
   }
 
-  private parked(): Promise<void> {
+  // parked resolves on the next grant, undo, settle or release — the channel
+  // Go's tryAcquire hands back; callers re-check with tryAcquire and loop.
+  parked(): Promise<void> {
     return new Promise((res) => this.waiters.push(res))
+  }
+}
+
+// takeBoth takes one credit from the stream window and, when there is a
+// connection window, one from it — stream first (see acquireBoth): on a
+// connection shortfall the stream credit is refunded before reporting which
+// window was short. Synchronous, like tryAcquire, for the same reason.
+function takeBoth(stream: FlowSender, peer: FlowSender | undefined): 'ok' | 'stream' | 'peer' {
+  if (!stream.tryAcquire()) return 'stream'
+  if (peer !== undefined && !peer.tryAcquire()) {
+    stream.undo()
+    return 'peer'
+  }
+  return 'ok'
+}
+
+// tryAcquireBoth is acquireBoth's synchronous fast path: both credits taken,
+// or nothing held; false means the sender must park (acquireBoth). It is the
+// tryAcquire of the pair, for the same reason — the send path stays
+// synchronous when there IS credit.
+export function tryAcquireBoth(stream: FlowSender, peer: FlowSender | undefined): boolean {
+  return takeBoth(stream, peer) === 'ok'
+}
+
+// acquireBoth consumes one message of credit from the stream window AND one
+// from the peer's connection window (§4.2.1), parking until both are there.
+// An undefined peer means no connection window (unreliable mode): it is then
+// FlowSender.acquire.
+//
+// Stream credit is taken first; if the connection is then short the stream
+// credit is refunded (undo) before parking. The order is load-bearing:
+// connection-first would let streams parked on their own window hoard the
+// shared budget until every stream parks — a mutual T_stall. Never holding
+// one credit while parked on the other is what keeps a stuck stream from
+// starving the healthy ones.
+//
+// A call that has already ended spends nothing: ends are checked right before
+// the credits are taken, with no yield in between — the same guarantee Go's
+// take-then-re-check-then-refund gives across its mutex gap — so a dead call
+// cannot spend the connection window, shared by every call to the peer and
+// cumulative for the incarnation's life, on a frame that will never go out.
+// The callers refund at their own late exits for the same reason.
+//
+// One T_stall timer, armed at the first park, bounds the whole wait across
+// both windows: §10.1 makes T_stall the longest a send may wait for credit,
+// and two budgets would silently make it 2 × T_stall. onStall is called
+// once, at the first park — synchronously, before this function first
+// yields, so a stall counter reads it while the sender is still parked —
+// with peer = true when the connection window is the one that is empty, and
+// when both are, since a sender short on both waits on the peer's whole
+// budget, not on one consumer (§14). On expiry the outcome names the window
+// by the same rule: 'peer-stalled' or 'stalled'. Which bound woke the park
+// decides the outcome, as in acquire: only a grant loops back to take
+// credit.
+export async function acquireBoth(
+  stream: FlowSender,
+  peer: FlowSender | undefined,
+  done: Latch,
+  stallMs: number,
+  signal?: AbortSignal,
+  onStall?: (peer: boolean) => void,
+): Promise<FlowAcquireBoth> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let dispose = noop
+  let bounds: Promise<FlowAcquireBoth>[] | undefined
+  try {
+    for (;;) {
+      if (done.tripped) return 'ended'
+      if (signal?.aborted) return 'aborted'
+      const short = takeBoth(stream, peer)
+      if (short === 'ok') return 'ok'
+      // Short on both: the connection window is the one to name.
+      const onPeer = short === 'peer' || (peer !== undefined && peer.empty())
+
+      if (bounds === undefined) {
+        bounds = [done.wait().then(() => 'ended' as const)]
+        if (stallMs > 0) {
+          bounds.push(
+            new Promise<FlowAcquireBoth>((res) => {
+              const t = setTimeout(() => res('stalled'), stallMs)
+              unrefTimer(t)
+              timer = t
+            }),
+          )
+        }
+        if (signal !== undefined) {
+          bounds.push(
+            new Promise<FlowAcquireBoth>((res) => {
+              dispose = abortListener(signal, () => res('aborted'))
+            }),
+          )
+        }
+        onStall?.(onPeer)
+      }
+      const wait = short === 'peer' ? peer!.parked() : stream.parked()
+      const why = await Promise.race([wait.then(() => 'grant' as const), ...bounds])
+      if (why === 'grant') continue
+      if (why === 'stalled') return onPeer ? 'peer-stalled' : 'stalled'
+      return why
+    }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    dispose()
   }
 }
 
@@ -407,6 +599,222 @@ export class FlowReceiver {
     const grant = this.pending
     this.pending = 0
     return grant
+  }
+}
+
+// U32_MAX bounds the ledger's counters: they are uint32 on the wire (§7), and
+// a hostile peer's returns must saturate, never wrap.
+const U32_MAX = 0xffff_ffff
+
+// EvictedSender is one held sender position: its credit and whether this
+// side's raise already went to it (PeerFlowRx.stash / unstash).
+export interface EvictedSender {
+  state: SenderState
+  raised: boolean
+}
+
+// PeerFlowRx is the receiving half of the connection window (§4.2.1, §15):
+// one per transport peer on the server, one per Conn on the client. It is a
+// physical ledger — outstanding counts the peer's data frames sitting in this
+// endpoint's buffers, pending the credit retired and not yet granted — so
+// junk cannot desync it: only a frame this ledger admitted can raise
+// outstanding, and the bound is enforced on outstanding, never on what was
+// granted.
+//
+// Every reliable-mode data frame received returns exactly one credit once it
+// stops occupying a buffer: consumed, discarded at its call's end, or never
+// buffered at all (off-shape, overrun-refused, RESET-drawn, tombstone drop).
+// Grants are batched at half the window like FlowReceiver's, plus the
+// starvation clause the §4.2.1 MUST requires here: with stuck consumers
+// pinning most of the window, pending may never reach half of it while the
+// sender is out of credit, so a grant also fires whenever outstanding +
+// pending reaches the window — whatever is pending is everything the sender
+// could still be waiting for.
+//
+// outstanding is one number: it is the bound, and the memory it bounds is
+// pinned by the transport peer whatever incarnation sent it. pending is per
+// incarnation, because a grant is addressed to one (peer_epoch, §6.1): two
+// incarnations can coexist on one key — a client restarted at the same
+// address on a datagram channel forced reliable, where no disconnectPeer
+// fires — and credit the live one's frames returned, batched into a grant
+// addressed to the dead one because its finished call tipped the batch,
+// would be dropped by the client and lost for good: a permanent shrink of
+// the live sender. So each incarnation is granted exactly what its own
+// frames returned. The starvation clause reads the shared outstanding
+// against one incarnation's pending, which can only fire early, never late.
+export class PeerFlowRx {
+  private window = 0 // maxPeerWindow; 0 = off (unreliable mode)
+  private outstanding = 0 // admitted − retired: the peer's frames in our buffers
+  private readonly pending = new Map<number, number>() // retired − granted, per incarnation (epoch)
+  private raised = false // the once-per-incarnation raise above W_CONN was sent
+
+  // The sending half of the containers the maxDeadPeers cap evicted (§9.4,
+  // §15), by client epoch, in eviction order (a Map iterates in insertion
+  // order), at most evictCap of them. An evicted incarnation may be idle
+  // rather than dead — a client holding several Conns on one socket — and a
+  // recreated container that started over at W_CONN would be under-credited
+  // against a client ledger that already raised it, with no grant cadence
+  // able to reach it (§4.2.1 Raise: a forever-park), while repeating the
+  // raise would over-credit the client. So the position is kept, bounded
+  // like the containers are, and a grant addressed to an evicted incarnation
+  // still lands on it, as does the credit of a RESET-drawn data frame it
+  // sent. Past the cap the oldest is dropped, credit held back for it
+  // included, and that incarnation starts over at W_CONN as a new one would
+  // — raised again, which over-credits the client (§16).
+  private readonly evicted = new Map<number, EvictedSender>()
+  private evictCap = 0
+
+  // enable sizes the ledger. evictCap is how many evicted senders it keeps
+  // (server: maxDeadPeers; the client evicts nothing). The window saturates
+  // at U32_MAX, what Go's uint32 parameter can hold: it is what the raise
+  // puts on the wire (§7) and what the grant rule measures against, and an
+  // unbounded one would do neither (limits.ts clamps first; this keeps the
+  // ledger honest on its own).
+  enable(window: number, evictCap: number): void {
+    this.window = Math.min(window, U32_MAX)
+    this.evictCap = evictCap
+  }
+
+  // active reports whether this side bounds the peer, i.e. whether a data
+  // frame must pass admit before it is buffered.
+  get active(): boolean {
+    return this.window > 0
+  }
+
+  // admit charges one frame about to be buffered. It refuses — false,
+  // nothing charged — when the frame would take outstanding past the window:
+  // that is the overrun the receiver fails the offending call INTERNAL for
+  // (§4.2, §15). Off, everything is admitted and nothing counted.
+  admit(): boolean {
+    if (this.window <= 0) return true
+    if (this.outstanding >= this.window) return false
+    this.outstanding++
+    return true
+  }
+
+  // retire reports that n admitted frames of incarnation epoch stopped
+  // occupying a buffer and returns the credit to grant it now on sid 0 (0 =
+  // nothing to send yet). credit = false retires without returning anything:
+  // the frames came from a server incarnation the client has moved past,
+  // whose calls are RESET-failed anyway (§10.6), so their credit has no one
+  // to go to.
+  retire(epoch: number, n: number, credit: boolean): number {
+    if (this.window <= 0) return 0
+    this.outstanding -= Math.min(n, this.outstanding)
+    if (!credit) return 0
+    this.hold(epoch, n)
+    return this.due(epoch)
+  }
+
+  // unadmitted returns the credit of n frames incarnation epoch sent that
+  // were never admitted — a data frame for an unknown, finished or
+  // tombstoned sid, which draws a RESET (§9.3, §10.6) — without touching
+  // outstanding: they never occupied a buffer, but the sender spent credit on
+  // them and a window that never gets it back is a permanent shrink. Same
+  // batching as retire.
+  unadmitted(epoch: number, n: number): number {
+    if (this.window <= 0) return 0
+    this.hold(epoch, n)
+    return this.due(epoch)
+  }
+
+  // unadmittedEvicted is unadmitted for an incarnation whose container the
+  // maxDeadPeers cap evicted and whose sender position this ledger holds
+  // (§9.4): a data frame it still had in flight for a call this side has
+  // finished draws its RESET like any other, and its credit goes back to
+  // that incarnation — the stash keeps the server→client direction exact,
+  // and this keeps the other one. Held nowhere, nothing is held back: junk
+  // creates no state, and a dropped position takes its held-back credit
+  // with it.
+  unadmittedEvicted(epoch: number, n: number): number {
+    if (this.window <= 0 || !this.evicted.has(epoch)) return 0
+    this.hold(epoch, n)
+    return this.due(epoch)
+  }
+
+  // hold holds back n retired credits for incarnation epoch, saturating.
+  private hold(epoch: number, n: number): void {
+    this.pending.set(epoch, Math.min((this.pending.get(epoch) ?? 0) + n, U32_MAX))
+  }
+
+  // due applies the grant rule to one incarnation's held-back credit: half
+  // the window, or the starvation clause against the shared outstanding.
+  private due(epoch: number): number {
+    const pending = this.pending.get(epoch) ?? 0
+    if (pending === 0) return 0
+    if (pending * 2 < this.window && this.outstanding + pending < this.window) return 0
+    this.pending.delete(epoch)
+    return pending
+  }
+
+  // raise returns the once-per-peer-incarnation sid-0 grant that lifts the
+  // sender's assumed W_CONN to this receiver's window (§4.2.1): window −
+  // W_CONN, exactly once; 0 when there is nothing to raise by, and 0 ever
+  // after. It is a MUST, not an optimisation: this side's grant cadence is
+  // computed against its own window, so a sender left at W_CONN against a
+  // larger receiver would park before any batched grant fired.
+  raise(): number {
+    if (this.raised) return 0
+    this.raised = true
+    return this.excess()
+  }
+
+  // excess is what a raise lifts the sender by — window − W_CONN when
+  // positive — without the once-only latch: on the server the ledger is per
+  // transport peer while the raise is per client incarnation (§4.2.1, §15),
+  // so the container keeps the latch and asks the ledger only for the
+  // amount.
+  excess(): number {
+    return this.window <= W_CONN ? 0 : this.window - W_CONN
+  }
+
+  // renew makes the raise due again: the peer is a new incarnation, whose
+  // sender starts over at W_CONN and has never seen this receiver's window
+  // (§4.2.1). The ledger itself carries over — outstanding still counts the
+  // dead incarnation's frames until they drain, uncredited — but whatever
+  // was held back for the old incarnation has no one left to go to. Client
+  // only: a Conn faces one server incarnation at a time.
+  renew(): void {
+    this.raised = false
+    this.pending.clear()
+  }
+
+  // stash keeps the sender position of a container the maxDeadPeers cap is
+  // evicting (see the field comment). Whatever the ledger holds back for
+  // that incarnation stays with it.
+  stash(epoch: number, state: SenderState, raised: boolean): void {
+    if (this.evictCap <= 0) {
+      this.pending.delete(epoch)
+      return
+    }
+    // A re-stash keeps its place in the eviction order, as a Map does.
+    this.evicted.set(epoch, { state: { ...state }, raised })
+    while (this.evicted.size > this.evictCap) {
+      const oldest = this.evicted.keys().next().value!
+      this.evicted.delete(oldest)
+      this.pending.delete(oldest)
+    }
+  }
+
+  // unstash hands back the held position of an incarnation whose container
+  // is being recreated, if it is still held — once.
+  unstash(epoch: number): EvictedSender | undefined {
+    const e = this.evicted.get(epoch)
+    if (e === undefined) return undefined
+    this.evicted.delete(epoch)
+    return e
+  }
+
+  // creditEvicted applies a sid-0 grant addressed to an evicted incarnation
+  // to its held position: the client is returning credit for frames that
+  // were in flight or buffered at the eviction. Same rule as
+  // FlowSender.grant — it never enables — and a grant for an incarnation
+  // held nowhere is dropped.
+  creditEvicted(epoch: number, n: number): void {
+    if (n <= 0) return
+    const e = this.evicted.get(epoch)
+    if (e === undefined || !e.state.on) return
+    e.state.granted = Math.min(e.state.granted + n, Number.MAX_SAFE_INTEGER)
   }
 }
 

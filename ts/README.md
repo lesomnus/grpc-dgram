@@ -17,10 +17,13 @@ server and vice versa.
   mode machinery: seq windows and dedup, epoch/`peer_epoch` incarnation
   isolation, control-frame retransmission, tombstones + aged watermark,
   PING/probe liveness, and the §15 resource caps. On a reliable transport all
-  timers are off, sequencing is strict fail-loud (§10.6), and **per-stream
-  flow control** (§4.2.1) keeps one slow consumer from stalling the other
-  calls on the channel — the browser case where a blocked receive path would
-  otherwise wedge the whole event loop.
+  timers are off, sequencing is strict fail-loud (§10.6), and **flow
+  control** (§4.2.1) keeps one slow consumer from stalling the other calls on
+  the channel — the browser case where a blocked receive path would otherwise
+  wedge the whole event loop: a credit window per stream, and beside it a
+  connection window per peer (`limits.maxPeerWindow`, 1024 messages by
+  default) that bounds what one peer can pin across *all* of its calls, as
+  HTTP/2's does.
 - **v1.1 surface.** Binary metadata (`-bin` keys carry arbitrary octets;
   base64 at the TS API, raw bytes on the wire), rich status details on the
   terminal frame, per-message compression (`gzip` via the platform's
@@ -205,6 +208,8 @@ else maps to `UNKNOWN`).
 | `NewPeerContext` / `NewReliableContext` | `FrameContext { peer, reliable, signal }` argument to `handle` |
 | mutexes + atomics | none needed: state transitions are synchronous between `await` points |
 | `WithProtocolStats(obs)` (repeatable) | `protocolStats: obs` or `protocolStats: [obs, …]` on `ConnOptions` / `ServerOptions`; `Counters.observe` is the ready-made observer |
+| `ProtocolEventKind` (`EventSkipped` … `EventFlowStall`, `EventFlowResume`, `EventPeerFlowStall`, `EventPeerFlowResume`) | `ProtocolEventKind`, the strings Go's `String()` fixes (`'skipped'` … `'flow-stall'`, `'flow-resume'`, `'peer-flow-stall'`, `'peer-flow-resume'`); `Counters` keeps `flowStall` / `flowResume` and `peerFlowStall` / `peerFlowResume` apart, as Go does |
+| `WithLimits(Limits{MaxPeerWindow: n})` (the §4.2.1 connection window) | `limits: { maxPeerWindow: n }` on `ConnOptions` / `ServerOptions`, floored at `W_CONN` (1024, exported beside `W_INIT`) for the reason `W_init` floors the rx buffer, and capped at 2³² − 1 — the wire's uint32 — so `Infinity` means that much, not off |
 | `WithChainUnaryInterceptor(…)` / `ChainUnaryInterceptors(…)` and the stream twins | `unaryInterceptors: […]` / `streamInterceptors: […]` on `ConnOptions` / `ServerOptions` — same order (element 0 outermost), `(req, call, next)` shape; see `docs/typescript.md` |
 
 Deliberately not ported (yet): the `stats.Handler` bridge (a grpc-go type; the
@@ -222,20 +227,25 @@ calls sharing the channel.
 
 ## Tests
 
-`pnpm test` — 353 tests mirroring the Go suites: the §5 golden wire vectors
+`pnpm test` — 510 tests mirroring the Go suites: the §5 golden wire vectors
 byte-for-byte (including the v1.1 vectors generated from the Go
 implementation), e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,
 probes, liveness), the §6.5 restart walkthroughs, §15 caps and §4.2 drop
-policies, §4.2.1 flow control (advertisement, parking, grants, `T_stall`,
-overrun), compression, size caps and binary metadata, each adapter
+policies, §4.2.1 flow control — per stream (advertisement, parking, grants,
+`T_stall`, overrun) and per peer (the `W_conn` assumption, settle and off,
+`sid = 0` grants and the raise, the starvation clause, credit returned for
+every non-buffered frame, one stall budget across both windows, the evicted
+sender's stash) — compression, size caps and binary metadata, each adapter
 (WebRTC/WebSocket/Port/UDP/protobuf-es/Connect) next to its source, `open()`
 and the worker it ships against a fake `Go` (`src/wasm/`), and two
 cross-language conformance tests driving a real Go `drpc.Server`: one over
 loopback UDP, one a `js/wasm` build of the server loaded into the test process
 and talked to across a `MessageChannel` — the second being where reliable mode
 is genuinely reliable rather than asserted, so the §4.2.1 windows are exercised
-between the two implementations.
+between the two implementations — per stream, and on `sid = 0` past `W_conn`
+each way across three streams, which completes only because both ends grant
+on the connection window.
 
 **Layout.** Unit and per-adapter tests are **co-located** next to their source
 (`src/wire.test.ts`, `src/transport/webrtc/index.test.ts`, …); cross-cutting

@@ -14,9 +14,9 @@ import { Conn } from '../src/conn'
 import { DropPolicy } from '../src/limits'
 import { Code, type StatusError } from '../src/status'
 import { Counters, type ProtocolEvent, type ProtocolEventKind, type ProtocolStats } from '../src/stats'
-import { Latch } from '../src/util'
+import { Latch, W_CONN, W_INIT } from '../src/util'
 import type { Timing } from '../src/timing'
-import { FlagPing, FlagReset, frame, isData, isOpen, isReset, isTerminal, type Frame } from '../src/wire'
+import { FlagPing, FlagReset, FlagWindow, frame, isData, isOpen, isReset, isTerminal, shapeOf, type Frame } from '../src/wire'
 import { echo, makeNet, tick, wireClone } from '../src/testing'
 
 const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v))
@@ -698,5 +698,82 @@ describe('a reliable channel is quiet', () => {
     }
     expect(c.log.evs).toEqual([])
     expect(s.log.evs).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// §4.2.1 / §14 connection window: a sender out of CONNECTION credit is a
+// peer-flow stall, never a flow stall — the remedies differ ("this consumer
+// stopped" vs "raise maxPeerWindow or find the other slow consumer") and an
+// operator must be able to tell them apart in one counter — and it is
+// observable WHILE parked, with the parked call's sid and method. The resume
+// is its own event, so a stuck sender is distinguishable from one that
+// recovered. The two peer-scope events count beside, not into, the
+// per-stream ones.
+// ---------------------------------------------------------------------------
+
+// Pins §14: "flow-stall counters (per stream and per peer, §4.2.1)".
+describe('peer-flow-stall / peer-flow-resume (§4.2.1, §14)', () => {
+  const isPeerGrant = (f: Frame): boolean => shapeOf(f) === FlagWindow && f.sid === 0 && f.seq === 0 && f.payload === undefined
+
+  it('a client out of connection credit is a peer stall while parked, naming the call; the resume names the same window', async () => {
+    const { net, c, s } = observed({ reliable: true })
+    const gate = new Latch()
+    net.server.register(echo.count, async (stream) => {
+      await gate.wait()
+      let n = 0
+      for await (const _ of stream) n++
+      return { text: String(n) }
+    })
+
+    // W_CONN/W_INIT calls each fill exactly their own window: the whole
+    // connection window is spent and no stream window ever was.
+    const streams = []
+    for (let i = 0; i < W_CONN / W_INIT; i++) {
+      const st = net.conn.newStream(echo.count, {})
+      for (let k = 0; k < W_INIT; k++) await st.send({ text: 'm' })
+      streams.push(st)
+    }
+    expect(c.counters.snapshot().flowStall).toBe(0)
+
+    // One more call, one more message: its stream window is untouched, the
+    // connection window is empty. With the handlers gated shut nothing
+    // returns credit: the sender is parked right now, and the stall is
+    // already visible — as a PEER stall.
+    const extra = net.conn.newStream(echo.count, {})
+    const sent = extra.send({ text: 'm' })
+    await tick()
+    expect(c.counters.snapshot()).toMatchObject({ peerFlowStall: 1, flowStall: 0, peerFlowResume: 0 })
+    expect(c.log.of('flow-stall')).toEqual([])
+    expect(c.log.first('peer-flow-stall')).toMatchObject({ sid: streams.length + 1, method: echo.count.path })
+
+    // Draining the buffers returns credit on sid 0, which unparks the
+    // sender.
+    gate.trip()
+    await sent
+    for (const st of streams) {
+      st.closeSend()
+      expect(await st.recv()).toEqual({ text: String(W_INIT) })
+    }
+    extra.closeSend()
+    expect(await extra.recv()).toEqual({ text: '1' })
+    expect(c.counters.snapshot()).toMatchObject({ peerFlowStall: 1, peerFlowResume: 1, flowStall: 0, flowResume: 0 })
+    expect(c.log.first('peer-flow-resume').method).toBe(echo.count.path)
+    expect(net.sentS2C.filter(isPeerGrant).length, 'the credit came back on sid 0').toBeGreaterThan(0)
+    // The consumer side parked nothing.
+    expect(s.counters.snapshot()).toMatchObject({ peerFlowStall: 0, peerFlowResume: 0 })
+  })
+
+  it('Counters keeps the peer pair apart from the per-stream pair', () => {
+    const c = new Counters()
+    c.observe({ kind: 'peer-flow-stall', sid: 3, method: '/m', count: 0 })
+    c.observe({ kind: 'peer-flow-resume', sid: 3, method: '/m', count: 0 })
+    c.observe({ kind: 'peer-flow-resume', sid: 3, method: '/m', count: 0 })
+    const s = c.snapshot()
+    expect([s.peerFlowStall, s.peerFlowResume]).toEqual([1, 2])
+    expect([s.flowStall, s.flowResume], 'the per-stream counters are untouched').toEqual([0, 0])
+    // One event, one increment: the count is not a magnitude here.
+    c.observe({ kind: 'peer-flow-stall', sid: 3, method: '/m', count: 7 })
+    expect(c.snapshot().peerFlowStall).toBe(2)
   })
 })

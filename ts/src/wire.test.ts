@@ -282,6 +282,9 @@ describe('presence semantics (§5, §7)', () => {
   })
 
   it('implicit-presence fields at their default are omitted', () => {
+    // sid 0 is the default: a WINDOW built without a sid is a connection
+    // grant (§4.2.1), and it encodes to nothing.
+    expect(frame().sid).toBe(0)
     expect(encodeFrame(frame())).toEqual(new Uint8Array(0))
     // window 0 / compressor "" / no details are defaults too (§5).
     expect(encodeFrame(frame({ window: 0, compressor: '', details: [] }))).toEqual(new Uint8Array(0))

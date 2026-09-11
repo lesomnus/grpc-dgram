@@ -217,9 +217,9 @@ partitioned, and an unanswered ping would only measure how busy the peer is.
 - **No backpressure on `postMessage`**, so inbound messages queue in the
   adapter without bound. That is safe for the same reason the WebSocket
   adapter's rx queue is: in reliable mode a conforming peer cannot put more in
-  flight than the per-stream windows it was granted (§4.2.1). A received frame
-  is never dropped — a gap in reliable mode is a protocol error, not a lost
-  datagram.
+  flight than the windows it was granted — per stream by the advertisement,
+  in all by `limits.maxPeerWindow` (§4.2.1). A received frame is never
+  dropped — a gap in reliable mode is a protocol error, not a lost datagram.
 - A message that is not a binary envelop (a string, another library's object
   sharing the port), an undecodable one, and a `messageerror` are all ignored;
   none of them tears the channel down (§4.2).
