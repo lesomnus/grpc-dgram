@@ -36,6 +36,17 @@ server and vice versa.
   keepalive — browser-safe (WhatWG `WebSocket`, `binaryType='arraybuffer'`).
   `dialWebSocket(url)` is a `Conn` in one line; `new WebSocketTransport(ws)` is
   the path for a socket you brought yourself.
+- **WebTransport datagram adapter** (`@lesomnus/grpc-dgram/transport/webtransport`),
+  the TS twin of the Go `transport/webtransport` adapter: unreliable mode over
+  the session's datagrams, one Envelop per datagram — the browser's datagram
+  channel with no signaling, a URL and nothing else. `dialWebTransport(url)` is
+  a `Conn` in one line (`https://` only; `serverCertificateHashes` pins a
+  development certificate), `new WebTransportDatagramTransport(wt)` the path
+  for a session you brought. The size ceiling follows the session's own
+  `datagrams.maxDatagramSize` (1200 B when it reports none), and the §4.5
+  teardown comes from the session — `closed` settling, `ready` rejecting — not
+  the read loop. Client only: Node has no `WebTransport`, so the server side is
+  the Go module.
 - **Message-port adapter** (`@lesomnus/grpc-dgram/transport/port`), the TS twin
   of the Go `transport/jsport` adapter: `PortTransport`/`PortGateway` over
   anything with `postMessage` and a `message` event — a `MessagePort`, a
@@ -75,7 +86,8 @@ server and vice versa.
 
 **Getting a connection.** Four cases, and the verb says which:
 `new Conn(new XTransport(ch), opts)` when you already hold the channel;
-`dialUdp` / `dialWebSocket` / `dialWorker` when the library should make it —
+`dialUdp` / `dialWebSocket` / `dialWebTransport` / `dialWorker` when the
+library should make it —
 each hands back a `Conn`, and takes one options bag, since `ConnOptions` and an
 adapter's own options share no key; `open(app)` when there is no peer yet,
 which returns a `Sock` whose `dial()` is the connection; and, on the serving
@@ -227,7 +239,7 @@ calls sharing the channel.
 
 ## Tests
 
-`pnpm test` — 517 tests mirroring the Go suites: the §5 golden wire vectors
+`pnpm test` — 542 tests mirroring the Go suites: the §5 golden wire vectors
 byte-for-byte (including the v1.1 vectors generated from the Go
 implementation), e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,
@@ -237,7 +249,8 @@ policies, §4.2.1 flow control — per stream (advertisement, parking, grants,
 `sid = 0` grants and the raise, the starvation clause, credit returned for
 every non-buffered frame, one stall budget across both windows, the evicted
 sender's stash) — compression, size caps and binary metadata, each adapter
-(WebRTC/WebSocket/Port/UDP/protobuf-es/Connect) next to its source, `open()`
+(WebRTC/WebSocket/WebTransport/Port/UDP/protobuf-es/Connect) next to its
+source, `open()`
 and the worker it ships against a fake `Go` (`src/wasm/`), and two
 cross-language conformance tests driving a real Go `drpc.Server`: one over
 loopback UDP, one a `js/wasm` build of the server loaded into the test process

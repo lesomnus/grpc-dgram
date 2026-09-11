@@ -1,7 +1,7 @@
 # gRPC-dgram
 
 **gRPC programming model over unreliable datagram channels (UDP, WebRTC data
-channels) — built for real-time sensor streams.**
+channels, WebTransport datagrams) — built for real-time sensor streams.**
 
 `grpc-dgram` lets you keep your `.proto` files, your generated gRPC stubs, and
 your handler code, and run them over a datagram transport instead of HTTP/2.
@@ -22,8 +22,9 @@ generated impls <── drpc.Server <──(per frame)──── adapter (unpa
   protocol is **dRPC**, specified in [`docs/PROTOCOL.md`](./docs/PROTOCOL.md)
 - Status: **core + protocol complete and characterized** (unary / server- /
   client- / bidi-streaming, metadata, interceptors, codecs, timeouts,
-  liveness), **transport adapters shipped** (UDP, WebSocket, pion/webrtc, JS
-  message port), and a **TypeScript port** of the same wire protocol
+  liveness), **transport adapters shipped** (UDP, WebSocket, pion/webrtc,
+  WebTransport datagrams, JS message port), and a **TypeScript port** of the
+  same wire protocol
   ([`ts/`](./ts) — browser and Node, verified against a real Go server).
 
 ---
@@ -58,9 +59,9 @@ subsequence** instead of stalling.
 | Per-stream and per-peer flow control on reliable channels (no head-of-line blocking; bounded memory per peer) | ✅ HTTP/2-shaped windows, counted in messages |
 | Per-stream buffering & drop policy (`DropNewest` / `DropOldest`) | ✅ per method / per role |
 | Resource caps (tombstones, live calls, reset maps, buffered messages per peer) | ✅ bounded under a junk flood |
-| Transport adapters: UDP, WebSocket, pion/webrtc, JS message port | ✅ [`transport/udp`](./transport/udp), [`transport/gorilla`](./transport/gorilla), [`transport/pion`](./transport/pion), [`transport/jsport`](./transport/jsport) |
+| Transport adapters: UDP, WebSocket, pion/webrtc, WebTransport datagrams, JS message port | ✅ [`transport/udp`](./transport/udp), [`transport/gorilla`](./transport/gorilla), [`transport/pion`](./transport/pion), [`transport/webtransport`](./transport/webtransport), [`transport/jsport`](./transport/jsport) |
 | A server compiled to `js/wasm`, served to the page over a message port | ✅ [`transport/jsport`](./transport/jsport) ↔ [`ts/…/transport/port`](./ts/src/transport/port) — same wire as WebSocket, both ends in one process |
-| Browser / Node TypeScript port (client + server, same wire) | ✅ [`ts/`](./ts) — WebRTC DataChannel, WebSocket, JS message port, Node UDP, protobuf-es & Connect-ES bindings |
+| Browser / Node TypeScript port (client + server, same wire) | ✅ [`ts/`](./ts) — WebRTC DataChannel, WebSocket, WebTransport datagrams (client), JS message port, Node UDP, protobuf-es & Connect-ES bindings |
 | Runnable examples | ✅ [`examples/`](./examples) — UDP sensor stream, WebSocket echo, browser↔Go WebRTC, a Go server compiled to wasm and started by the page |
 | `Envelop` batching (`Coalescer`) | ⬜ planned |
 
@@ -103,11 +104,12 @@ for {
 }
 ```
 
-Four adapters ship. `transport/udp` and `transport/jsport` are part of the core
+Five adapters ship. `transport/udp` and `transport/jsport` are part of the core
 module (stdlib only — `jsport` builds on `js/wasm` alone, and is skipped by
-`go build ./...` everywhere else); `transport/gorilla` (gorilla/websocket) and
-`transport/pion` (pion/webrtc) live in their own Go modules so importing the
-core never pulls their dependencies.
+`go build ./...` everywhere else); `transport/gorilla` (gorilla/websocket),
+`transport/pion` (pion/webrtc) and `transport/webtransport`
+(quic-go/webtransport-go) live in their own Go modules so importing the core
+never pulls their dependencies.
 
 | | transport | mode | client | server |
 |---|---|---|---|---|
@@ -115,6 +117,7 @@ core never pulls their dependencies.
 | [`transport/gorilla`](./transport/gorilla) | WebSocket | reliable | `gorilla.New(wsc)` | `gorilla.NewGateway()` + `ServePeer` |
 | [`transport/pion`](./transport/pion) | WebRTC DataChannel | **derived from the channel config** | `pion.New(dc)` | `pion.NewGateway()` + `Bind`+`ServePeer` |
 | [`transport/jsport`](./transport/jsport) | JS message port (`js/wasm`) | reliable | `jsport.New(port)` | `jsport.NewGateway()` + `Serve` |
+| [`transport/webtransport`](./transport/webtransport) | WebTransport datagrams (HTTP/3; the browser's datagram path, no signaling) | unreliable | `webtransport.New(sess)` | `webtransport.NewGateway()` + `ServePeer` |
 
 Clients are gRPC-shaped: `drpc.NewConn(tp)` attaches the transport and its
 receive machinery starts by itself; `conn.Close(nil)` (or the transport's
@@ -242,7 +245,8 @@ bugs — a lost reading is superseded by the next.
   (`PROTOCOL.md` §15); `epoch` is a correctness device, not a security token.
   On **raw UDP**, anyone who can sniff a live `(epoch, sid, seq)` and inject
   datagrams can forge a RESET to kill a call or force a `DATA_LOSS`. Deploy
-  over **DTLS / WSS / WebRTC** (all encrypted) and this is unreachable. Client
+  over **DTLS / WSS / WebRTC / WebTransport** (all encrypted — WebTransport is
+  QUIC, and has no plaintext form at all) and this is unreachable. Client
   streams reject foreign-epoch frames, so cross-incarnation poisoning is
   closed; same-epoch injection is the transport's job to prevent.
 - **Status details are a passenger.** `code`, `message` and
@@ -279,9 +283,9 @@ reproduction of every gRPC lifecycle detail (see
 
 ```sh
 go test -race ./...     # core + transport/udp — fast & deterministic (testing/synctest)
-# transport/gorilla and transport/pion are separate modules (their own go.mod),
-# so ./... does not reach them; CI iterates over every go.mod the same way:
-for d in transport/gorilla transport/pion; do (cd $d && go test -race ./...); done
+# transport/gorilla, transport/pion and transport/webtransport are separate modules
+# (their own go.mod), so ./... does not reach them; CI iterates over every go.mod the same way:
+for d in transport/gorilla transport/pion transport/webtransport; do (cd $d && go test -race ./...); done
 # transport/jsport is js/wasm-only, so every command above skips it; node runs it:
 GOOS=js GOARCH=wasm go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" -count=1 ./transport/jsport/...
 buf generate            # regenerate protobuf bindings after editing proto/

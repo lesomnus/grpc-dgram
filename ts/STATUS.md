@@ -45,14 +45,26 @@ the OPEN's transmit resolves). Both cross-language suites now move more than
 `W_conn` messages each way across three streams, so a TS endpoint and a Go
 endpoint pace each other on sid 0 exactly as two Go endpoints do.
 
+**WebTransport round (2026-09-11)** — a third adapter twin, **WebTransport
+datagrams** (`transport/webtransport`, the client half of Go's new
+`transport/webtransport`; issue #6, step one): the browser's unreliable
+channel with no signaling. `dialWebTransport(url)` → `Conn`, or
+`new WebTransportDatagramTransport(wt)` over a structural `WebTransportLike`;
+the ceiling follows `datagrams.maxDatagramSize` at each send (1200 B when
+unreported), the §4.5 teardown comes from `closed`/`ready`, and
+`requireUnreliable` defaults to true. Client only — Node has no
+`WebTransport`, so there is no TS server and no cross-language run for this
+channel yet; the adapter is tested against a mock session pair. The reliable
+per-stream channel on the same session is the issue's second step.
+
 ## Done
 
 Client + server core and the WebRTC DataChannel adapter, wire-compatible with
 the Go reference. The zero-dep core lives in `ts/src/`; each third-party /
 platform adapter is its **own directory** under `ts/src/transport/` — an
 `index.ts` plus a `README.md` — exported as `@lesomnus/grpc-dgram/transport/*`,
-mirroring Go's `transport/{udp,pion,gorilla,jsport}/` layout (dir + README
-each).
+mirroring Go's `transport/{udp,pion,gorilla,webtransport,jsport}/` layout (dir
++ README each).
 
 | File | Role | Go twin |
 |---|---|---|
@@ -68,6 +80,7 @@ each).
 | `interceptor.ts` | Unary/stream, client/server interceptor types in a `(…, next)` shape, and the chain fold — element 0 outermost, the last element gets the real invoker/handler | the interceptor chains of `conn.go` / `server.go` (grpc-go's order; TS-native signatures, arrays instead of single-vs-chain options) |
 | `transport/webrtc/` | `DataChannelTransport` (client) + `DataChannelGateway` (server, mixed-mode) | `transport/pion/*.go` |
 | `transport/websocket/` | `WebSocketTransport` + `dialWebSocket` → `Conn` (client), gateway/`servePeer` (server), reliable | `transport/gorilla/*.go` |
+| `transport/webtransport/` | `WebTransportDatagramTransport` + `dialWebTransport` → `Conn` (client only; Node has no `WebTransport`, the server is Go), unreliable over the session's datagrams; teardown from `closed`/`ready` | `transport/webtransport/*.go` |
 | `transport/port/` | `PortTransport` + `dialWorker` → `Conn`, `PortGateway` over `postMessage`, reliable; teardown is the empty-message goodbye plus `close(cause)` | `transport/jsport/*.go` |
 | `transport/node-udp/` | `UdpTransport`/`UdpGateway` + `dialUdp` → `Conn` / `listenUdp` (Node `dgram`) | `transport/udp/*.go` |
 | `transport/protobuf-es/` | `fromService`/`fromMethod` — derive descriptors from generated protobuf-es | grpc-go codegen (G2) |
@@ -75,7 +88,7 @@ each).
 
 Verified at this commit:
 
-- `pnpm test` → **517 passing** (25 files). Unit and per-adapter tests are
+- `pnpm test` → **542 passing** (26 files). Unit and per-adapter tests are
   co-located next to their source (`src/wire.test.ts`,
   `src/transport/connect/index.test.ts`, …); cross-cutting integration tests
   (e2e, timeout, restart, limits, flow, flow_peer_client, flow_peer_server,
@@ -106,7 +119,10 @@ Verified at this commit:
   pair, incl. the reliable-datachannel echo — the project's final-goal demo
   shape), `src/transport/{websocket,port}/index.test.ts` (their adapters
   against mock pairs and a real `MessageChannel`, incl. the goodbye and the
-  §4.5 teardown), `src/wasm/{index,worker}.test.ts` (`open()` against a fake
+  §4.5 teardown), `src/transport/webtransport/index.test.ts` (the datagram
+  client against a mock session pair: the `ready` gate, the ceiling read live
+  from `maxDatagramSize`, §4.5 from `closed` and `ready`, `dialWebTransport`),
+  `src/wasm/{index,worker}.test.ts` (`open()` against a fake
   `Go`: the ordering rules a dropped frame would otherwise hide),
   `protobufes*.test.ts` (the binding, verified
   against real `protoc-gen-es` output), and the two cross-language suites —
@@ -271,7 +287,7 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
 ```
 cd ts
 pnpm install
-pnpm test     # vitest, 517 tests (the two cross-language suites need `go` on PATH)
+pnpm test     # vitest, 542 tests (the two cross-language suites need `go` on PATH)
 pnpm check    # tsc --noEmit (strict)
 pnpm build    # tsdown → dist/
 ```

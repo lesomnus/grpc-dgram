@@ -49,8 +49,9 @@ above, (3) a §4.1/§10.7 spec revision to match.
 
 ## 2. Release preparation
 
-- **Adapter `replace` directives.** `transport/pion/go.mod` and
-  `transport/gorilla/go.mod` (and the example modules) carry
+- **Adapter `replace` directives.** `transport/pion/go.mod`,
+  `transport/gorilla/go.mod` and `transport/webtransport/go.mod` (and the
+  example modules) carry
   `replace github.com/lesomnus/grpc-dgram => ../..`. A `replace` is ignored by
   anyone who *depends* on the published module, so as long as they are there and
   the core is untagged, those adapters cannot be consumed from outside this
@@ -84,6 +85,17 @@ this repo to happen against, and issue #4 is complete on both sides.
 
 ## 4. Smaller, unowned
 
+- **WebTransport, step two: a reliable channel over a session stream.**
+  `transport/webtransport` and its TS twin (issue #6, step one) use only the
+  session's datagrams — unreliable, `Reliable() == false`, in both languages.
+  The follow-up the issue names is a reliable channel over one of the same
+  session's streams, on the pion precedent: one session carrying a reliable
+  control channel next to the datagram telemetry, each peer annotated with its
+  channel's mode (`NewReliableContext`), and the mode derived from the
+  channel rather than configured. Two things wait on a runtime rather than on
+  design: a TS *server* (Node has no `WebTransport`, client or server), and
+  the browser-driven Go↔TS conformance run for this channel — the Go module's
+  own suite is the bar today.
 - **A `Peer()` for the pion adapter that names the ICE candidate pair** instead
   of the DataChannel label, so `peer.FromContext` reports a routable address.
 - **Reserved wire space.** §5 lists what is reserved for future work: the `ack`

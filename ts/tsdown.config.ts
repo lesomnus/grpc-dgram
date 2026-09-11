@@ -11,6 +11,7 @@ export default defineConfig({
     'transport/node-udp': 'src/transport/node-udp/index.ts',
     'transport/protobuf-es': 'src/transport/protobuf-es/index.ts',
     'transport/connect': 'src/transport/connect/index.ts',
+    'transport/webtransport': 'src/transport/webtransport/index.ts',
   },
   dts: true,
 })

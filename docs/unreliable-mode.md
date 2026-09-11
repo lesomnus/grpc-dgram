@@ -12,7 +12,8 @@ because something concrete breaks without it, and each section says what.
 
 **When it is on.** The mode is resolved once, at construction, from the
 transport's `TransportInfo` (PROTOCOL.md §4.3): `transport/udp` reports
-`Reliable() == false`, so `drpc.NewConn(udp.New(c))` and
+`Reliable() == false` (as does `transport/webtransport`, the browser's
+datagram channel), so `drpc.NewConn(udp.New(c))` and
 `drpc.NewServer(udp.NewGateway(pc))` are already in unreliable mode with no
 options, and `WithReliable(false)` forces it for a custom transport. A gateway
 serving channels of mixed reliability annotates each peer with
@@ -390,8 +391,9 @@ Buffers and caps:
 `W_fwd` (4096) and `K_loud` (3) are fixed protocol constants, not options: a
 knob there would buy nothing but a setting two implementations could disagree
 on. And one knob lives outside the core — message size is the adapter's
-business (§4.4), so `udp.WithMaxMessageSize(n)` (default 1200 bytes) decides
-whether a marshaled envelop fits a datagram; an oversize send is refused
+business (§4.4), so `udp.WithMaxMessageSize(n)` — or
+`webtransport.WithMaxMessageSize(n)`; 1200 bytes by default either way —
+decides whether a marshaled envelop fits a datagram; an oversize send is refused
 synchronously as `ResourceExhausted` on the owning call, never as silent loss.
 
 ## Where to look next

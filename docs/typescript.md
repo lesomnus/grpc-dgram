@@ -28,7 +28,7 @@ ts/src/
   conn.ts     Conn + ClientStream          server.ts  Server + streams
   seq.ts      tx seq + rx window           flow (in util.ts) stream + connection credit windows
   stats.ts    ProtocolStats observer + Counters (the §14 gap counter)
-  transport/  webrtc · websocket · port · node-udp · protobuf-es · connect
+  transport/  webrtc · websocket · webtransport · port · node-udp · protobuf-es · connect
   wasm/       open() — a Go server compiled to js/wasm, started in a worker
 ```
 
@@ -59,6 +59,16 @@ past `W_conn` each way across three streams, so the run completes only if
 both ends grant on `sid = 0`; the UDP suite runs the same case on the Go
 fixture's reliable-annotated endpoint. Both skip themselves when `go` is
 absent; CI installs Go so they always run.
+
+One adapter has no cross-language run yet. The WebTransport datagram client
+([`transport/webtransport`](../ts/src/transport/webtransport)) is
+wire-compatible with the Go `transport/webtransport` gateway, but the suites
+run in Node, which has no `WebTransport` — not the global the client dials
+with, and no server either — so a Go↔TS run over that channel waits on a
+runtime that has one (a browser driving the Go server, or a Node
+implementation). Until then the adapter is verified against a mock session
+pair, and the Go module's own suite is the bar for the channel; its README
+says the same.
 
 The distinction matters for one case in particular. Binary metadata is the only
 place where the two languages' *idiomatic representations* differ, so a
@@ -93,6 +103,15 @@ Node, over UDP, against a Go server:
 import { dialUdp } from '@lesomnus/grpc-dgram/transport/node-udp'
 
 const conn = await dialUdp(7777, '127.0.0.1')
+```
+
+Browser, over WebTransport datagrams, against a Go server — the unreliable
+channel with no signaling, one URL and nothing else:
+
+```ts
+import { dialWebTransport } from '@lesomnus/grpc-dgram/transport/webtransport'
+
+const conn = dialWebTransport('https://host:4433/rpc') // https only; serverCertificateHashes for a dev cert
 ```
 
 The browser, with no server anywhere — the Go service compiled to `js/wasm`

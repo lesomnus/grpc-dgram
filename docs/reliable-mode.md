@@ -23,7 +23,8 @@ that knows it is reliable says so through `TransportInfo`, and
 | [`transport/pion`](../transport/pion) (WebRTC) | ordered + no retransmit/lifetime cap → reliable, else unreliable |
 | [`transport/jsport`](../transport/jsport) (JS message port) | always reliable — a port in one process cannot lose, duplicate or reorder |
 | [`transport/udp`](../transport/udp) | always unreliable |
-| [`ts/src/transport/websocket`](../ts/src/transport/websocket), [`webrtc`](../ts/src/transport/webrtc), [`port`](../ts/src/transport/port) | the same rules, in TypeScript |
+| [`transport/webtransport`](../transport/webtransport) (WebTransport datagrams) | always unreliable — only the session's datagram side is used |
+| [`ts/src/transport/websocket`](../ts/src/transport/websocket), [`webrtc`](../ts/src/transport/webrtc), [`port`](../ts/src/transport/port), [`webtransport`](../ts/src/transport/webtransport) | the same rules, in TypeScript |
 
 Nothing in the wiring mentions the mode:
 

@@ -20,6 +20,7 @@
     "datagram",
     "webrtc",
     "websocket",
+    "webtransport",
     "wasm",
     "connect"
   ],
@@ -37,6 +38,7 @@
     "./transport/node-udp": "./dist/transport/node-udp.mjs",
     "./transport/protobuf-es": "./dist/transport/protobuf-es.mjs",
     "./transport/connect": "./dist/transport/connect.mjs",
+    "./transport/webtransport": "./dist/transport/webtransport.mjs",
     "./package.json": "./package.json"
   },
   "files": [

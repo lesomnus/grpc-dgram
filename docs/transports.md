@@ -18,10 +18,12 @@ one. The normative contract is [PROTOCOL.md](./PROTOCOL.md) §3–§4.
 | [`transport/gorilla`](../transport/gorilla) | WebSocket | reliable | `gorilla.New(wsc)` | `gorilla.NewGateway()` + `ServePeer` |
 | [`transport/pion`](../transport/pion) | WebRTC DataChannel | derived per channel | `pion.New(dc)` | `pion.NewGateway()` + `Bind` + `ServePeer` |
 | [`transport/jsport`](../transport/jsport) | JS message port (`js/wasm`) | reliable | `jsport.New(port)` | `jsport.NewGateway()` + `Serve` |
+| [`transport/webtransport`](../transport/webtransport) | WebTransport datagrams (HTTP/3) | unreliable | `webtransport.New(sess)` | `webtransport.NewGateway()` + `ServePeer` |
 | [`ts/…/node-udp`](../ts/src/transport/node-udp) | UDP (Node) | unreliable | `new UdpTransport(...)`, `dialUdp` → `Conn` | `listenUdp` → `UdpGateway` + `serve` |
 | [`ts/…/websocket`](../ts/src/transport/websocket) | WebSocket | reliable | `new WebSocketTransport(ws)`, `dialWebSocket` → `Conn` | `new WebSocketGateway()` + `bind` + `servePeer` |
 | [`ts/…/webrtc`](../ts/src/transport/webrtc) | WebRTC DataChannel | derived per channel | `new DataChannelTransport(dc)` | `new DataChannelGateway()` + `bind` + `servePeer` |
 | [`ts/…/port`](../ts/src/transport/port) | JS message port | reliable | `new PortTransport(port)`, `dialWorker` → `Conn` | `new PortGateway()` + `bind` + `servePeer` |
+| [`ts/…/webtransport`](../ts/src/transport/webtransport) | WebTransport datagrams (browser) | unreliable | `new WebTransportDatagramTransport(wt)`, `dialWebTransport` → `Conn` | — (Go only: Node has no `WebTransport`) |
 
 Two things under `ts/src/transport/` are **not** transports, despite living
 there: [`protobuf-es`](../ts/src/transport/protobuf-es) derives method
@@ -52,11 +54,25 @@ needs no `open` — there is nothing to bring into existence — so it is
 `dialWorker(worker)`; an iframe or a second TS endpoint, where you hold the
 port yourself, is the manual path below, unchanged.
 
+`transport/webtransport` and `ts/…/webtransport` are the browser's datagram
+path. A page reaches a Go server with a URL and nothing else — no offer/answer,
+no ICE, no signaling server — and gets the unreliable mode the protocol is
+designed around, which WebSocket cannot give it. Only the session's datagram
+side is used, one marshaled `Envelop` per datagram; a reliable channel over
+one of the session's streams is the possible second step
+([TODO.md](./TODO.md#4-smaller-unowned)). The wire is HTTP/3 over QUIC, hence
+always TLS: `https://` only, a certificate on the server — a browser accepts a
+self-signed one through `serverCertificateHashes`, under limits (ECDSA P-256,
+validity under two weeks, no pooling) the two READMEs spell out. The server
+side is Go only in this step: Node has no `WebTransport`, so the TS adapter is
+a client, and a Go↔TS conformance run on this channel waits on a runtime that
+has one ([typescript.md](./typescript.md#how-interoperability-is-kept-honest)).
+
 `transport/udp` and `transport/jsport` are part of the core Go module (stdlib
 only — `jsport` needs nothing but `syscall/js`, and being `//go:build js &&
 wasm` it is silently skipped by `go build ./...` on every other GOOS).
-`gorilla` and `pion` are separate modules, so importing the core never pulls
-their dependencies.
+`gorilla`, `pion` and `webtransport` are separate modules, so importing the core
+never pulls their dependencies.
 
 ## The four ways in
 
@@ -65,8 +81,8 @@ which:
 
 | what you have | the way in | what you get |
 |---|---|---|
-| **the channel already** — a `net.Conn`, a `*websocket.Conn`, an `RTCDataChannel`, a `MessagePort` | wrap it: `new XTransport(ch)` in TS, `xxx.New(ch)` in Go | a transport, which you hand to `new Conn(tx, opts)` / `drpc.NewConn(tx, …)` |
-| **a target, and want the library to make the channel** | `dial…(target, opts?)` — `dialUdp`, `dialWebSocket`, `dialWorker` | a **`Conn`**, ready to call |
+| **the channel already** — a `net.Conn`, a `*websocket.Conn`, a `*webtransport.Session`, an `RTCDataChannel`, a `MessagePort` | wrap it: `new XTransport(ch)` in TS, `xxx.New(ch)` in Go | a transport, which you hand to `new Conn(tx, opts)` / `drpc.NewConn(tx, …)` |
+| **a target, and want the library to make the channel** | `dial…(target, opts?)` — `dialUdp`, `dialWebSocket`, `dialWebTransport`, `dialWorker` | a **`Conn`**, ready to call |
 | **a program, and no peer yet** | `open(app)` → a `Sock`, then `sock.dial(opts?)` | a **`Conn`** per `dial` |
 | **the serving side** | a `Gateway` — `listen…` where the library opens the socket, then `Serve` when the gateway owns the whole endpoint, or `Bind` + `ServePeer` per channel handed in from outside | frames delivered to your `Server` |
 
@@ -89,14 +105,16 @@ what it names is the thing it dials into.
 
 Go has no `dial…` at all, and that is consistent rather than a gap: a Go
 caller always already holds the channel — `net.Dial`, `websocket.Dialer`, a
+`*webtransport.Session` from `Transport.Dial` or `Server.Upgrade`, a
 `*webrtc.DataChannel`, a `js.Value` port — so the first row is the only one it
 needs.
 
 The three server verbs are three different jobs, not an inconsistency. `Serve`
 is for a gateway that owns the whole endpoint (a UDP socket, the js entry
 point) and serves everything arriving on it. `ServePeer` is for one channel
-handed in from outside — a WebSocket the http server upgraded, a DataChannel,
-a transferred port — one call per channel. `Bind` registers a channel *now* to
+handed in from outside — a WebSocket the http server upgraded, a WebTransport
+session the HTTP/3 handler upgraded, a DataChannel, a transferred port — one
+call per channel. `Bind` registers a channel *now* to
 be served in a moment, which is what keeps the messages arriving in between
 from being dropped.
 
@@ -104,7 +122,8 @@ from being dropped.
 
 `TransportInfo` is a one-method interface — `Reliable() bool` — discovered by
 type assertion at construction (§4.3). WebSocket and a message port answer
-`true` unconditionally; UDP answers `false`. WebRTC is the interesting one,
+`true` unconditionally; UDP and WebTransport datagrams answer `false`. WebRTC
+is the interesting one,
 because a DataChannel is only reliable if it was configured that way:
 
 ```go
@@ -150,10 +169,15 @@ They are often confused, and they measure different things.
 
 Neither implies the other. A 1200-byte send cap still overflows a 1200-byte
 datagram budget once the frame around it is counted. Defaults: UDP 1200 B,
-WebRTC 1200 B unreliable / 16 KiB reliable, WebSocket and message port
-unlimited — neither channel imposes a ceiling of its own, so the adapter
-invents none; per-call caps are gRPC's own 4 MiB receive and effectively
-unlimited send.
+WebRTC 1200 B unreliable / 16 KiB reliable, WebTransport datagrams 1200 B (in
+Go a constant, `webtransport.WithMaxMessageSize` to override: the library
+exposes no live ceiling, and 1200 B fits under the one a session has right
+after its handshake; in TypeScript the session's own
+`datagrams.maxDatagramSize` once it is up, read at each write, and 1200 B
+while it is still connecting — what a browser reports before `ready` is a
+placeholder — or when it reports none), WebSocket and message port unlimited
+— neither channel imposes a ceiling of its own, so the adapter invents none;
+per-call caps are gRPC's own 4 MiB receive and effectively unlimited send.
 
 The core never fragments and never asks for an MTU. On an unreliable channel
 that is deliberate: reassembly over a lossy link would rebuild the reliability
@@ -231,6 +255,7 @@ out-of-band signal:
 | ts websocket | `onclose`/`onerror` plus a keepalive |
 | jsport, ts port | nothing the channel reports — the peer's goodbye, or an explicit `Close`/`close(cause)` from the host (below) |
 | udp | nothing — UDP is connectionless, so the core's timers (`T_call`, `T_live`) are the bound, and shutdown is the application's move |
+| webtransport, ts webtransport | the session's own closure — `Session.Context()` in Go, `closed` settling or `ready` rejecting in TS — which fires whether or not the datagram pump is making progress; a peer that vanishes without closing is the core's timers to bound, as on UDP, with QUIC's idle timeout closing the session underneath |
 
 ### When there is nothing to detect
 
@@ -287,8 +312,10 @@ the read loop.
 The shipped adapters are the reference — [`transport/udp`](../transport/udp) is
 the smallest, [`transport/gorilla`](../transport/gorilla) shows the
 keepalive/teardown pattern, [`transport/pion`](../transport/pion) shows
-per-channel mode and back-pressure, and
-[`transport/jsport`](../transport/jsport) shows teardown on a channel that
+per-channel mode and back-pressure,
+[`transport/webtransport`](../transport/webtransport) shows a datagram channel
+that is nonetheless connection-oriented (unreliable mode *and* the §4.5 duty),
+and [`transport/jsport`](../transport/jsport) shows teardown on a channel that
 cannot report its own death. Each of the TypeScript adapters
 ([`ts/src/transport/`](../ts/src/transport)) is the same contract in the other
 language, with a README next to it.

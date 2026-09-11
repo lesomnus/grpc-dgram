@@ -28,17 +28,19 @@ that one `go get`. So is `transport/jsport`, the JS message-port adapter —
 `syscall/js` is stdlib too, and its `//go:build js && wasm` files simply do not
 exist on any other GOOS.
 
-The other two adapters are separate Go modules, so importing the core never
+The other three adapters are separate Go modules, so importing the core never
 pulls their dependencies:
 
 ```sh
-go get github.com/lesomnus/grpc-dgram/transport/gorilla   # WebSocket
-go get github.com/lesomnus/grpc-dgram/transport/pion      # WebRTC DataChannel
+go get github.com/lesomnus/grpc-dgram/transport/gorilla       # WebSocket
+go get github.com/lesomnus/grpc-dgram/transport/pion          # WebRTC DataChannel
+go get github.com/lesomnus/grpc-dgram/transport/webtransport  # WebTransport datagrams (the browser's, no signaling)
 ```
 
-Nothing is tagged yet, and those two modules reach the core through a
+Nothing is tagged yet, and those three modules reach the core through a
 `replace` directive of their own. A `replace` is ignored by anyone who
-*depends* on a module, so today the WebSocket and WebRTC adapters resolve only
+*depends* on a module, so today the WebSocket, WebRTC and WebTransport
+adapters resolve only
 from inside a checkout of this repository — where each module's own `replace`
 is enough, no workspace file required — or through a `replace` you add
 yourself. The release list in [TODO.md](./TODO.md) tracks the fix.
@@ -326,8 +328,9 @@ client := sensorpb.NewSensorServiceClient(conn)
 
 There is no mode flag in either snippet because the mode is not a setting.
 `NewConn`/`NewServer` type-assert the transport for `drpc.TransportInfo`
-once, at construction (§4.3): the UDP adapter's `Reliable()` returns false,
-the gorilla adapter's returns true, and the pion adapter derives it from each
+once, at construction (§4.3): the UDP and WebTransport adapters' `Reliable()`
+returns false, the gorilla adapter's returns true, and the pion adapter
+derives it from each
 data channel's own configuration (ordered, no retransmit or lifetime cap).
 The reason it is discovered rather than configured is §10.6's
 mode-agreement rule — both ends of a channel must land in the same mode, and
@@ -347,8 +350,8 @@ What the derived mode changes is entirely inside the core:
 That last row is the one to internalize. With the protocol timers off, an
 adapter that fails to detect transport death leaves calls hanging forever —
 nothing else can unblock them. The shipped adapters carry that duty
-(keepalive timeout, `OnClose`, a stalled write, all routed into `Conn.Close`
-/ `Server.DisconnectPeer`); a custom one must too.
+(keepalive timeout, `OnClose`, a stalled write, a session's own closure, all
+routed into `Conn.Close` / `Server.DisconnectPeer`); a custom one must too.
 
 `WithReliable(true)` overrides the derivation. It is for a custom transport
 whose adapter does not implement `TransportInfo`, not a tuning knob — setting
@@ -393,6 +396,7 @@ cd examples/browser-wasm   && go run .     # same prerequisite
 - The adapter READMEs — [`transport/udp`](../transport/udp),
   [`transport/gorilla`](../transport/gorilla),
   [`transport/pion`](../transport/pion),
+  [`transport/webtransport`](../transport/webtransport),
   [`transport/jsport`](../transport/jsport) — each documents its own options,
   message-size ceiling, and death-detection behavior. Those are per-adapter
   properties; the core has no opinion on them (§4.4).
