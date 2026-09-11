@@ -692,22 +692,98 @@ describe('one instance, many servers', () => {
   })
 
   it('fails only that connection when the name never arrives', async () => {
-    // Bounded by the same readyTimeoutMs the start used. The instance is alive
-    // and every other connection to it is untouched — and with no protocol
-    // timers (§10.6) nothing but this would ever end the call.
+    // Bounded by the dial's own readyTimeoutMs; the start's, left at its
+    // default here, was sized for main() reaching Serve and says nothing
+    // about how long a second gateway takes. The instance is alive and every
+    // other connection to it is untouched — and with no protocol timers
+    // (§10.6) nothing but this would ever end the call.
     const go = new FakeGo()
     const control = serving(go)
-    const sock = await here(go, { readyTimeoutMs: 30 })
+    const sock = await here(go)
     const ok = sock.dial()
-    const nowhere = sock.dial({ entryPoint: 'drpcNoSuchServer' })
+    const nowhere = sock.dial({ entryPoint: 'drpcNoSuchServer', readyTimeoutMs: 30 })
 
     const err = (await nowhere.invoke(echo.once, { text: 'nobody' }).catch((e: unknown) => e)) as StatusError
     expect(err.code).toBe(Code.UNAVAILABLE)
-    expect(String(err.cause ?? err)).toMatch(/drpcNoSuchServer/)
+    expect(String(err.cause ?? err)).toMatch(/no globalThis\.drpcNoSuchServer after 30 ms/)
 
     expect(await ok.invoke(echo.once, { text: 'fine' })).toEqual({ text: 'echo:fine' })
     expect(control.counts.once).toBe(1)
     expect(Object.hasOwn(globalThis, 'drpcNoSuchServer')).toBe(false) // no accessor left behind
+  })
+
+  it('lets a dial wait longer than the start was willing to', async () => {
+    // The start's clock covers main() reaching Serve — registration, no I/O —
+    // and a second gateway that opens a database first needs more than that.
+    // Raising the one must not mean raising the other, and the start's
+    // running out must not end a dial that was told to wait longer.
+    const go = new FakeGo()
+    serving(go)
+    const admin = servingAlso(go, { after: 60 })
+    const sock = await here(go, { readyTimeoutMs: 20 })
+
+    const a = sock.dial({ entryPoint: secondEntryPoint, readyTimeoutMs: 1_000 })
+    expect(await a.invoke(echo.once, { text: 'late' })).toEqual({ text: 'echo:late' })
+    expect(admin.counts.once).toBe(1)
+  })
+
+  it('lets a dial wait forever while the start was on a clock', async () => {
+    // The <= 0 convention on the dial's own clock. A 0 is "forever", not
+    // "none given": read as absent it would land on the start's 20 ms and end
+    // this dial before the gateway it is waiting for has run.
+    const go = new FakeGo()
+    serving(go)
+    const admin = servingAlso(go, { after: 60 })
+    const sock = await here(go, { readyTimeoutMs: 20 })
+
+    const a = sock.dial({ entryPoint: secondEntryPoint, readyTimeoutMs: 0 })
+    expect(await a.invoke(echo.once, { text: 'late' })).toEqual({ text: 'echo:late' })
+    expect(admin.counts.once).toBe(1)
+  })
+
+  it("lets a dial give up sooner than the start would, even with the start's clock off", async () => {
+    // The other direction. A mistyped name is caught by nothing but this
+    // bound, and a start allowed to take forever is no reason a probe for a
+    // name that may not exist should.
+    const go = new FakeGo()
+    serving(go)
+    const sock = await here(go, { readyTimeoutMs: 0 })
+
+    const probe = sock.dial({ entryPoint: 'drpcNoSuchServer', readyTimeoutMs: 20 })
+    const err = (await probe.invoke(echo.once, { text: 'anyone' }).catch((e: unknown) => e)) as StatusError
+    expect(err.code).toBe(Code.UNAVAILABLE)
+    expect(String(err.cause ?? err)).toMatch(/after 20 ms/)
+  })
+
+  it("runs a shared wait on the first dial's clock, whatever the second asked for", async () => {
+    // Two dials to one unpublished name are one wait (above), so they have
+    // one bound, and it is the first dial's: the second joins a watch already
+    // running and is answered when it is — long before the forever it asked
+    // for in the first round, and AFTER the 20 ms it asked for in the second.
+    // The second round is what tells "the first dial's" from "the shortest";
+    // the first alone cannot, since 30 is both. A clock per dial would have
+    // to keep the accessor up for whichever waits longest and take it down
+    // when the last gives up, which this case does not earn; the rule is
+    // stated on DialOptions instead.
+    const go = new FakeGo()
+    serving(go)
+    const sock = await here(go)
+
+    const round = async (firstMs: number, secondMs: number) => {
+      const conns = [firstMs, secondMs].map((readyTimeoutMs) => sock.dial({ entryPoint: 'drpcNoSuchServer', readyTimeoutMs }))
+      // Both calls in flight BEFORE the clock runs out: the cause reaches the
+      // calls a connection is carrying when it ends, not one opened after.
+      const calls = conns.map((conn) => conn.invoke(echo.once, { text: 'anyone' }).catch((e: unknown) => e))
+      for (const err of (await Promise.all(calls)) as StatusError[]) {
+        expect(err.code).toBe(Code.UNAVAILABLE)
+        expect(String(err.cause ?? err)).toMatch(new RegExp(`after ${firstMs} ms`))
+      }
+      expect(Object.hasOwn(globalThis, 'drpcNoSuchServer')).toBe(false)
+    }
+    await round(30, 0)
+    // A settled wait is dropped, so the same name is waited for again — on
+    // the new first dial's clock, not the old one's and not the shorter one.
+    await round(60, 20)
   })
 
   it('ends a waiting connection when the instance dies under it', async () => {
@@ -728,8 +804,8 @@ describe('one instance, many servers', () => {
     // a port; a mistyped entryPoint has to report instead.
     const go = new FakeGo()
     serving(go)
-    const sock = await here(go, { readyTimeoutMs: 20 })
-    const conn = sock.dial({ entryPoint: 'toString' })
+    const sock = await here(go)
+    const conn = sock.dial({ entryPoint: 'toString', readyTimeoutMs: 20 })
     const err = (await conn.invoke(echo.once, { text: 'x' }).catch((e: unknown) => e)) as StatusError
     expect(err.code).toBe(Code.UNAVAILABLE)
     expect(String(err.cause ?? err)).toMatch(/no globalThis\.toString after 20 ms/)
@@ -738,15 +814,25 @@ describe('one instance, many servers', () => {
     expect(typeof globalThis.toString).toBe('function')
   })
 
-  it('carries the entry point to the worker, and omits it when there is none', async () => {
+  it('carries the entry point and its clock to the worker, and omits what was not given', async () => {
     // The page's half of the contract; the routing itself is the worker's, in
-    // worker.test.ts. Omitted rather than filled in with the started name:
-    // which name that is belongs to the realm holding the instance.
+    // worker.test.ts. Omitted rather than filled in with what the start used:
+    // which name and which clock those are belongs to the realm holding the
+    // instance — and an absent clock is what a worker older than the field
+    // sees anyway. Strict, because an `undefined` on the wire is not omitted
+    // — and a 0 is not absent: it is the forever the dial asked for.
     const w = new FakeWorker()
     const sock = await withWorker(w)
     sock.dial()
     sock.dial({ entryPoint: secondEntryPoint })
-    expect(w.serves).toEqual([{ drpc: 'serve' }, { drpc: 'serve', entryPoint: secondEntryPoint }])
+    sock.dial({ entryPoint: secondEntryPoint, readyTimeoutMs: 250 })
+    sock.dial({ entryPoint: secondEntryPoint, readyTimeoutMs: 0 })
+    expect(w.serves).toStrictEqual([
+      { drpc: 'serve' },
+      { drpc: 'serve', entryPoint: secondEntryPoint },
+      { drpc: 'serve', entryPoint: secondEntryPoint, readyTimeoutMs: 250 },
+      { drpc: 'serve', entryPoint: secondEntryPoint, readyTimeoutMs: 0 },
+    ])
   })
 })
 

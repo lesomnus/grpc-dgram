@@ -57,9 +57,17 @@ export interface StartMessage {
 // evaluates. Whoever can post here can already run anything here. The lookup
 // is restricted to OWN properties all the same, so a mistyped name reports
 // rather than resolving to something inherited (see entryPointNamed).
+//
+// `readyTimeoutMs` bounds the wait for a name the instance has not published
+// yet (Instance.serve), with the start's convention: <= 0 waits forever. It is
+// absent for the same reason `entryPoint` is — absent means "the one the
+// start used", and only the page knows whether the caller gave a dial a clock
+// of its own — so a worker older than this field, which ignores it, falls
+// back to exactly that.
 export interface ServeMessage {
   drpc: 'serve'
   entryPoint?: string
+  readyTimeoutMs?: number
 }
 
 // ReadyMessage says the instance published its entry point and can serve. It

@@ -75,7 +75,7 @@ each).
 
 Verified at this commit:
 
-- `pnpm test` → **510 passing** (25 files). Unit and per-adapter tests are
+- `pnpm test` → **517 passing** (25 files). Unit and per-adapter tests are
   co-located next to their source (`src/wire.test.ts`,
   `src/transport/connect/index.test.ts`, …); cross-cutting integration tests
   (e2e, timeout, restart, limits, flow, flow_peer_client, flow_peer_server,
@@ -271,7 +271,7 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
 ```
 cd ts
 pnpm install
-pnpm test     # vitest, 510 tests (the two cross-language suites need `go` on PATH)
+pnpm test     # vitest, 517 tests (the two cross-language suites need `go` on PATH)
 pnpm check    # tsc --noEmit (strict)
 pnpm build    # tsdown → dist/
 ```

@@ -227,7 +227,7 @@ calls sharing the channel.
 
 ## Tests
 
-`pnpm test` — 510 tests mirroring the Go suites: the §5 golden wire vectors
+`pnpm test` — 517 tests mirroring the Go suites: the §5 golden wire vectors
 byte-for-byte (including the v1.1 vectors generated from the Go
 implementation), e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,

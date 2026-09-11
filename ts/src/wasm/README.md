@@ -69,7 +69,7 @@ the shipped module has no `error` event to fall back on either.
 | `workerUrl` | resolved from this module's URL | where the shipped worker module lives. For bundlers, below |
 | `wasmExec` | `'/wasm_exec.js'` | where to fetch the JS half of the Go runtime, in whichever realm runs the instance. Nothing is fetched where that realm already has `globalThis.Go` |
 | `entryPoint` | `'drpcServe'` | the global the instance publishes its port-taking function as; must match the Go side's (`jsport.WithEntryPoint`) |
-| `readyTimeoutMs` | `10_000` | how long to wait for that publish, measured from instantiation; `<= 0` waits forever |
+| `readyTimeoutMs` | `10_000` | how long to wait for that publish, measured from instantiation; `<= 0` waits forever. Also what a `dial({ entryPoint })` waits for its name, unless it brings its own ([below](#two-servers-in-one-instance)) |
 | `go` | `new Go()` in the running realm | a `Go` instance you built — the way to pass argv or env. It belongs to the realm that made it, so it goes with `{ worker: false }`; `open()` refuses it otherwise rather than ignore it |
 | `maxMessageSize`, `transfer` | see [`transport/port`](../transport/port#options) | passed to the transport under every `dial()` |
 
@@ -79,7 +79,7 @@ the shipped module has no `error` event to fall back on either.
 interface WasmSock {
   readonly worker?: WasmWorker
   readonly exited: Promise<unknown>
-  dial(opts?: DialOptions): Conn   // ConnOptions & { entryPoint?: string }
+  dial(opts?: DialOptions): Conn   // ConnOptions & { entryPoint?: string; readyTimeoutMs?: number }
   close(): void
 }
 ```
@@ -150,9 +150,26 @@ So a dial to a name that is not there **yet** waits for it rather than failing.
 It stays synchronous: the transferred port queues the calls opened on it while
 the far side waits, exactly as it queues the ones opened before the instance
 was ready. A name that never arrives ends that one connection with a cause
-after `readyTimeoutMs` — the same clock the start used — while the instance and
-every other connection to it go on working. Nothing about the ordering of your
-`Serve` calls is load-bearing.
+after the dial's `readyTimeoutMs`, while the instance and every other
+connection to it go on working. Nothing about the ordering of your `Serve`
+calls is load-bearing.
+
+The bound is the dial's own because the start's was sized for something else —
+`main()` reaching `Serve`, which is registration and no I/O — and a second
+gateway is precisely the one that may do real work first. And a mistyped name
+is caught by nothing *but* this bound — §10.6 leaves no other timer to end the
+call — so it is also how a probe for a name that may not be there fails fast,
+without shortening how long `open()` waits for the program to come up. Omitted,
+it is the clock the start used; `<= 0` waits forever:
+
+```ts
+const admin = sock.dial({ entryPoint: 'drpcAdmin', readyTimeoutMs: 60_000 }) // opens a database first
+const probe = sock.dial({ entryPoint: 'drpcMaybe', readyTimeoutMs: 500 })    // fail fast if it is not there
+```
+
+Two dials in flight to one unpublished name share one wait, and it runs on the
+**first** dial's bound: the second is answered when the first is, whatever it
+asked for.
 
 A word of warning about the Go side: `Serve` refuses a name that is already
 published rather than steal it, and returns that error *without* publishing. A

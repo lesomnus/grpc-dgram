@@ -131,13 +131,14 @@ function start(scope: FakeScope, opts: Partial<StartMessage> = {}): void {
 }
 
 // dial is the page's half of a `serve`: a fresh channel, one end posted in on
-// the transfer list, a Conn over the other.
-function dial(scope: FakeScope, entryPoint?: string): Conn {
+// the transfer list, a Conn over the other. The two optional fields are posted
+// only when given, as the page does.
+function dial(scope: FakeScope, entryPoint?: string, readyTimeoutMs?: number): Conn {
   const ch = new MessageChannel()
   opened.push(ch.port1, ch.port2)
   const conn = new Conn(new PortTransport(ch.port1))
   conns.push(conn)
-  scope.post({ drpc: 'serve', ...(entryPoint === undefined ? {} : { entryPoint }) }, [ch.port2])
+  scope.post({ drpc: 'serve', ...(entryPoint === undefined ? {} : { entryPoint }), ...(readyTimeoutMs === undefined ? {} : { readyTimeoutMs }) }, [ch.port2])
   return conn
 }
 
@@ -287,10 +288,65 @@ describe('the shipped worker', () => {
   })
 
   it('says goodbye to a port whose entry point never arrives', async () => {
-    // Bounded by the start's own readyTimeoutMs. The goodbye is what makes the
-    // call FAIL rather than hang: with every protocol timer off (§10.6) it is
-    // the only thing that ever ends it.
+    // Bounded by the serve's own readyTimeoutMs — and only by that: the
+    // start's clock is OFF here, so a worker that dropped the field would
+    // hold this port forever. The goodbye is what makes the call FAIL rather
+    // than hang: with every protocol timer off (§10.6) it is the only thing
+    // that ever ends it.
     vi.stubGlobal('Go', EchoGo) // one gateway; nothing will ever publish the other
+    const scope = new FakeScope()
+    serveIn(scope)
+    start(scope, { readyTimeoutMs: 0 })
+    await scope.waitFor('ready')
+
+    const err = (await dial(scope, adminEntryPoint, 30)
+      .invoke(echo.once, { text: 'nobody' })
+      .catch((e) => e)) as StatusError
+    expect(err.code).toBe(Code.UNAVAILABLE)
+
+    // One port, not the instance: the server it does run is untouched, and the
+    // worker has nothing to report about a death that did not happen.
+    expect(await dial(scope).invoke(echo.once, { text: 'fine' })).toEqual({ text: 'echo:fine' })
+    expect(scope.sent).toEqual([{ drpc: 'ready' }])
+  })
+
+  it("waits as long as the serve says, past the start's own clock", async () => {
+    // The start's clock covers main() reaching Serve; a second gateway that
+    // does real work first needs more, and gets it without the start having
+    // to wait longer for a program that should still fail fast.
+    adminDelay = 60
+    vi.stubGlobal('Go', TwoGatewayGo)
+    const scope = new FakeScope()
+    serveIn(scope)
+    start(scope, { readyTimeoutMs: 20 })
+    await scope.waitFor('ready')
+
+    const conn = dial(scope, adminEntryPoint, 1_000)
+    expect(await conn.invoke(echo.once, { text: 'late' })).toEqual({ text: 'echo:late' })
+    expect((instances[0] as TwoGatewayGo).adminCounts.once).toBe(1)
+  })
+
+  it("waits forever for a serve that says so, past the start's own clock", async () => {
+    // The <= 0 convention on the serve's own clock (ServeMessage). A 0 on the
+    // wire is "forever", not "carries none": handed on as absent it would
+    // land on the start's 20 ms and say goodbye before the gateway has run.
+    adminDelay = 60
+    vi.stubGlobal('Go', TwoGatewayGo)
+    const scope = new FakeScope()
+    serveIn(scope)
+    start(scope, { readyTimeoutMs: 20 })
+    await scope.waitFor('ready')
+
+    const conn = dial(scope, adminEntryPoint, 0)
+    expect(await conn.invoke(echo.once, { text: 'late' })).toEqual({ text: 'echo:late' })
+    expect((instances[0] as TwoGatewayGo).adminCounts.once).toBe(1)
+  })
+
+  it("falls back to the start's clock for a serve that carries none", async () => {
+    // The version-skew half of the contract (ServeMessage): absent means "the
+    // one the start used", so a page older than the field gets what it always
+    // got.
+    vi.stubGlobal('Go', EchoGo)
     const scope = new FakeScope()
     serveIn(scope)
     start(scope, { readyTimeoutMs: 30 })
@@ -300,11 +356,6 @@ describe('the shipped worker', () => {
       .invoke(echo.once, { text: 'nobody' })
       .catch((e) => e)) as StatusError
     expect(err.code).toBe(Code.UNAVAILABLE)
-
-    // One port, not the instance: the server it does run is untouched, and the
-    // worker has nothing to report about a death that did not happen.
-    expect(await dial(scope).invoke(echo.once, { text: 'fine' })).toEqual({ text: 'echo:fine' })
-    expect(scope.sent).toEqual([{ drpc: 'ready' }])
   })
 
   it('says goodbye on every port when the instance dies, then reports it', async () => {

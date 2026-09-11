@@ -44,9 +44,10 @@
 // Only the FIRST of those names is what readiness means: open() resolves when
 // the started entry point publishes, and a program that yields to the event
 // loop between its two gateways can be reached before the second has run. So a
-// dial to a name that is not there yet WAITS for it (bounded by
-// readyTimeoutMs) instead of failing — which is what keeps the order the Go
-// program happens to publish in from deciding whether the page works.
+// dial to a name that is not there yet WAITS for it (bounded by the dial's own
+// readyTimeoutMs, the start's by default) instead of failing — which is what
+// keeps the order the Go program happens to publish in from deciding whether
+// the page works.
 
 import { Conn, type ConnOptions } from '../conn'
 import { PortTransport, type PortOptions } from '../transport/port'
@@ -94,7 +95,9 @@ export interface OpenOptions extends PortOptions {
   // DefaultEntryPoint.
   entryPoint?: string
   // How long to wait for that publish, measured from the moment the module is
-  // instantiated; <= 0 waits forever. Default DefaultReadyTimeoutMs.
+  // instantiated; <= 0 waits forever. Default DefaultReadyTimeoutMs. Also
+  // what a dial to another entry point waits, unless it brings its own
+  // (DialOptions.readyTimeoutMs).
   readyTimeoutMs?: number
   // A Go instance built by the caller — the way to pass argv or env, since
   // nothing here sets either. It belongs to the realm that made it, so it goes
@@ -103,8 +106,9 @@ export interface OpenOptions extends PortOptions {
   go?: GoLike
 }
 
-// DialOptions is a Conn's options plus the one thing that is this sock's
-// business: which of the instance's servers to reach.
+// DialOptions is a Conn's options plus the two things that are this sock's
+// business: which of the instance's servers to reach, and how long to wait
+// for it to be there.
 export interface DialOptions extends ConnOptions {
   // The entry point to dial, for a program that publishes more than one
   // (jsport.WithEntryPoint on the Go side). Omitted — the usual case — this
@@ -116,8 +120,26 @@ export interface DialOptions extends ConnOptions {
   // reach this line before the second one has run. The port queues the calls
   // opened on it meanwhile, so this stays synchronous and nothing is lost. A
   // name that never arrives ends the connection with a cause after
-  // readyTimeoutMs — the same clock the start used — rather than hanging it.
+  // readyTimeoutMs rather than hanging it.
   entryPoint?: string
+  // How long to wait for that name, when the instance has not published it
+  // yet; <= 0 waits forever. Default: the readyTimeoutMs the start used.
+  //
+  // Its own, because the start's clock was sized for something else — main()
+  // reaching Serve, which is registration and no I/O — and a second gateway
+  // is exactly the one that may open a database first. A mistyped name is
+  // caught by nothing but this bound (§10.6 — no other timer ends the call),
+  // so it is also how a probe for a name that may not be there fails fast,
+  // without shortening how long open() waits for the program to come up.
+  //
+  //   sock.dial({ entryPoint: 'drpcAdmin', readyTimeoutMs: 60_000 })
+  //   sock.dial({ entryPoint: 'drpcMaybe', readyTimeoutMs: 500 })
+  //
+  // Two dials in flight to one unpublished name share one wait, and it runs
+  // on the FIRST dial's bound: the second is answered when the first is,
+  // whatever it asked for. Meaningless without `entryPoint` — the started
+  // name never waits.
+  readyTimeoutMs?: number
 }
 
 // WasmSock is one running instance, seen from the page.
@@ -258,10 +280,11 @@ abstract class Sock implements WasmSock {
       throw new Error(`wasm: ${what}${this.dead.cause instanceof Error ? `: ${this.dead.cause.message}` : ''}`)
     }
     // Split rather than passed whole: entryPoint says which server this
-    // channel goes to, which is settled before a Conn exists and is no part of
-    // what a Conn is configured with.
-    const { entryPoint, ...connOpts } = opts
-    const tx = this.connect(entryPoint)
+    // channel goes to and readyTimeoutMs how long to wait for it, both of
+    // which are settled before a Conn exists and are no part of what a Conn
+    // is configured with.
+    const { entryPoint, readyTimeoutMs, ...connOpts } = opts
+    const tx = this.connect(entryPoint, readyTimeoutMs)
     this.txs.add(tx)
     return new Conn(tx, connOpts)
   }
@@ -280,8 +303,9 @@ abstract class Sock implements WasmSock {
   }
 
   // connect opens one more connection to the instance, through the entry point
-  // named — the one it was started on by default.
-  protected abstract connect(entryPoint: string | undefined): PortTransport
+  // named — the one it was started on by default — waiting readyTimeoutMs for
+  // it, or the start's clock when there is none.
+  protected abstract connect(entryPoint: string | undefined, readyTimeoutMs: number | undefined): PortTransport
   // stop ends the instance if this sock is what owns it.
   protected abstract stop(): void
 
@@ -408,15 +432,22 @@ class WorkerSock extends Sock {
     return this.readiness
   }
 
-  protected connect(entryPoint: string | undefined): PortTransport {
+  protected connect(entryPoint: string | undefined, readyTimeoutMs: number | undefined): PortTransport {
     // The port is transferred, never the worker itself: a MessagePort queues
     // what is posted into it until the far side binds it (see ./worker, rule
     // 1), and it is what makes a second, independent peer possible at all.
     //
-    // The field is omitted rather than filled in with the started name: which
-    // name that is belongs to the realm holding the instance, and a worker
-    // reading the two from one message could disagree with the page about it.
-    const serve: ServeMessage = entryPoint === undefined ? { drpc: 'serve' } : { drpc: 'serve', entryPoint }
+    // Both fields are omitted rather than filled in with what the start used:
+    // which name and which clock those are belongs to the realm holding the
+    // instance, and a page repeating them on every serve could disagree with
+    // the start about them across a version skew. It is also what lets a
+    // worker older than the clock field ignore it and land on the start's,
+    // which is what an absent one means.
+    const serve: ServeMessage = {
+      drpc: 'serve',
+      ...(entryPoint === undefined ? {} : { entryPoint }),
+      ...(readyTimeoutMs === undefined ? {} : { readyTimeoutMs }),
+    }
     // Nothing to await here even when the entry point is one the instance has
     // yet to publish: the worker holds the port until it can serve it, and
     // ends it with a goodbye if it never can — which reaches this connection
@@ -486,13 +517,13 @@ class HereSock extends Sock {
     void inst.exited.then((cause) => this.bury(cause))
   }
 
-  protected connect(entryPoint: string | undefined): PortTransport {
+  protected connect(entryPoint: string | undefined, readyTimeoutMs: number | undefined): PortTransport {
     // No transfer list: the instance runs in this realm, so handing it the
     // other end is a plain call — which is also what makes it the one place
     // that throws when the instance has already exited. An entry point it has
     // not published yet is the one part that cannot answer synchronously, and
     // channelTo ends this connection with the reason when it does.
-    return this.channelTo((port) => this.inst.serve(port, entryPoint))
+    return this.channelTo((port) => this.inst.serve(port, entryPoint, readyTimeoutMs))
   }
 
   protected stop(): void {

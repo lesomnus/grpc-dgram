@@ -144,11 +144,15 @@ export interface Instance {
   // that yields to the event loop (a fetch, a database opening, a sleep) lets
   // the page reach this before the second gateway has run. So a name that is
   // not there yet is WAITED for rather than refused, and the wait is bounded
-  // by the same readyTimeoutMs the start used. It rejects when that runs out,
-  // when the instance dies first, or when the name turns out to hold
-  // something that is not a function — and then the port is the caller's to
-  // say goodbye on, since nothing here speaks the wire.
-  serve(port: MessagePort, entryPoint?: string): Promise<void>
+  // by readyTimeoutMs — the start's when the caller gives none, and <= 0
+  // waits forever. Its own, because the start's clock covers main() reaching
+  // Serve and nothing slower, and a second gateway is the one that may do
+  // real work first. Two callers in flight on one name share one wait, run
+  // on the FIRST caller's bound (see entryPointNamed). It rejects when that
+  // runs out, when the instance dies first, or when the name turns out to
+  // hold something that is not a function — and then the port is the
+  // caller's to say goodbye on, since nothing here speaks the wire.
+  serve(port: MessagePort, entryPoint?: string, readyTimeoutMs?: number): Promise<void>
   // Resolves — never rejects — with the cause when the instance is gone. This
   // is the §4.5 evidence nothing else can produce, and it settles only after
   // the corpse has been defused (makeInert), so whoever holds the ports may
@@ -215,7 +219,7 @@ function live(name: string, go: GoLike, serve: ServeFn, run: Promise<void>, time
     // Deliberately not an `async` method: the one condition knowable here and
     // now — the instance is gone — is reported as a synchronous throw, the
     // way it always was, and only the wait for a name becomes a promise.
-    serve(port: MessagePort, entryPoint?: string): Promise<void> {
+    serve(port: MessagePort, entryPoint?: string, readyTimeoutMs?: number): Promise<void> {
       if (dead !== undefined) {
         throw new Error(`wasm: the instance behind globalThis.${name} has exited${dead.cause instanceof Error ? `: ${dead.cause.message}` : ''}`)
       }
@@ -226,7 +230,7 @@ function live(name: string, go: GoLike, serve: ServeFn, run: Promise<void>, time
         serve(port) // one port is one peer (§6.4)
         return Promise.resolve()
       }
-      return entryPointNamed(entryPoint, timeoutMs, exited).then((fn) => {
+      return entryPointNamed(entryPoint, readyTimeoutMs ?? timeoutMs, exited).then((fn) => {
         // Checked again on this side of the wait: the instance may have died
         // while it ran, and handing a port to a dead runtime re-enters it
         // (see makeInert) instead of serving anybody.
@@ -354,10 +358,16 @@ function claimEntryPoint(name: string, after: 'restore' | 'keep' = 'restore'): E
 
 // The dial-time waits in flight, one per name. Two dials to a name that has
 // not appeared yet are one wait: the accessor may only be installed once, and
-// both of them want the same answer. A settled wait is dropped so the next
-// dial reads the published value straight off globalThis — and so a name that
-// timed out can be waited for again, since the gateway behind it may simply
-// have been slower than one dial was willing to wait.
+// both of them want the same answer. One wait is one clock, and it is the
+// FIRST dial's: a dial joining a watch already in flight is answered when
+// that one is, and the bound it brought is not consulted. A clock per dial
+// would have to keep the accessor up for whichever dial waits longest and
+// take it down when the last one gives up, which two bounds on one
+// unpublished name — the only case that would notice — does not earn. A
+// settled wait is dropped so the next dial reads the published value straight
+// off globalThis — and so a name that timed out can be waited for again,
+// since the gateway behind it may simply have been slower than one dial was
+// willing to wait.
 const waits = new Map<string, Promise<ServeFn>>()
 
 // entryPointNamed resolves the function published under `name`: at once when

@@ -160,7 +160,7 @@ export function serveIn(scope: WorkerScope): void {
         // it would take a whole worker down over one connection.
         let served: Promise<void>
         try {
-          served = inst.serve(port, msg.entryPoint)
+          served = inst.serve(port, msg.entryPoint, msg.readyTimeoutMs)
         } catch {
           abandon(port)
           return
