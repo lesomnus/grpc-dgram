@@ -175,7 +175,7 @@ chaining each on the last.
   the core is untagged, those adapters cannot be consumed from outside this
   repo. Tagging a release means: tag the core, drop the replace, require the
   real version, and re-tag the adapters.
-- **TypeScript packaging** — done (`@lesomnus/grpc-dgram` 0.0.1, Apache-2.0,
+- **TypeScript packaging** — done (`@lesomnus/grpc-dgram` 0.1.0, Apache-2.0,
   `publishConfig.access: public`). Still open: the versioning relationship to
   the Go modules (they share a wire text, not a release cadence).
 - **Wire freeze.** PROTOCOL.md is unversioned and untagged: no independent

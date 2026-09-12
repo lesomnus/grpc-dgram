@@ -1,7 +1,7 @@
 {
   "name": "@lesomnus/grpc-dgram",
   "type": "module",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "gRPC over unreliable datagram channels \u2014 TypeScript port of gRPC-dgram (the dRPC wire protocol, docs/PROTOCOL.md)",
   "license": "Apache-2.0",
   "author": "lesomnus",
@@ -42,7 +42,8 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsdown",

@@ -3,7 +3,7 @@
 > **Status: pre-release, and unversioned on purpose.** Nothing has been
 > tagged — no Go module tag, no version on the wire (§10.6) — and no
 > implementation exists outside this repository; the TypeScript package on
-> npm (`@lesomnus/grpc-dgram` 0.0.1) is a cut of this same text at one date,
+> npm (`@lesomnus/grpc-dgram` 0.1.0) is a cut of this same text at one date,
 > not a protocol version. So this text has no number: its rounds are dated
 > below, which says when the text changed and nothing more. The wire format
 > — frame fields,

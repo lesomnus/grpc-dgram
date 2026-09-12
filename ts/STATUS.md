@@ -273,7 +273,7 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
    page over `transport/port` — both import `dist/` through an import map, so
    `pnpm build` is their prerequisite (`../examples/` also has a UDP sensor
    stream and a WebSocket echo).
-4. ~~**Packaging**~~ — **done**: `@lesomnus/grpc-dgram` **0.0.1**, Apache-2.0,
+4. ~~**Packaging**~~ — **done**: `@lesomnus/grpc-dgram` **0.1.0** (0.0.1, the first cut, is deprecated — it speaks the wire before the 2026-09-12 rounds), Apache-2.0,
    `publishConfig.access: public`, `private` gone. `files` stays `["dist"]` —
    tsdown emits no source maps, so there is nothing for `src` to be shipped
    *for*. Verified the way a consumer meets it rather than the way a test does:
