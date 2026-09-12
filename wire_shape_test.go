@@ -163,7 +163,8 @@ func TestWireShape_EnvelopeInOrderProcessing(t *testing.T) {
 // golden vector for cross-implementation agreement (TS port).
 // Frame{epoch:0x01020304 sid:5 seq:6 flags:OPEN|CLOSE method:"/a.B/C"
 // codec:"json" timeout:1.5s payload:[0xAA] code:0(present) desc:"d"
-// peer_epoch:0x0A0B0C0D} — header/trailer absent to keep the vector stable.
+// peer_epoch:0x0A0B0C0D} — header/trailer absent here; the metadata vectors
+// are pinned in metadata_internal_test.go.
 // Layout (§5): 0d=epoch(1,fixed32) 15=sid(2,fixed32) 1d=seq(3,fixed32)
 // 20=flags(4,varint) 2a=method(5,len) 3a=codec(7,len) 42=timeout(8,msg)
 // 4a=payload(9,len) 50=code(10,varint,explicit) 5a=desc(11,len)

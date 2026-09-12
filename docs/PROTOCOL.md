@@ -641,8 +641,8 @@ message Frame {
 message Envelope { repeated Frame frames = 1; }
 
 message Metadata {                      // §11
-  message Entry { repeated bytes values = 1; }
-  map<string, Entry> entries = 1;
+  message Entry { string key = 1; repeated bytes values = 2; }  // key: explicit presence
+  repeated Entry entries = 1;           // ordered; ascending key on send
 }
 ```
 
@@ -686,10 +686,17 @@ Notes:
   00` for `header`) is what an explicit `SendHeader` with no metadata emits,
   and is distinct from an absent field (§7, §11); an `Entry` with **no**
   values is distinct from an absent key; and a **zero-length value** is a
-  present value.
-- Map entry order is **not** significant and MUST NOT be relied on: proto map
-  serialization is unordered. Implementations that need reproducible bytes
-  (golden vectors) marshal deterministically.
+  present value. `Entry.key` has explicit presence — `metadata.proto` carries
+  no file-wide `IMPLICIT` option — so a key is always emitted, even `""`,
+  which §11 forbids a sender to produce and a receiver merely tolerates.
+- `entries` is a repeated message, not a map, so its order is defined. A
+  sender MUST emit entries in ascending key order (bytewise), and a key MUST
+  NOT repeat within one message; a receiver that meets a repeated key MUST
+  merge its values onto the earlier entry, in wire order (gRPC metadata is a
+  multimap). This is what makes the same metadata marshal to the same bytes
+  on every implementation — the golden vectors compare them — and what makes
+  the byte-identical retransmission of §10.3 literally true for a frame that
+  carries metadata.
 - The next free field number is 18.
 
 ## 6. Identity
@@ -1399,6 +1406,12 @@ path, where its write deadline would otherwise have been the backstop.
   violation locally, with `INTERNAL`, naming the key — never by failing an
   encode deep inside an adapter. Credential-produced metadata (§15) goes
   through the same gate.
+- **Ordering.** `entries` is an ordered list (§5): a sender emits keys in
+  ascending bytewise order and never repeats one, and a receiver merges the
+  values of a repeated key onto the earlier entry, in wire order. Order
+  carries no meaning — metadata is a multimap keyed by name — it exists so
+  that equal metadata is equal bytes, on every implementation and on every
+  retransmission (§10.3).
 - **Receiving non-conforming metadata.** A receiver MUST NOT fail the call or
   crash on a value its binding cannot represent — a hostile peer must not be
   able to break a call by sending one. It surfaces whatever its language

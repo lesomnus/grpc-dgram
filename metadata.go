@@ -3,11 +3,13 @@ package drpc
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // Metadata values travel as raw bytes (PROTOCOL.md §11): gRPC's binary
@@ -20,26 +22,42 @@ import (
 
 func (x *Metadata) MD() metadata.MD {
 	v := metadata.MD{}
-	for k, e := range x.GetEntries() {
+	// Entries are ordered. A sender never repeats a key (§11), but a receiver
+	// merges one that does: each repeat appends, in wire order, so the
+	// multimap that gRPC metadata is comes through whole.
+	for _, e := range x.GetEntries() {
 		bs := e.GetValues()
 		ss := make([]string, len(bs))
 		for i, b := range bs {
 			ss[i] = string(b)
 		}
-		v[k] = ss
+		if prev, ok := v[e.GetKey()]; ok {
+			v[e.GetKey()] = append(prev, ss...)
+		} else {
+			v[e.GetKey()] = ss // an empty, non-nil slice for a key with no values
+		}
 	}
 
 	return v
 }
 
 func newMd(md metadata.MD) *Metadata {
-	es := map[string]*Metadata_Entry{}
-	for k, v := range md {
+	// Ascending key order, so the same metadata marshals to the same bytes on
+	// every implementation and every retransmission (§10.3, §11) — a Go map
+	// would hand them out in a different order each time.
+	keys := make([]string, 0, len(md))
+	for k := range md {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	es := make([]*Metadata_Entry, 0, len(keys))
+	for _, k := range keys {
+		v := md[k]
 		bs := make([][]byte, len(v))
 		for i, s := range v {
 			bs[i] = []byte(s)
 		}
-		es[k] = Metadata_Entry_builder{Values: bs}.Build()
+		es = append(es, Metadata_Entry_builder{Key: proto.String(k), Values: bs}.Build())
 	}
 
 	return Metadata_builder{Entries: es}.Build()

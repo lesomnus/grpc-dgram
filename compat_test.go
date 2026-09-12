@@ -941,7 +941,13 @@ func TestCompat_BinaryMetadata(t *testing.T) {
 
 	// ...and they were raw bytes on the wire: no base64, no UTF-8 coercion.
 	open := cpOpen(t, cpTxFrames(client))
-	x.Equal(t, [][]byte{[]byte(raw), {}}, open.GetHeader().GetEntries()["trace-bin"].GetValues())
+	var traceBin [][]byte
+	for _, e := range open.GetHeader().GetEntries() { // ordered entries, keyed by e.Key (§11)
+		if e.GetKey() == "trace-bin" {
+			traceBin = e.GetValues()
+		}
+	}
+	x.Equal(t, [][]byte{[]byte(raw), {}}, traceBin)
 
 	// s -> c: the echo handler mirrors the MD into header and trailer, so the
 	// octets survive the return trip too (§11).

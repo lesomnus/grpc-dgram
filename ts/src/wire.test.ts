@@ -122,14 +122,15 @@ describe('golden bytes (§5)', () => {
 // ---------------------------------------------------------------------------
 // wire v1.1 — the fields and metadata encoding added on top of v1.0. Every
 // vector below was produced by google.golang.org/protobuf marshaling the same
-// message against the Go core (deterministic mode, which sorts map keys the
-// way this codec does), so the two implementations are pinned byte-for-byte.
+// message against the Go core (which emits metadata entries in ascending key
+// order, as this codec does), so the two implementations are pinned byte-for-byte.
 // ---------------------------------------------------------------------------
 
 describe('golden bytes — wire v1.1 (§5)', () => {
   it('a "-bin" metadata value carries raw octets (0x00/0xff), base64 in the TS API', () => {
-    // Metadata{entries:{"x-bin": {values:[00 01 ff 80 7f]}}} on Frame{epoch:1}.
-    const want = '0d0100000062120a100a05782d62696e12070a050001ff807f'
+    // Metadata{entries:[{key:"x-bin", values:[00 01 ff 80 7f]}]} on Frame{epoch:1}:
+    // 62 10 | 0a 0e | 0a 05 "x-bin" | 12 05 00 01 ff 80 7f.
+    const want = '0d0100000062100a0e0a05782d62696e12050001ff807f'
     const f = frame({ epoch: 1 })
     f.header = { 'x-bin': ['AAH/gH8='] }
     expect(hex(encodeFrame(f))).toBe(want)
@@ -141,8 +142,9 @@ describe('golden bytes — wire v1.1 (§5)', () => {
   })
 
   it('a text metadata key is UTF-8 bytes on the wire (byte-identical to the old string field)', () => {
-    // Metadata{entries:{"x-text": {values:["hello", "wor ld"]}}}.
-    const want = '0d01000000621b0a190a06782d74657874120f0a0568656c6c6f0a06776f72206c64'
+    // Metadata{entries:[{key:"x-text", values:["hello", "wor ld"]}]}: each value
+    // is its own field-2 element on the entry, no wrapper.
+    const want = '0d0100000062190a170a06782d74657874120568656c6c6f1206776f72206c64'
     const f = frame({ epoch: 1 })
     f.header = { 'x-text': ['hello', 'wor ld'] }
     expect(hex(encodeFrame(f))).toBe(want)
@@ -159,8 +161,9 @@ describe('golden bytes — wire v1.1 (§5)', () => {
     expect(g.trailer).toBeUndefined()
   })
 
-  it('a key with no values keeps the map entry (key + empty Entry message)', () => {
-    const want = '0d0100000062090a070a03782d611200'
+  it('a key with no values keeps its entry (the key alone)', () => {
+    // 62 07 | 0a 05 | 0a 03 "x-a" — no field 2 at all, and still a present key.
+    const want = '0d0100000062070a050a03782d61'
     const f = frame({ epoch: 1 })
     f.header = { 'x-a': [] }
     expect(hex(encodeFrame(f))).toBe(want)
@@ -168,7 +171,8 @@ describe('golden bytes — wire v1.1 (§5)', () => {
   })
 
   it('a key with one empty value is distinct from a key with no values', () => {
-    const want = '0d01000000620b0a090a03782d6112020a00'
+    // ...| 12 00: one field-2 element of zero length.
+    const want = '0d0100000062090a070a03782d611200'
     const f = frame({ epoch: 1 })
     f.header = { 'x-a': [''] }
     expect(hex(encodeFrame(f))).toBe(want)
@@ -180,9 +184,9 @@ describe('golden bytes — wire v1.1 (§5)', () => {
   })
 
   it('text and binary keys mix in one Metadata, sorted by key', () => {
-    // trailer{"a-text":["v"], "z-bin":[ff 00]} — Go's deterministic marshal
-    // sorts map keys, as this codec does.
-    const want = '0d010000006a1e0a0d0a06612d7465787412030a01760a0d0a057a2d62696e12040a02ff00'
+    // trailer{"a-text":["v"], "z-bin":[ff 00]} — both sides emit entries in
+    // ascending key order (§11), so insertion order never reaches the wire.
+    const want = '0d010000006a1a0a0b0a06612d746578741201760a0b0a057a2d62696e1202ff00'
     const f = frame({ epoch: 1 })
     f.trailer = { 'z-bin': ['/wA='], 'a-text': ['v'] } // insertion order is not encode order
     expect(hex(encodeFrame(f))).toBe(want)
@@ -402,23 +406,28 @@ describe('metadata', () => {
   })
 
   it('the per-key transform runs after the entry closes (key may follow the values)', () => {
-    // A hand-built map entry with field 2 (values) BEFORE field 1 (key):
+    // A hand-built entry with field 2 (a value) BEFORE field 1 (key):
     // legal protobuf, and the only order under which a value-time transform
     // would mis-decode a "-bin" key as text.
-    const g = decodeFrame(unhex('0d01000000620f0a0d12040a0200ff0a05782d62696e'))
+    //   62 0d | 0a 0b | 12 02 00 ff | 0a 05 "x-bin"
+    const g = decodeFrame(unhex('0d01000000620d0a0b120200ff0a05782d62696e'))
     expect(g.header).toEqual({ 'x-bin': ['AP8='] })
     expect(decodeBase64(g.header!['x-bin']![0]!)).toEqual(new Uint8Array([0x00, 0xff]))
   })
 
-  it('a repeated Entry field merges its values (proto message merge)', () => {
-    // key "x-a" with two `values` submessages: ["a"] then ["b"].
-    const g = decodeFrame(unhex('0d0100000062110a0f0a03782d6112030a016112030a0162'))
+  it('a key that repeats across entries merges its values, in wire order (§11)', () => {
+    // Two entries both keyed "x-a": ["a"] then ["b"]. A sender never emits
+    // this (§11 says a key MUST NOT repeat), so it is the receiver's merge
+    // rule being pinned, not a round trip.
+    //   62 14 | 0a 08 0a 03 "x-a" 12 01 "a" | 0a 08 0a 03 "x-a" 12 01 "b"
+    const g = decodeFrame(unhex('0d0100000062140a080a03782d611201610a080a03782d61120162'))
     expect(g.header).toEqual({ 'x-a': ['a', 'b'] })
   })
 
   it('a non-UTF-8 text value decodes lossily instead of throwing', () => {
     // Metadata{"x-a": [ff]} — invalid UTF-8 for a text key.
-    const g = decodeFrame(unhex('0d01000000620c0a0a0a03782d6112030a01ff'))
+    //   62 0a | 0a 08 | 0a 03 "x-a" | 12 01 ff
+    const g = decodeFrame(unhex('0d01000000620a0a080a03782d611201ff'))
     expect(g.header!['x-a']).toEqual(['�'])
   })
 
@@ -577,5 +586,54 @@ describe('robustness', () => {
 
   it('an empty envelope decodes to no frames', () => {
     expect(decodeEnvelope(new Uint8Array(0))).toEqual([])
+  })
+})
+
+describe('metadata keys that collide with Object.prototype (§11)', () => {
+  const own = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k)
+
+  it('"constructor" decodes as an own property, and merges when repeated', () => {
+    // Two entries keyed "constructor": ["v"] then ["w"]. On a plain object
+    // md["constructor"] is Object — inherited, not undefined — which a naive
+    // merge would try to spread.
+    const g = decodeFrame(unhex('0d0100000062240a100a0b636f6e7374727563746f721201760a100a0b636f6e7374727563746f72120177'))
+    expect(own(g.header!, 'constructor')).toBe(true)
+    expect(g.header!['constructor']).toEqual(['v', 'w'])
+    expect(Object.keys(g.header!)).toEqual(['constructor'])
+  })
+
+  it('"__proto__" decodes as an own property, not as the prototype', () => {
+    const g = decodeFrame(unhex('0d0100000062100a0e0a095f5f70726f746f5f5f120176'))
+    expect(own(g.header!, '__proto__')).toBe(true)
+    expect(g.header!['__proto__']).toEqual(['v'])
+    expect(Object.getPrototypeOf(g.header!)).toBe(Object.prototype)
+    // and it round-trips through the encoder as a key, ascending with the rest
+    const h: Record<string, string[]> = {}
+    Object.defineProperty(h, '__proto__', { value: ['v'], enumerable: true, writable: true, configurable: true })
+    expect(hex(encodeFrame(frame({ epoch: 1, header: h })))).toBe('0d0100000062100a0e0a095f5f70726f746f5f5f120176')
+  })
+
+  it('a long run of one repeated key decodes in linear time', () => {
+    // 20000 entries of key "a": quadratic merging took most of a second here;
+    // appending in place takes milliseconds. No timing assertion — the guard
+    // is that this finishes at all inside the suite's per-test timeout.
+    const one = unhex('0a060a0161120176')
+    const body = new Uint8Array(one.length * 20000)
+    for (let i = 0; i < 20000; i++) body.set(one, i * one.length)
+    const varint = (n: number) => {
+      const out: number[] = []
+      while (n >= 0x80) {
+        out.push((n & 0x7f) | 0x80)
+        n >>>= 7
+      }
+      out.push(n)
+      return out
+    }
+    const head = new Uint8Array([0x0d, 1, 0, 0, 0, 0x62, ...varint(body.length)])
+    const buf = new Uint8Array(head.length + body.length)
+    buf.set(head)
+    buf.set(body, head.length)
+    const g = decodeFrame(buf)
+    expect(g.header!['a']).toHaveLength(20000)
   })
 })

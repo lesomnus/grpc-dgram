@@ -3,6 +3,7 @@ package drpc_test
 import (
 	"context"
 	"io"
+	"sort"
 	"testing"
 
 	drpc "github.com/lesomnus/grpc-dgram"
@@ -43,13 +44,19 @@ func dropEvery(match func(f *drpc.Frame) bool) func(drpc.FrameHandler) drpc.Fram
 // wireMd builds the wire Metadata message from md (test-side twin of the
 // core's newMd).
 func wireMd(md metadata.MD) *drpc.Metadata {
-	es := map[string]*drpc.Metadata_Entry{}
-	for k, v := range md {
+	keys := make([]string, 0, len(md))
+	for k := range md {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // ascending key order, as the core sends (§11)
+	es := make([]*drpc.Metadata_Entry, 0, len(keys))
+	for _, k := range keys {
+		v := md[k]
 		bs := make([][]byte, len(v))
 		for i, s := range v {
 			bs[i] = []byte(s)
 		}
-		es[k] = drpc.Metadata_Entry_builder{Values: bs}.Build()
+		es = append(es, drpc.Metadata_Entry_builder{Key: proto.String(k), Values: bs}.Build())
 	}
 	return drpc.Metadata_builder{Entries: es}.Build()
 }

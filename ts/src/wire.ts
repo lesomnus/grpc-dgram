@@ -370,21 +370,18 @@ function decodeAny(data: Uint8Array): Any {
 
 function encodeMetadata(md: Metadata): Uint8Array {
   const w = new Writer()
-  // Emit map entries sorted by key: protobuf map ordering is semantically
-  // insignificant, but a stable order makes the encoding deterministic and
-  // aligns it with Go's proto.Marshal Deterministic mode (which sorts map
-  // keys), so re-encodings are byte-comparable. Value order within an entry
-  // is preserved (it IS significant).
+  // Entries are a repeated message, not a map, and go out in ascending key
+  // order (§11): that is what makes the same metadata marshal to the same
+  // bytes on every implementation and on every retransmission (§10.3). Value
+  // order within an entry is preserved — it IS significant.
   for (const key of Object.keys(md).sort()) {
     const entry = new Writer()
-    for (const v of md[key]!) entry.bytes(1, encodeMetadataValue(key, v))
-    const kv = new Writer()
-    // Both map-entry fields are emitted unconditionally, even at their
-    // default: that is what protobuf-go's map encoder does, and an empty key
-    // or an entry with no values must produce identical bytes on both sides.
-    kv.string(1, key)
-    kv.bytes(2, entry.finish())
-    w.bytes(1, kv.finish())
+    // The key has explicit presence in the schema and Go always sets it, so
+    // it is emitted even when empty; values are repeated, so an entry with
+    // none is just its key — present, and distinct from an absent key.
+    entry.string(1, key)
+    for (const v of md[key]!) entry.bytes(2, encodeMetadataValue(key, v))
+    w.bytes(1, entry.finish())
   }
   return w.finish()
 }
@@ -395,27 +392,32 @@ function decodeMetadata(data: Uint8Array): Metadata {
   while (!r.eof) {
     const tag = r.varint32()
     if (tag >>> 3 === 1 && (tag & 7) === 2) {
-      const kv = new Reader(r.bytes())
+      const entry = new Reader(r.bytes())
       let key = ''
-      // Values are collected as raw octets first: field order inside a map
-      // entry is not guaranteed (the key may arrive AFTER the values), and
+      // Values are collected as raw octets first: field order inside a
+      // message is not guaranteed (the key may arrive AFTER the values), and
       // the per-value transform depends on the key. It therefore runs once
       // the entry has closed, never inside the loop.
       const raw: Uint8Array[] = []
-      while (!kv.eof) {
-        const t = kv.varint32()
-        if (t >>> 3 === 1 && (t & 7) === 2) key = kv.string()
-        else if (t >>> 3 === 2 && (t & 7) === 2) {
-          // A repeated `value` field merges, as proto message merging does.
-          const entry = new Reader(kv.bytes())
-          while (!entry.eof) {
-            const et = entry.varint32()
-            if (et >>> 3 === 1 && (et & 7) === 2) raw.push(entry.bytes())
-            else entry.skip(et & 7)
-          }
-        } else kv.skip(t & 7)
+      while (!entry.eof) {
+        const t = entry.varint32()
+        if (t >>> 3 === 1 && (t & 7) === 2) key = entry.string()
+        else if (t >>> 3 === 2 && (t & 7) === 2) raw.push(entry.bytes())
+        else entry.skip(t & 7)
       }
-      md[key] = raw.map((b) => decodeMetadataValue(key, b)) // map semantics: last entry wins
+      // A key that repeats appends, in wire order: gRPC metadata is a
+      // multimap and §11 says a receiver merges (never "last wins"). Own
+      // properties only, and defined rather than assigned: "constructor" and
+      // "__proto__" are legal keys (§11), and on a plain object the first is
+      // inherited and the second is a setter. Appending in place keeps a
+      // hostile run of one key linear, not quadratic.
+      const vals = raw.map((b) => decodeMetadataValue(key, b))
+      const prev = Object.prototype.hasOwnProperty.call(md, key) ? md[key] : undefined
+      if (prev === undefined) {
+        Object.defineProperty(md, key, { value: vals, enumerable: true, writable: true, configurable: true })
+      } else {
+        for (const v of vals) prev.push(v)
+      }
     } else r.skip(tag & 7)
   }
   return md

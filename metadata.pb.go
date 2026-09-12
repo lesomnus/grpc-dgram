@@ -21,9 +21,16 @@ const (
 )
 
 // Metadata carries gRPC header/trailer metadata. See PROTOCOL.md §11.
+//
+// A repeated Entry, not a map: a map's entry order is unspecified, and this
+// protocol wants two things a map cannot give it — that a retransmitted frame
+// is byte-identical (§10.3), and that two implementations produce the same
+// bytes for the same metadata (the cross-language golden vectors). Senders
+// emit entries in ascending key order; a receiver merges entries that repeat
+// a key, in order, so the multimap semantics of gRPC metadata are kept.
 type Metadata struct {
-	state              protoimpl.MessageState     `protogen:"opaque.v1"`
-	xxx_hidden_Entries map[string]*Metadata_Entry `protobuf:"bytes,1,rep,name=entries" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	state              protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_Entries *[]*Metadata_Entry     `protobuf:"bytes,1,rep,name=entries"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -53,36 +60,41 @@ func (x *Metadata) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-func (x *Metadata) GetEntries() map[string]*Metadata_Entry {
+func (x *Metadata) GetEntries() []*Metadata_Entry {
 	if x != nil {
-		return x.xxx_hidden_Entries
+		if x.xxx_hidden_Entries != nil {
+			return *x.xxx_hidden_Entries
+		}
 	}
 	return nil
 }
 
-func (x *Metadata) SetEntries(v map[string]*Metadata_Entry) {
-	x.xxx_hidden_Entries = v
+func (x *Metadata) SetEntries(v []*Metadata_Entry) {
+	x.xxx_hidden_Entries = &v
 }
 
 type Metadata_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
-	Entries map[string]*Metadata_Entry
+	Entries []*Metadata_Entry
 }
 
 func (b0 Metadata_builder) Build() *Metadata {
 	m0 := &Metadata{}
 	b, x := &b0, m0
 	_, _ = b, x
-	x.xxx_hidden_Entries = b.Entries
+	x.xxx_hidden_Entries = &b.Entries
 	return m0
 }
 
 type Metadata_Entry struct {
-	state             protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_Values [][]byte               `protobuf:"bytes,1,rep,name=values"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state                  protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_Key         *string                `protobuf:"bytes,1,opt,name=key"`
+	xxx_hidden_Values      [][]byte               `protobuf:"bytes,2,rep,name=values"`
+	XXX_raceDetectHookData protoimpl.RaceDetectHookData
+	XXX_presence           [1]uint32
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *Metadata_Entry) Reset() {
@@ -110,6 +122,16 @@ func (x *Metadata_Entry) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
+func (x *Metadata_Entry) GetKey() string {
+	if x != nil {
+		if x.xxx_hidden_Key != nil {
+			return *x.xxx_hidden_Key
+		}
+		return ""
+	}
+	return ""
+}
+
 func (x *Metadata_Entry) GetValues() [][]byte {
 	if x != nil {
 		return x.xxx_hidden_Values
@@ -117,13 +139,31 @@ func (x *Metadata_Entry) GetValues() [][]byte {
 	return nil
 }
 
+func (x *Metadata_Entry) SetKey(v string) {
+	x.xxx_hidden_Key = &v
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 0, 2)
+}
+
 func (x *Metadata_Entry) SetValues(v [][]byte) {
 	x.xxx_hidden_Values = v
+}
+
+func (x *Metadata_Entry) HasKey() bool {
+	if x == nil {
+		return false
+	}
+	return protoimpl.X.Present(&(x.XXX_presence[0]), 0)
+}
+
+func (x *Metadata_Entry) ClearKey() {
+	protoimpl.X.ClearPresent(&(x.XXX_presence[0]), 0)
+	x.xxx_hidden_Key = nil
 }
 
 type Metadata_Entry_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
+	Key *string
 	// Values are raw bytes, not text: gRPC's binary metadata ("-bin" keys)
 	// carries arbitrary octets, which a proto `string` cannot hold (proto
 	// enforces UTF-8 and marshaling fails). `bytes` and `string` share wire
@@ -135,6 +175,10 @@ func (b0 Metadata_Entry_builder) Build() *Metadata_Entry {
 	m0 := &Metadata_Entry{}
 	b, x := &b0, m0
 	_, _ = b, x
+	if b.Key != nil {
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 0, 2)
+		x.xxx_hidden_Key = b.Key
+	}
 	x.xxx_hidden_Values = b.Values
 	return m0
 }
@@ -143,29 +187,25 @@ var File_drpc_metadata_proto protoreflect.FileDescriptor
 
 const file_drpc_metadata_proto_rawDesc = "" +
 	"\n" +
-	"\x13drpc/metadata.proto\x12\x04drpc\"\xb4\x01\n" +
-	"\bMetadata\x125\n" +
-	"\aentries\x18\x01 \x03(\v2\x1b.drpc.Metadata.EntriesEntryR\aentries\x1a\x1f\n" +
-	"\x05Entry\x12\x16\n" +
-	"\x06values\x18\x01 \x03(\fR\x06values\x1aP\n" +
-	"\fEntriesEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
-	"\x05value\x18\x02 \x01(\v2\x14.drpc.Metadata.EntryR\x05value:\x028\x01B%Z#github.com/lesomnus/grpc-dgram;drpcb\beditionsp\xe8\a"
+	"\x13drpc/metadata.proto\x12\x04drpc\"m\n" +
+	"\bMetadata\x12.\n" +
+	"\aentries\x18\x01 \x03(\v2\x14.drpc.Metadata.EntryR\aentries\x1a1\n" +
+	"\x05Entry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x16\n" +
+	"\x06values\x18\x02 \x03(\fR\x06valuesB%Z#github.com/lesomnus/grpc-dgram;drpcb\beditionsp\xe8\a"
 
-var file_drpc_metadata_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_drpc_metadata_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 var file_drpc_metadata_proto_goTypes = []any{
 	(*Metadata)(nil),       // 0: drpc.Metadata
 	(*Metadata_Entry)(nil), // 1: drpc.Metadata.Entry
-	nil,                    // 2: drpc.Metadata.EntriesEntry
 }
 var file_drpc_metadata_proto_depIdxs = []int32{
-	2, // 0: drpc.Metadata.entries:type_name -> drpc.Metadata.EntriesEntry
-	1, // 1: drpc.Metadata.EntriesEntry.value:type_name -> drpc.Metadata.Entry
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	1, // 0: drpc.Metadata.entries:type_name -> drpc.Metadata.Entry
+	1, // [1:1] is the sub-list for method output_type
+	1, // [1:1] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_drpc_metadata_proto_init() }
@@ -179,7 +219,7 @@ func file_drpc_metadata_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_drpc_metadata_proto_rawDesc), len(file_drpc_metadata_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

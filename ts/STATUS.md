@@ -172,10 +172,10 @@ tests:
   reorder). Not reachable via a conforming sequential-delivery adapter, but the
   primitive stands in for a Go channel (a true FIFO), so hardened with a
   call-order chain. (`src/util.test.ts`)
-- **`wire.ts` — metadata map entry order** (minor, harmless). Emitted in JS
-  insertion order; both sides decode fine and the golden vectors omit metadata,
-  but sorting keys makes the encoding deterministic and matches Go's
-  `Deterministic` marshal, so it now sorts.
+- **`wire.ts` — metadata entry order** (minor, harmless at the time). Emitted
+  in JS insertion order; both sides decoded fine. It now sorts keys ascending —
+  since then a §11 MUST (entries are a repeated message, not a map) and pinned
+  by the metadata golden vectors both suites share.
 
 Everything else the audit attacked was verified clean: all other counter
 paths and GC, the demux→open no-await double-create window, re-entrant

@@ -37,8 +37,10 @@ ts/src/
 Two mechanisms, doing different jobs.
 
 **Golden byte vectors** pin the *encoding*. `ts/src/wire.test.ts` carries frames
-as hex, and every vector was generated from the Go implementation with
-`proto.MarshalOptions{Deterministic: true}` — including the v1.1 fields
+as hex, and every vector is pinned byte for byte against what the Go
+implementation marshals (`metadata_internal_test.go` holds the same metadata
+vectors); both sides emit metadata entries in ascending key order (§11), so no
+marshal option is needed for the bytes to agree — including the v1.1 fields
 (`window`, `compressor`, `details`) and the awkward metadata cases: a `-bin`
 value containing `00 01 ff 80 7f`, a present-but-empty `Metadata`, a key with
 no values, a key with one empty value. If either side's encoder drifts, the
