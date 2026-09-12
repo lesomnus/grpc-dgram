@@ -411,9 +411,10 @@ describe('a user-written Batcher over the node-udp gateway', () => {
   })
 })
 
-// The seam is one name on every adapter, transport and gateway alike: a
-// batching middleware written against one of them is written against all of
-// them, and a renamed or missing entry here is what would make that false.
+// The seam is one TYPE on every adapter, transport and gateway alike — each
+// class declares `implements EnvelopeSender`, so a renamed or missing entry
+// is a compile error, not a runtime surprise. This keeps the runtime half of
+// that claim too: the method is really on the prototype a subclass inherits.
 describe('the envelope-level seam', () => {
   it('is sendFrames on every exported adapter class', () => {
     const classes = [

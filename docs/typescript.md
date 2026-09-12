@@ -155,7 +155,7 @@ serializer. If you already use Connect-ES, `createDrpcTransport(conn)` keeps
 | generated stubs / `RegisterService` | `conn.invoke(desc, req)` / `server.register(desc, handler)` |
 | `TransportInfo` / `ConnAttacher` | the same seams, structural (`reliable()`, `attachConn()`) |
 | `drpc.ErrMessageTooLarge` | `MessageTooLargeError` |
-| `udp.Transport.Send(ctx, *Envelope)` — the §4.1 batching seam | `sendFrames` on every exported adapter class, mirroring that class's `handle`: `sendFrames(frames)`, or `sendFrames(frames, ctx)` where `handle` takes a context |
+| `drpc.EnvelopeHandler` (`Send(ctx, *Envelope)`) — the §4.1 batching seam | `EnvelopeSender` (`sendFrames(frames, ctx?)`), implemented by every exported adapter class; the transports that have one destination take no ctx |
 | `NewPeerContext` / `NewReliableContext` | a `FrameContext { peer, reliable, signal }` argument |
 | `WithLimits(Limits{MaxPeerWindow: n})` — the §4.2.1 connection window | `limits: { maxPeerWindow: n }` on `ConnOptions` / `ServerOptions`; same floor (`W_CONN` = 1024), same default, same `sid = 0` grants on the wire |
 | `EventPeerFlowStall` / `EventPeerFlowResume` (with the stream pair) | `'peer-flow-stall'` / `'peer-flow-resume'` — see [observability.md](./observability.md#typescript) |

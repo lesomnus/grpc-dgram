@@ -60,8 +60,8 @@ import (
 // The adapter is EMBEDDED, not held in a field. Embedding promotes
 // AttachConn, Close, Reliable and Peer, which is exactly the set drpc.NewConn
 // discovers by type assertion; a field would hide all four and the Batcher
-// would still compile and still satisfy drpc.FrameHandler. drpc.Wrap1's own
-// doc comment warns about the same hiding.
+// would still compile and still satisfy drpc.FrameHandler (PROTOCOL.md §3
+// and Appendix C put the duty normatively).
 type batcher struct {
 	*udp.Transport
 

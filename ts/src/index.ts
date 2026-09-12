@@ -73,7 +73,7 @@ export {
   W_INIT,
   type Compressor,
 } from './util'
-export { hasConnAttacher, hasTransportInfo, unpack, type ConnAttacher, type FrameContext, type FrameHandler, type TransportInfo } from './seam'
+export { hasConnAttacher, hasTransportInfo, unpack, type ConnAttacher, type EnvelopeSender, type FrameContext, type FrameHandler, type TransportInfo } from './seam'
 export { Counters, type CounterSnapshot, type ProtocolEvent, type ProtocolEventKind, type ProtocolStats } from './stats'
 export {
   decodeEnvelope,

@@ -28,7 +28,7 @@
 import type { Conn } from '../../conn'
 import type { Server } from '../../server'
 import { MessageTooLargeError } from '../../status'
-import type { FrameContext, FrameHandler } from '../../seam'
+import type { EnvelopeSender, FrameContext, FrameHandler } from '../../seam'
 import { unpack } from '../../seam'
 import { abortListener, Latch, noop, unrefTimer } from '../../util'
 import { decodeEnvelope, encodeEnvelope, type Frame } from '../../wire'
@@ -299,7 +299,7 @@ function wakeAll(waiters: (() => void)[]): void {
 // Construct it promptly after the channel exists (for a remotely-announced
 // channel, synchronously inside ondatachannel): messages that arrive before
 // the handlers are registered are lost by the stack, not buffered.
-export class DataChannelTransport {
+export class DataChannelTransport implements FrameHandler, EnvelopeSender {
   private readonly ch: Channel
   private attached = false
   private closed = false
@@ -392,7 +392,7 @@ interface GwChannel {
 // annotated per peer (FrameContext.reliable), so the server runs every peer
 // in its channel's mode; the Gateway itself deliberately does not implement
 // the TransportInfo discovery — there is no single answer to advertise.
-export class DataChannelGateway {
+export class DataChannelGateway implements FrameHandler, EnvelopeSender {
   private readonly o: DataChannelOptions
   private next = 0
   private readonly chans = new Map<DataChannelLike, GwChannel>()

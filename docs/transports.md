@@ -212,8 +212,10 @@ Four seams, in the order you will meet them.
 
 **1. Send — `FrameHandler`.** The core hands you frames; you put them on the
 wire. The wire unit is one marshaled `Envelope` per transport message, so the
-usual shape is `drpc.Wrap1` plus your own `EnvelopeHandler`, or a single type
-that does both:
+shape is one type that does both — `Send` puts an envelope on the wire and
+`Handle` wraps one frame and calls it. That `Send` is `drpc.EnvelopeHandler`,
+the seam a batching middleware calls with the frames it packed, so keep it
+exported:
 
 ```go
 func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
@@ -227,9 +229,9 @@ Refuse an oversize message **synchronously**, wrapping `drpc.ErrMessageTooLarge`
 — that sentinel is how the core knows to fail the owning call with
 `ResourceExhausted` instead of treating the error as fatal.
 
-Note that `Wrap1` returns a bare `FrameHandler` and re-exposes nothing: a
-transport wrapped in it loses `TransportInfo` discovery. Implement both on one
-type, or annotate per peer.
+Do not put `Send` on one type and `Handle` on a wrapper around it: a bare
+`FrameHandler` re-exposes nothing, and a transport wrapped that way loses
+`TransportInfo` discovery. Implement both on one type, or annotate per peer.
 
 **2. Receive — `Conn.Handle` / `Server.Handle`.** Unmarshal one `Envelope`, then
 deliver its frames **in order** (`drpc.Unpack` does this), with the peer

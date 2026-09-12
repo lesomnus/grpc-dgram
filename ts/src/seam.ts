@@ -39,6 +39,18 @@ export interface FrameHandler {
 // Explicit options always override discovery (PROTOCOL.md §4.3). Reliability
 // is the only capability the core needs — message size is deliberately the
 // adapter's concern (§4.4).
+// EnvelopeSender is the adapter-facing half of the seam: one envelope of 1..n
+// frames per transport message (PROTOCOL.md §3, §4.1). Every exported adapter
+// class implements it as sendFrames, and its handle is the one-frame default
+// — sendFrames with the frame it was handed. A batching middleware subclasses
+// the adapter, overrides handle, and calls sendFrames with what it packed;
+// ctx is optional here so the single-destination transports, whose sendFrames
+// takes no context, satisfy the same type as the gateways, for which the ctx
+// IS the destination (§4.1: one destination per envelope).
+export interface EnvelopeSender {
+  sendFrames(frames: readonly Frame[], ctx?: FrameContext): Promise<void>
+}
+
 export interface TransportInfo {
   reliable(): boolean
 }

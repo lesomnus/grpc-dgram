@@ -54,7 +54,7 @@
 
 import { Conn, type ConnOptions } from '../../conn'
 import type { Server } from '../../server'
-import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '../../seam'
+import type { ConnAttacher, EnvelopeSender, FrameContext, FrameHandler, TransportInfo } from '../../seam'
 import { unpack } from '../../seam'
 import { Code, MessageTooLargeError, StatusError } from '../../status'
 import { abortListener, Latch, noop } from '../../util'
@@ -380,7 +380,7 @@ function causeDetail(err: unknown): string {
 // Construct it promptly after the port exists — on the same tick as the
 // MessageChannel or the Worker — so no early message is lost: a Worker drops
 // messages that arrive before a listener is registered.
-export class PortTransport implements FrameHandler, TransportInfo, ConnAttacher {
+export class PortTransport implements FrameHandler, TransportInfo, ConnAttacher, EnvelopeSender {
   private readonly pt: Port
   private attached = false
 
@@ -542,7 +542,7 @@ interface GwPort {
 //
 // The peer key is a fresh opaque counter per port, never reused: one port is
 // one peer (PROTOCOL.md §6.4).
-export class PortGateway implements FrameHandler, TransportInfo {
+export class PortGateway implements FrameHandler, TransportInfo, EnvelopeSender {
   private readonly o: PortOptions
   private next = 0
   private readonly ports = new Map<PortLike, GwPort>()

@@ -92,7 +92,7 @@ func newRestartPipe(t *testing.T) *restartPipe {
 }
 
 func (p *restartPipe) newServer() *drpc.Server {
-	tx := drpc.Wrap1(drpc.EnvelopeHandlerFunc(func(_ context.Context, e *drpc.Envelope) error {
+	tx := wrap1(drpc.EnvelopeHandlerFunc(func(_ context.Context, e *drpc.Envelope) error {
 		if p.s2cDead.Load() {
 			return nil
 		}
@@ -112,7 +112,7 @@ func (p *restartPipe) newServer() *drpc.Server {
 // client process dying: its tx goes dark, but nothing is cleaned up.
 func (p *restartPipe) newConn() (client echo.EchoServiceClient, dead *atomic.Bool) {
 	dead = &atomic.Bool{}
-	tx := drpc.Wrap1(drpc.EnvelopeHandlerFunc(func(_ context.Context, e *drpc.Envelope) error {
+	tx := wrap1(drpc.EnvelopeHandlerFunc(func(_ context.Context, e *drpc.Envelope) error {
 		if dead.Load() {
 			return nil
 		}

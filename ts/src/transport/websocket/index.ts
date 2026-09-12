@@ -39,7 +39,7 @@
 
 import { Conn, type ConnOptions } from '../../conn'
 import type { Server } from '../../server'
-import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '../../seam'
+import type { ConnAttacher, EnvelopeSender, FrameContext, FrameHandler, TransportInfo } from '../../seam'
 import { unpack } from '../../seam'
 import { Code, MessageTooLargeError, StatusError } from '../../status'
 import { abortListener, Latch, noop, unrefTimer } from '../../util'
@@ -437,7 +437,7 @@ function poll(): Promise<void> {
 // Construct it promptly after the socket exists — ideally on the same tick as
 // `new WebSocket(url)` — so no early message is lost: the stack drops
 // messages that arrive before a listener is registered.
-export class WebSocketTransport implements FrameHandler, TransportInfo, ConnAttacher {
+export class WebSocketTransport implements FrameHandler, TransportInfo, ConnAttacher, EnvelopeSender {
   private readonly sock: Socket
   private attached = false
   private closed = false
@@ -524,7 +524,7 @@ interface GwSocket {
 // The peer key is a fresh opaque counter per socket, deliberately not the
 // remote address: addresses collide behind proxies, and one connection is one
 // peer (PROTOCOL.md §6.4).
-export class WebSocketGateway implements FrameHandler, TransportInfo {
+export class WebSocketGateway implements FrameHandler, TransportInfo, EnvelopeSender {
   private readonly o: WebSocketOptions
   private next = 0
   private readonly socks = new Map<WebSocketLike, GwSocket>()

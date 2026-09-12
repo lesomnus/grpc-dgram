@@ -19,7 +19,7 @@ import { createSocket, type RemoteInfo, type Socket } from 'node:dgram'
 import { Conn, type ConnOptions } from '../../conn'
 import { MessageTooLargeError } from '../../status'
 import type { Server } from '../../server'
-import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '../../seam'
+import type { ConnAttacher, EnvelopeSender, FrameContext, FrameHandler, TransportInfo } from '../../seam'
 import { unpack } from '../../seam'
 import { decodeEnvelope, encodeEnvelope, type Frame } from '../../wire'
 
@@ -54,7 +54,7 @@ function sendDatagram(socket: Socket, data: Uint8Array, target?: { port: number;
 // ConnAttacher directly. The Conn attaches it and the receive pump starts by
 // itself; conn.close() (or close() here) tears everything down, socket
 // included.
-export class UdpTransport implements FrameHandler, TransportInfo, ConnAttacher {
+export class UdpTransport implements FrameHandler, TransportInfo, ConnAttacher, EnvelopeSender {
   private readonly max: number
   private conn: Conn | undefined
   private closed = false
@@ -151,7 +151,7 @@ function peerKey(rinfo: RemoteInfo): string {
 // UdpGateway is the server-side endpoint: one unconnected UDP socket serving
 // many peers, the source address:port as the peer key. It is the tx handler
 // for the Server constructor.
-export class UdpGateway implements FrameHandler {
+export class UdpGateway implements FrameHandler, EnvelopeSender {
   private readonly max: number
   private readonly peers = new Map<string, { port: number; address: string }>()
   private server: Server | undefined

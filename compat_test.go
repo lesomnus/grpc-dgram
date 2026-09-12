@@ -205,7 +205,7 @@ func TestCompat_MaxRecvMsgSize(t *testing.T) {
 	t.Run("gRPC's 4 MiB default", func(t *testing.T) {
 		// Reliable mode on both ends, as czPipe does: the cap is the same
 		// check in either mode (recvInto), but the pipe defaults to unreliable
-		// (Wrap1 hides TransportInfo), and that wraps this one 4 MiB unary in
+		// (the test wrap1 hides TransportInfo), and that wraps this one 4 MiB unary in
 		// every protocol timer there is — T_call (5 s) on the call, then T_live
 		// (15 s) once a starved server stops answering probes. Under -race on
 		// a loaded machine the race-instrumented copies of 4 MiB alone can

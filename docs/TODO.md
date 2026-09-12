@@ -36,9 +36,8 @@ normatively (§3, §4.1).
 
 **The seam is complete and exported in both languages.** In Go, `frame.go` has both handler types
 — `FrameHandler` (core-facing, one frame) and `EnvelopeHandler` (adapter-facing,
-one envelope of 1..n frames) — plus `Wrap1`, the no-batching default, which the
-adapters implement directly rather than install (it re-exposes nothing,
-`frame.go`), and `Unpack` for the receive side. Every shipped adapter exports
+one envelope of 1..n frames), which every adapter satisfies with its exported
+`Send`, and `Unpack` for the receive side. Every shipped adapter exports
 an envelope-level send (`udp.Transport.Send(ctx, *drpc.Envelope)`, and the same
 shape in the others). A batcher is a
 `FrameHandler` that buffers frames and calls that `Send` with what it packed;
@@ -55,9 +54,7 @@ normatively in §4.1, §4.4 and Appendix C rather than left to taste:
   `Reliable` and `Peer` through the batcher; a
   field-wrapper hides all four, and the worst of those failures is silent —
   without `AttachConn` the receive pump never starts and the endpoint receives
-  nothing, with no error. (`Wrap1`'s own doc comment says the same of the
-  wrapper it returns — it "re-exposes nothing"; §3 and Appendix C put the duty
-  normatively.)
+  nothing, with no error (§3 and Appendix C put the duty normatively).
 - **One destination per envelope.** A datagram is addressed by the `ctx` of the
   call that flushes it, not by anything in its frames — `udp.Gateway.Send`
   reads the peer out of `ctx` (§6.4), and the server hands one tx a different

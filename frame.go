@@ -58,31 +58,20 @@ func (f FrameHandlerFunc) Handle(ctx context.Context, frame *Frame) error {
 }
 
 // EnvelopeHandler is the adapter-facing seam: the wire unit is always one
-// Envelope holding 1..n frames. See PROTOCOL.md §3, §4.1.
+// Envelope holding 1..n frames (PROTOCOL.md §3, §4.1). Every shipped adapter
+// satisfies it with its exported Send, which is also what a batching
+// middleware calls with the frames it packed — the adapter's own Handle is
+// the one-frame default, Send with what Handle wrapped. The method is named
+// Send rather than Handle because the same type already has Handle(ctx,
+// *Frame) for FrameHandler, and the two must not collide.
 type EnvelopeHandler interface {
-	Handle(ctx context.Context, e *Envelope) error
+	Send(ctx context.Context, e *Envelope) error
 }
 
 type EnvelopeHandlerFunc func(ctx context.Context, e *Envelope) error
 
-func (f EnvelopeHandlerFunc) Handle(ctx context.Context, e *Envelope) error {
+func (f EnvelopeHandlerFunc) Send(ctx context.Context, e *Envelope) error {
 	return f(ctx, e)
-}
-
-// Wrap1 adapts an EnvelopeHandler to a FrameHandler by wrapping each frame in
-// a single-frame envelope (the no-batching default).
-//
-// The returned handler re-exposes nothing: if h also implements
-// TransportInfo, the wrapper hides it from NewConn/NewServer discovery
-// (PROTOCOL.md §3). Single-mode adapters should implement FrameHandler and
-// TransportInfo on one type instead, mixed-mode gateways annotate per peer
-// (NewReliableContext), or pass WithReliable explicitly.
-func Wrap1(h EnvelopeHandler) FrameHandler {
-	return FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
-		e := &Envelope{}
-		e.SetFrames([]*Frame{f})
-		return h.Handle(ctx, e)
-	})
 }
 
 // Unpack delivers each frame of e to h in order (PROTOCOL.md §4.1).

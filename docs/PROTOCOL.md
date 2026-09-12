@@ -88,7 +88,7 @@ Non-goals:
 ## 3. Architecture
 
 ```
-generated stubs ──> drpc.Conn ──(FrameHandler)──> [Wrap1 | batching middleware] ──(EnvelopeHandler)──> adapter ──> channel
+generated stubs ──> drpc.Conn ──(FrameHandler)──> [one-frame default | batching middleware] ──(EnvelopeHandler)──> adapter ──> channel
 generated impls <── drpc.Server <──(Handle per frame)── adapter (unpacks Envelope) <── channel
 ```
 
@@ -101,9 +101,10 @@ type FrameHandler   interface { Handle(ctx context.Context, f *Frame) error }
 type EnvelopeHandler interface { Handle(ctx context.Context, e *Envelope) error }
 ```
 
-- tx path: the core writes frames to a `FrameHandler`. `drpc.Wrap1(a)` adapts an
-  `EnvelopeHandler` by wrapping each frame in a 1-frame envelope — the
-  no-batching default. This is a **seam, not a component**: batching policy is
+- tx path: the core writes frames to a `FrameHandler`. An adapter takes
+  envelopes through `Send(ctx, *Envelope)` — `drpc.EnvelopeHandler` names
+  that — and its own `Handle` wraps each frame in a 1-frame envelope and calls
+  it: the no-batching default. This is a **seam, not a component**: batching policy is
   workload-specific (§4.1), so this document defines no batcher and an
   implementation need not ship one. An application that wants batching
   installs its own `FrameHandler` here; the duties below bind whatever it
@@ -111,9 +112,9 @@ type EnvelopeHandler interface { Handle(ctx context.Context, e *Envelope) error 
 - rx path: the adapter reads a transport message, unmarshals **one `Envelope`**,
   and calls `Conn.Handle`/`Server.Handle` once per contained frame, in order,
   attaching the peer to `ctx` (§6.4).
-- Middleware note: wrapping hides interfaces obtained by type assertion, and
-  `Wrap1` returns a bare `FrameHandler` that re-exposes **nothing** — an
-  adapter wrapped by it loses `Reliable()` discovery. Single-mode adapter
+- Middleware note: wrapping hides interfaces obtained by type assertion — a
+  bare `FrameHandler` around an adapter re-exposes **nothing**, and the
+  adapter loses `Reliable()` discovery. Single-mode adapter
   endpoints therefore implement `FrameHandler` + `TransportInfo` directly on
   one type; a mixed-mode gateway (pion) skips `TransportInfo` and advertises
   per peer via `NewReliableContext` instead (§4.3). A batching middleware
@@ -185,7 +186,7 @@ type EnvelopeHandler interface { Handle(ctx context.Context, e *Envelope) error 
     a blocking adapter cannot wedge `Handle` for everyone — while a single
     flushing goroutine buys it without blocking the next `Handle`.
 - With no batching middleware installed every envelope carries one frame
-  (`Wrap1`, or an adapter's equivalent). That is always conformant: batching
+  (each adapter's own `Handle` does that wrap). That is always conformant: batching
   is an optimization the sender chooses, never something a peer can require.
 - The transport MUST preserve message boundaries and integrity (DTLS/SCTP/WSS
   qualify; raw UDP relies on the weak UDP checksum — users accept that risk).
@@ -1820,7 +1821,6 @@ Appendix B mirrors the body; where they disagree, the body governs.
   (e.g. `udp.Transport.Send`) is what the override calls with the packed
   envelope. A field-wrapper hides all four, and the worst of those failures is
   silent: without `AttachConn` the receive pump never starts and the endpoint
-  hears nothing, with no error anywhere — which is what `Wrap1`'s own doc
-  comment warns about.
+  hears nothing, with no error anywhere.
 - **Eager OPEN** is emitted by the innermost streamer after interceptors run
   (§8), so interceptor-added metadata reaches the OPEN frame.

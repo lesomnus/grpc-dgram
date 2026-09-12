@@ -28,7 +28,7 @@
 // authentication either; that stays with the application.
 
 import { Conn, type ConnOptions } from '../../conn'
-import type { ConnAttacher, FrameHandler, TransportInfo } from '../../seam'
+import type { ConnAttacher, EnvelopeSender, FrameHandler, TransportInfo } from '../../seam'
 import { unpack } from '../../seam'
 import { Code, MessageTooLargeError, StatusError } from '../../status'
 import { Latch, noop } from '../../util'
@@ -143,7 +143,7 @@ function bytesOf(v: unknown): Uint8Array | undefined {
 // Nothing is lost by wrapping late: the platform queues inbound datagrams in
 // the readable until someone reads (bounded by incomingHighWaterMark, then
 // dropped as any datagram may be).
-export class WebTransportDatagramTransport implements FrameHandler, TransportInfo, ConnAttacher {
+export class WebTransportDatagramTransport implements FrameHandler, TransportInfo, ConnAttacher, EnvelopeSender {
   private readonly wt: WebTransportLike
   private readonly max: number | undefined // explicit ceiling; undefined follows the session
   private readonly writer: WritableStreamDefaultWriter<Uint8Array> | undefined // undefined: the sink refused, the session already dead

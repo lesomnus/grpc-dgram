@@ -231,8 +231,9 @@ drpc half of the observability surface,
 
 Batching is the application's policy in both languages and neither ships a
 batcher (`docs/TODO.md` §1); both ship the seam to write one against. Here it
-is `sendFrames`, public on every exported adapter class, with `handle`
-delegating to it so an override reaches the same code the core would. It
+is `EnvelopeSender`, implemented by every exported adapter class as
+`sendFrames`, with `handle` delegating to it so an override reaches the same
+code the core would. It
 mirrors that class's own `handle`: `sendFrames(frames)` where `handle` takes
 a frame alone, `sendFrames(frames, ctx)` where `handle` takes a
 `FrameContext` — on the gateways the ctx *is* the address, so a batch may

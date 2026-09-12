@@ -46,7 +46,7 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 	cb := make(chan []byte, 256) // client -> server
 
 	wire := func(ch chan []byte) drpc.FrameHandler {
-		return drpc.Wrap1(drpc.EnvelopeHandlerFunc(func(_ context.Context, e *drpc.Envelope) error {
+		return wrap1(drpc.EnvelopeHandlerFunc(func(_ context.Context, e *drpc.Envelope) error {
 			data, err := proto.Marshal(e)
 			if err != nil {
 				return err
