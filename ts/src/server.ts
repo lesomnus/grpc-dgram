@@ -112,7 +112,7 @@ export interface ServerOptions {
   maxSendMsgSize?: number
   // Interceptor chains (interceptor.ts). Element 0 runs outermost; the last
   // element is handed the registered handler — grpc-go's order
-  // (ChainUnaryInterceptors / ChainStreamInterceptors). One stream chain
+  // (ChainUnaryInterceptor / ChainStreamInterceptor). One stream chain
   // serves all three streaming shapes; ctx.desc tells them apart.
   unaryInterceptors?: UnaryServerInterceptor[]
   streamInterceptors?: StreamServerInterceptor[]

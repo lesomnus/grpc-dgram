@@ -992,7 +992,7 @@ func UnaryInterceptor(i grpc.UnaryServerInterceptor) ServerOption {
 	})
 }
 
-func ChainUnaryInterceptors(is ...grpc.UnaryServerInterceptor) ServerOption {
+func ChainUnaryInterceptor(is ...grpc.UnaryServerInterceptor) ServerOption {
 	return serverOptionFunc(func(o *serverOption) {
 		o.unary_ints = append(o.unary_ints, is...)
 	})
@@ -1022,7 +1022,7 @@ func StreamInterceptor(i grpc.StreamServerInterceptor) ServerOption {
 	})
 }
 
-func ChainStreamInterceptors(is ...grpc.StreamServerInterceptor) ServerOption {
+func ChainStreamInterceptor(is ...grpc.StreamServerInterceptor) ServerOption {
 	return serverOptionFunc(func(o *serverOption) {
 		o.stream_ints = append(o.stream_ints, is...)
 	})

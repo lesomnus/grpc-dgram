@@ -279,7 +279,7 @@ Unary and stream, client and server, single and chained — all present, with
 grpc-go's signatures and ordering:
 
 ```go
-srv := drpc.NewServer(tx, drpc.ChainUnaryInterceptors(
+srv := drpc.NewServer(tx, drpc.ChainUnaryInterceptor(
     func(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
         p, _ := peer.FromContext(ctx)
         log.Printf("%s from %s", info.FullMethod, p.Addr)

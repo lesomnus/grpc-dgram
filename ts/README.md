@@ -222,7 +222,7 @@ else maps to `UNKNOWN`).
 | `WithProtocolStats(obs)` (repeatable) | `protocolStats: obs` or `protocolStats: [obs, …]` on `ConnOptions` / `ServerOptions`; `Counters.observe` is the ready-made observer |
 | `ProtocolEventKind` (`EventSkipped` … `EventFlowStall`, `EventFlowResume`, `EventPeerFlowStall`, `EventPeerFlowResume`) | `ProtocolEventKind`, the strings Go's `String()` fixes (`'skipped'` … `'flow-stall'`, `'flow-resume'`, `'peer-flow-stall'`, `'peer-flow-resume'`); `Counters` keeps `flowStall` / `flowResume` and `peerFlowStall` / `peerFlowResume` apart, as Go does |
 | `WithLimits(Limits{MaxPeerWindow: n})` (the §4.2.1 connection window) | `limits: { maxPeerWindow: n }` on `ConnOptions` / `ServerOptions`, floored at `W_CONN` (1024, exported beside `W_INIT`) for the reason `W_init` floors the rx buffer, and capped at 2³² − 1 — the wire's uint32 — so `Infinity` means that much, not off |
-| `WithChainUnaryInterceptor(…)` / `ChainUnaryInterceptors(…)` and the stream twins | `unaryInterceptors: […]` / `streamInterceptors: […]` on `ConnOptions` / `ServerOptions` — same order (element 0 outermost), `(req, call, next)` shape; see `docs/typescript.md` |
+| `WithChainUnaryInterceptor(…)` / `ChainUnaryInterceptor(…)` and the stream twins | `unaryInterceptors: […]` / `streamInterceptors: […]` on `ConnOptions` / `ServerOptions` — same order (element 0 outermost), `(req, call, next)` shape; see `docs/typescript.md` |
 
 Deliberately not ported (yet): the `stats.Handler` bridge (a grpc-go type; the
 drpc half of the observability surface,
