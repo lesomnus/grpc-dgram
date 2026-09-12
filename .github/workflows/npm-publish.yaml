@@ -36,12 +36,17 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 11
+      # No registry-url: with it, setup-node writes an .npmrc whose auth line
+      # is `_authToken=${NODE_AUTH_TOKEN}` and exports a placeholder token —
+      # and npm's OIDC exchange never throws, so a failed exchange would fall
+      # through to that placeholder and the registry's 403 would say nothing
+      # useful. Without it, npm's default registry is npmjs.org, there is no
+      # token, and OIDC is the only credential in play.
       - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
           cache-dependency-path: ts/pnpm-lock.yaml
-          registry-url: https://registry.npmjs.org
 
       - name: The tag names the version in package.json
         run: |
@@ -69,5 +74,15 @@ jobs:
           npm install -g npm@latest
           npm --version
 
+      - name: No token may be in play — OIDC is the credential
+        run: |
+          if [ -n "${NODE_AUTH_TOKEN:-}${NPM_TOKEN:-}" ]; then
+            echo "NODE_AUTH_TOKEN / NPM_TOKEN is set; trusted publishing must be the only credential" >&2
+            exit 1
+          fi
+          npm config get //registry.npmjs.org/:_authToken | grep -qv '^\(undefined\|null\)$' && { echo "an _authToken is configured for registry.npmjs.org" >&2; exit 1; } || true
+
+      # verbose, so that a failed OIDC token exchange — which npm logs at
+      # this level and otherwise swallows — names its cause in the run log.
       - name: Publish
-        run: npm publish
+        run: npm publish --loglevel verbose
