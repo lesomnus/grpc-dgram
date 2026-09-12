@@ -269,19 +269,39 @@ export class WebTransportDatagramTransport implements FrameHandler, TransportInf
     }
   }
 
-  // handle sends one frame as a single-frame envelop, gated on `ready`; an
-  // envelop over the ceiling is refused with MessageTooLargeError before the
-  // platform, which would drop an oversize datagram silently, ever sees it
-  // (PROTOCOL.md §4.4): synchronously here, against the ceiling known now,
-  // and once more at the write when the session was still connecting (see
-  // send) — a call made on the dial tick queues against the default rather
-  // than failing against a placeholder, and is judged against the real
-  // ceiling when it goes out. The core treats the rejection as it does the
-  // throw: it walks the cause chain for the refusal and reclaims the seq.
-  handle(f: Frame): Promise<void> {
-    const data = encodeEnvelop([f])
+  // sendFrames writes these frames as ONE datagram — one marshaled Envelop of
+  // 1..n frames is the wire unit either way (PROTOCOL.md §4.1) — gated on
+  // `ready`. An envelop over the ceiling is refused with MessageTooLargeError
+  // before the platform, which would drop an oversize datagram silently, ever
+  // sees it (§4.4): synchronously here, against the ceiling known now, and
+  // once more at the write when the session was still connecting (see send) —
+  // a call made on the dial tick queues against the default rather than
+  // failing against a placeholder, and is judged against the real ceiling
+  // when it goes out. The core treats the rejection as it does the throw: it
+  // walks the cause chain for the refusal and reclaims the seq.
+  //
+  // It is the envelop-level seam a batching middleware flushes through (§4.1).
+  // The library ships no batcher: what may share a datagram (which couples
+  // the frames' fate under loss) and how long a frame may wait for company
+  // (§10.7) are answerable only against a workload. A user subclasses this
+  // transport, overrides `handle` to buffer, and flushes here — subclassing
+  // keeps reliable/attachConn/close on the prototype, which is where the Conn
+  // discovers them (seam.ts). Every frame in one call leaves in one datagram,
+  // for the session's one peer; on a gateway the ctx would be the address
+  // instead, and packing two peers' frames together would misdeliver both.
+  //
+  // It is sendFrames and not send because `send` below is the byte-level
+  // write, one name a level down that means something else.
+  sendFrames(frames: readonly Frame[]): Promise<void> {
+    const data = encodeEnvelop(frames)
     this.check(data)
     return this.send(data)
+  }
+
+  // handle sends one frame as a single-frame envelop: the no-batching default
+  // (§4.1), and always conformant.
+  handle(f: Frame): Promise<void> {
+    return this.sendFrames([f])
   }
 
   // send writes one datagram once the session is established. There is no

@@ -317,6 +317,15 @@ func (p *msgPort) post(data []byte, transfer bool) error {
 // limit is refused synchronously with an error wrapping drpc.ErrMessageTooLarge
 // (PROTOCOL.md §4.4) and the port stays up.
 func (p *msgPort) send(e *drpc.Envelop) error {
+	if len(e.GetFrames()) == 0 {
+		// A zero-frame envelop marshals to 0 bytes, which on this adapter is
+		// the goodbye (below) — so sending one here would tear the channel
+		// down instead of doing nothing. A batching middleware (§4.1) flushes
+		// on a delay budget, and an idle tick flushes an empty buffer, so this
+		// is a send the seam invites. goodbye() posts directly and is
+		// unaffected.
+		return nil
+	}
 	data, err := marshal(e, p.max)
 	if err != nil {
 		return err

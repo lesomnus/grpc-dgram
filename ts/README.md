@@ -229,17 +229,17 @@ drpc half of the observability surface,
 `ProtocolStats`/`Counters`, is ported — `protocolStats` on `ConnOptions` and
 `ServerOptions`, `docs/observability.md`).
 
-Missing rather than deliberate: an **envelop-level send seam**. Batching is
-the application's policy in both languages and neither ships a batcher
-(`docs/TODO.md` §1), but Go ships the seam to write one against —
-`EnvelopHandler` beside `FrameHandler`, and a `Send(ctx, *Envelop)` on every
-adapter. Here only the receive half exists: `unpack` already delivers the n
-frames of a datagram in order, but nothing exported takes an envelop. Three
-adapters (WebRTC, WebSocket, port) already have an n-frame `send` internally;
-it sits on a module-private channel class the exported `Transport`/`Gateway`
-holds privately, so a subclass cannot reach it. The other two (Node UDP,
-WebTransport) encode `encodeEnvelop([f])` inline in `handle`. `wire.ts`
-exports `encodeEnvelop`, so what is missing is reach, not encoding.
+Batching is the application's policy in both languages and neither ships a
+batcher (`docs/TODO.md` §1); both ship the seam to write one against. Here it
+is `sendFrames`, public on every exported adapter class, with `handle`
+delegating to it so an override reaches the same code the core would. It
+mirrors that class's own `handle`: `sendFrames(frames)` where `handle` takes
+a frame alone, `sendFrames(frames, ctx)` where `handle` takes a
+`FrameContext` — on the gateways the ctx *is* the address, so a batch may
+hold only frames whose contexts name one peer. Subclass the adapter and override `handle`: the core finds
+`reliable()`, `attachConn()` and `close()` structurally, so the prototype
+keeps all three. `src/transport/node-udp/batcher.test.ts` is the worked
+example, per-peer gateway batching included.
 
 Receive-path note for browsers: an `RTCDataChannel` cannot pause delivery, so
 adapter-level buffering is unavoidable — but since v1.1 the *protocol* paces
@@ -249,7 +249,7 @@ calls sharing the channel.
 
 ## Tests
 
-`pnpm test` — 542 tests mirroring the Go suites: the §5 golden wire vectors
+`pnpm test` — 549 tests mirroring the Go suites: the §5 golden wire vectors
 byte-for-byte (including the v1.1 vectors generated from the Go
 implementation), e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,

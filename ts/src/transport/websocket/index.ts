@@ -299,7 +299,8 @@ class Socket {
   }
 
   // send transmits one envelop as one binary message. It refuses an envelop
-  // over the size limit synchronously (PROTOCOL.md §4.4), waits for the
+  // over the size limit (PROTOCOL.md §4.4 — as a rejection, this method being
+  // async; the core treats a throw and a rejection alike), waits for the
   // socket to open, and parks while bufferedAmount is at the high-water mark
   // — each wait bounded by socket death and by one stall budget. The budget
   // is what gorilla's write deadline is: with protocol timers off, a peer
@@ -467,11 +468,31 @@ export class WebSocketTransport implements FrameHandler, TransportInfo, ConnAtta
     })()
   }
 
-  // handle sends one frame as a single-frame envelop, gated on open and on
-  // the buffered-amount mark; an envelop over the size limit is refused
-  // synchronously with MessageTooLargeError (PROTOCOL.md §4.4).
+  // sendFrames sends these frames as ONE binary message — one marshaled
+  // Envelop of 1..n frames is the wire unit either way (PROTOCOL.md §4.1). A
+  // thin passthrough: Socket.send owns the gating (open, the buffered-amount
+  // mark, the stall budget) and the §4.4 size refusal, and nothing is
+  // duplicated here.
+  //
+  // It is the envelop-level seam a batching middleware flushes through (§4.1).
+  // The library ships no batcher: what may share a message and how long a
+  // frame may wait for company (§10.7) are answerable only against a
+  // workload. A user subclasses this transport, overrides `handle` to buffer,
+  // and flushes here — subclassing keeps reliable/attachConn/close on the
+  // prototype, which is where the Conn discovers them (seam.ts). Every frame
+  // in one call leaves in one message, for this socket's one peer; on a
+  // gateway the ctx is the address instead (see WebSocketGateway.sendFrames).
+  //
+  // It is sendFrames and not send because WebSocketLike.send is the
+  // byte-level write, one name a level down that means something else.
+  sendFrames(frames: readonly Frame[], ctx: FrameContext = {}): Promise<void> {
+    return this.sock.send(frames, ctx.signal)
+  }
+
+  // handle sends one frame as a single-frame envelop: the no-batching default
+  // (§4.1), and always conformant.
   handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
-    return this.sock.send([f], ctx.signal)
+    return this.sendFrames([f], ctx)
   }
 
   // close stops the pump and closes the WebSocket; the pump's exit fails any
@@ -580,9 +601,16 @@ export class WebSocketGateway implements FrameHandler, TransportInfo {
     }
   }
 
-  // handle sends one frame as a single-frame envelop to the peer named in
-  // ctx, with the same gating as the client transport.
-  handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
+  // sendFrames sends these frames as ONE binary message to the peer named in
+  // ctx, with the same gating as the client transport — the envelop-level
+  // seam a batching middleware flushes through (PROTOCOL.md §4.1).
+  //
+  // The ctx IS the address (§6.4): the whole message goes to the one socket it
+  // names, never to anything the frames themselves carry. So a batcher above a
+  // gateway may pack together only frames whose contexts name the same peer,
+  // and must flush on a context naming it. Mixing two peers sends one peer's
+  // frames to the other and nothing to the first, and nothing reports it.
+  sendFrames(frames: readonly Frame[], ctx: FrameContext = {}): Promise<void> {
     const key = ctx.peer
     if (typeof key !== 'number') {
       return Promise.reject(new Error(`websocket: no gateway peer in context (got ${String(key)})`))
@@ -591,7 +619,13 @@ export class WebSocketGateway implements FrameHandler, TransportInfo {
     if (sock === undefined) {
       return Promise.reject(new Error(`websocket: peer ${key} is disconnected`))
     }
-    return sock.send([f], ctx.signal)
+    return sock.send(frames, ctx.signal)
+  }
+
+  // handle sends one frame as a single-frame envelop to the peer named in ctx:
+  // the no-batching default (§4.1).
+  handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
+    return this.sendFrames([f], ctx)
   }
 
   // close tears every served socket down; each servePeer then exits through

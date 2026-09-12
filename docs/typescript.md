@@ -155,6 +155,7 @@ serializer. If you already use Connect-ES, `createDrpcTransport(conn)` keeps
 | generated stubs / `RegisterService` | `conn.invoke(desc, req)` / `server.register(desc, handler)` |
 | `TransportInfo` / `ConnAttacher` | the same seams, structural (`reliable()`, `attachConn()`) |
 | `drpc.ErrMessageTooLarge` | `MessageTooLargeError` |
+| `udp.Transport.Send(ctx, *Envelop)` — the §4.1 batching seam | `sendFrames` on every exported adapter class, mirroring that class's `handle`: `sendFrames(frames)`, or `sendFrames(frames, ctx)` where `handle` takes a context |
 | `NewPeerContext` / `NewReliableContext` | a `FrameContext { peer, reliable, signal }` argument |
 | `WithLimits(Limits{MaxPeerWindow: n})` — the §4.2.1 connection window | `limits: { maxPeerWindow: n }` on `ConnOptions` / `ServerOptions`; same floor (`W_CONN` = 1024), same default, same `sid = 0` grants on the wire |
 | `EventPeerFlowStall` / `EventPeerFlowResume` (with the stream pair) | `'peer-flow-stall'` / `'peer-flow-resume'` — see [observability.md](./observability.md#typescript) |
@@ -219,15 +220,23 @@ runs inside Connect's: the drpc transport sits at the centre of that onion.
 
 The **`stats.Handler` bridge** (grpc-go's type; the drpc half,
 `ProtocolStats`/`Counters`, is ported — see
-[observability.md](./observability.md#typescript)) and the **envelop-level
-send seam**: Go exports `EnvelopHandler` beside `FrameHandler` and a
-`Send(ctx, *Envelop)` on every adapter, so an application can install its own
-batcher there, while here nothing exported takes an envelop: three adapters
-already have an n-frame `send` on a module-private channel class a subclass
-cannot reach, and the other two encode their one-frame envelop inline. Neither
-language ships a batcher — the policy is the workload's
-([TODO.md](./TODO.md) §1). These are gaps, not divergences: the
-wire is identical either way.
+[observability.md](./observability.md#typescript)). That is a gap, not a
+divergence: the wire is identical either way.
+
+Neither language ships a **batcher**, and neither will — the policy is the
+workload's ([TODO.md](./TODO.md) §1). Both ship the seam to write one
+against: in Go, embed the adapter and override `Handle`; here, `extends` it
+and override `handle`, calling `sendFrames` with what you packed. TS is the
+easier of the two, because the core discovers `reliable()`, `attachConn()`
+and `close()` structurally and a subclass inherits all three — where Go's
+field-wrapper would hide them. Two traps are TS's own. `private` members are
+part of the type, so a subclass may not redeclare a name a base class holds
+privately (`max`, and `send` under `WebTransportDatagramTransport`) — it is
+rejected, and the subclass stops being assignable to the base. And of §4.1's
+concurrency duty only the buffer half is free here: a flush on a reliable
+adapter can park (waiting for the socket to open, or for `bufferedAmount` to
+fall), so a second flush issued meanwhile overtakes it and reliable mode has
+no retransmission to repair the reorder. Keep one flush in flight.
 
 One genuine environmental difference: a browser `RTCDataChannel` cannot pause
 delivery, so inbound messages queue in the adapter while a slow consumer

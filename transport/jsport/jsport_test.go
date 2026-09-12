@@ -406,6 +406,39 @@ func TestEmptyEnvelopIsGoodbye(t *testing.T) {
 	}
 }
 
+// An empty envelop through the Send seam is a no-op, not a goodbye. A batching
+// middleware (§4.1) flushes on a delay budget, so an idle tick hands the seam
+// an empty batch — and on this adapter a 0-byte message is the goodbye, so
+// without the guard in msgPort.send that flush would tear the channel down and
+// report it as the peer leaving cleanly. Gateway.Send funnels into the same
+// msgPort.send, so the client side is where the guard is reachable from a test:
+// the peer key a gateway send needs is deliberately opaque (§6.4).
+func TestEmptySendIsNotGoodbye(t *testing.T) {
+	e := serve(t, nil, nil)
+
+	empty := &drpc.Envelop{}
+	if err := e.tp.Send(t.Context(), empty); err != nil {
+		t.Fatalf("client Send of an empty envelop: %v", err)
+	}
+
+	// The call still works, so nothing was torn down.
+	res, err := e.client.Once(t.Context(), echo.EchoRequest_builder{
+		Message: "ping", Repeat: 1,
+	}.Build())
+	if err != nil {
+		t.Fatalf("after an empty client flush: %v", err)
+	}
+	if res.GetMessage() == "" {
+		t.Fatal("empty response")
+	}
+
+	select {
+	case err := <-e.served:
+		t.Fatalf("ServePeer exited (%v): an empty flush was read as the goodbye", err)
+	default:
+	}
+}
+
 // The goodbye, server side. A wasm instance that is going away closes its
 // gateway; the empty envelop it posts is what fails the client's live call
 // with UNAVAILABLE, immediately. Without it the Recv below would block

@@ -221,6 +221,15 @@ class Port {
   // either happens now or the endpoint is dead. The frame's own signal
   // therefore has nothing to bound.
   async send(frames: readonly Frame[]): Promise<void> {
+    if (frames.length === 0) {
+      // A zero-frame envelop encodes to 0 bytes, which on this adapter is the
+      // goodbye (see pump) — so sending one here would tear the channel down
+      // instead of doing nothing. A batching middleware (§4.1) flushes on a
+      // delay budget, and an idle tick flushes an empty buffer, so this is a
+      // send the seam invites. close() posts the goodbye directly and is
+      // unaffected.
+      return
+    }
     const data = encodeEnvelop(frames)
     if (this.max > 0 && data.length > this.max) {
       throw new MessageTooLargeError(`port: ${data.length}-byte envelop over the ${this.max}-byte limit`)
@@ -401,11 +410,28 @@ export class PortTransport implements FrameHandler, TransportInfo, ConnAttacher 
     })()
   }
 
-  // handle posts one frame as a single-frame envelop; an envelop over the
-  // size limit is refused before anything reaches the port (PROTOCOL.md
-  // §4.4). The frame's signal is not used: a post never parks (see Port.send).
+  // sendFrames posts these frames as ONE message — one marshaled Envelop of
+  // 1..n frames is the wire unit either way (PROTOCOL.md §4.1). A thin
+  // passthrough: Port.send owns the §4.4 refusal, which happens before
+  // anything reaches the port. No ctx is taken because none is used: a post
+  // never parks, so a frame's signal has nothing to bound (see Port.send).
+  //
+  // It is the envelop-level seam a batching middleware flushes through (§4.1).
+  // The library ships no batcher: what may share a message and how long a
+  // frame may wait for company (§10.7) are answerable only against a
+  // workload. A user subclasses this transport, overrides `handle` to buffer,
+  // and flushes here — subclassing keeps reliable/attachConn/close on the
+  // prototype, which is where the Conn discovers them (seam.ts). Every frame
+  // in one call leaves in one message, for this port's one peer; on a gateway
+  // the ctx is the address instead (see PortGateway.sendFrames).
+  sendFrames(frames: readonly Frame[]): Promise<void> {
+    return this.pt.send(frames)
+  }
+
+  // handle posts one frame as a single-frame envelop: the no-batching default
+  // (§4.1), and always conformant.
   handle(f: Frame): Promise<void> {
-    return this.pt.send([f])
+    return this.sendFrames([f])
   }
 
   // close posts the goodbye that lets the peer run its own §4.5 teardown,
@@ -598,9 +624,16 @@ export class PortGateway implements FrameHandler, TransportInfo {
     }
   }
 
-  // handle posts one frame as a single-frame envelop to the peer named in
-  // ctx, with the same size ceiling as the client transport.
-  handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
+  // sendFrames posts these frames as ONE message to the peer named in ctx,
+  // with the same size ceiling as the client transport — the envelop-level
+  // seam a batching middleware flushes through (PROTOCOL.md §4.1).
+  //
+  // The ctx IS the address (§6.4): the whole message goes to the one port it
+  // names, never to anything the frames themselves carry. So a batcher above a
+  // gateway may pack together only frames whose contexts name the same peer,
+  // and must flush on a context naming it. Mixing two peers posts one peer's
+  // frames to the other and nothing to the first, and nothing reports it.
+  sendFrames(frames: readonly Frame[], ctx: FrameContext = {}): Promise<void> {
     const key = ctx.peer
     if (typeof key !== 'number') {
       return Promise.reject(new Error(`port: no gateway peer in context (got ${String(key)})`))
@@ -609,7 +642,13 @@ export class PortGateway implements FrameHandler, TransportInfo {
     if (pt === undefined) {
       return Promise.reject(new Error(`port: peer ${key} is disconnected`))
     }
-    return pt.send([f])
+    return pt.send(frames)
+  }
+
+  // handle posts one frame as a single-frame envelop to the peer named in ctx:
+  // the no-batching default (§4.1).
+  handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
+    return this.sendFrames([f], ctx)
   }
 
   // close says goodbye on every served port and tears it down; each servePeer

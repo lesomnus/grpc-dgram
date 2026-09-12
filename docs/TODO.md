@@ -34,7 +34,7 @@ this repository can know. Hence: **the library provides the seam, and the
 batching policy is the application's to write.** PROTOCOL.md now says the same
 normatively (§3, §4.1).
 
-**In Go the seam is complete and exported.** `frame.go` has both handler types
+**The seam is complete and exported in both languages.** In Go, `frame.go` has both handler types
 — `FrameHandler` (core-facing, one frame) and `EnvelopHandler` (adapter-facing,
 one envelop of 1..n frames) — plus `Wrap1`, the no-batching default, which the
 adapters implement directly rather than install (it re-exposes nothing,
@@ -138,22 +138,34 @@ is already decided, and must pack them unchanged. Per-batch compression would
 need an envelop-level flag to carry the marker — a wire change, and one that is
 cheap only before the freeze (item 2).
 
-**What the decision leaves open is one piece of real work, in TypeScript.** The
-port has half the seam: `ts/src/seam.ts` exports `FrameHandler` and `unpack`,
-so the receive side already takes n frames per datagram, the same as Go. The
-send side has no way in — there is no `EnvelopHandler` equivalent, and no
-exported class carries an envelop-level entry. Three of the five adapter
-families already have one internally: `Channel.send`, `Socket.send` and
-`Port.send` each take n frames and each already enforce the §4.4 refusal, but
-those classes are module-private and the exported `Transport`/`Gateway` holds
-them privately (one field on a transport, a per-peer map on a gateway), so a
-subclass cannot reach them. The other
-two (node-udp, webtransport) encode `encodeEnvelop([f])` inline in `handle`.
-`encodeEnvelop` is exported from `wire.ts`; what is missing is reach, not
-encoding. The work is a public envelop-level entry on each exported adapter
-plus the type that names it — a forward to the existing n-frame `send` for
-three of them, the encode lifted out of `handle` for the other two — not a
-port of a feature, because there is no feature to port.
+**TypeScript has the same seam**, in the shape the language makes natural.
+Discovery there is structural — `hasConnAttacher` is a `typeof
+tx.attachConn === 'function'` check, and the same for `reliable()` and
+`close()` — so a subclass inherits every one of them through the prototype
+and there is no Go-style wrapper trap: `class Batcher extends UdpTransport`
+overriding `handle` alone keeps all three. What it calls is `sendFrames`,
+the envelop-level entry every exported adapter class now carries
+(`UdpTransport`, `UdpGateway`, `WebSocketTransport`, `WebSocketGateway`,
+`DataChannelTransport`, `DataChannelGateway`, `PortTransport`,
+`PortGateway`, `WebTransportDatagramTransport`); `handle` is a one-line
+delegation to it, so an override reaches exactly the code the core would
+have. It is named `sendFrames` rather than `send` because the objects these
+adapters sit on already have a byte-level `send(data)`.
+`ts/src/transport/node-udp/batcher.test.ts` is the twin of the Go one, and
+adds the per-peer case the connected-socket Go test cannot show.
+
+Two traps particular to TypeScript, both surfaced by writing that test.
+`private` members are part of the type: a subclass that declares its own
+field named like a base `private` one (`max`, and `send` under
+`WebTransportDatagramTransport`) is rejected and, worse, becomes
+unassignable to the base type. And of §4.1's concurrency duty only the first
+half is free: the buffer needs no lock while it is touched inside one
+synchronous turn, but the ordering half still binds. On a reliable adapter a
+flush can park — `Socket.send` and `Channel.send` wait for the socket to open
+and while `bufferedAmount` is at the high-water mark — and a second flush
+issued meanwhile goes straight out past it, which reliable mode has no
+retransmission to repair. A batcher there must keep one flush in flight,
+chaining each on the last.
 
 ## 2. Release preparation
 
@@ -180,11 +192,6 @@ The port stops short of the Go side in two places — one deliberate, one a gap
 - the **`stats.Handler` bridge** — `ProtocolStats`/`Counters` are ported
   (`ts/src/stats.ts`, so a browser client reports the §14 gap counter), but the
   grpc-go `stats.Handler` type has no TS counterpart and is not mirrored;
-- the **envelop-level send seam** of item 1 — a gap, not a decision. Go exports
-  `EnvelopHandler` beside `FrameHandler` and an envelop-level `Send` on every
-  adapter, so an application can install its own batcher between the core and
-  the channel; here there is nothing to install it against. Neither language
-  ships a batcher, and neither is going to.
 
 That is the whole of it. The **connection window** (`WINDOW sid=0`, §4.2.1)
 that this section once listed as sequenced rather than deliberate is in the

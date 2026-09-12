@@ -98,14 +98,34 @@ export class UdpTransport implements FrameHandler, TransportInfo, ConnAttacher {
     this.socket.on('close', () => this.conn?.close())
   }
 
-  // handle sends one frame as a single-frame envelop, refusing an oversize
-  // envelop synchronously with MessageTooLargeError (PROTOCOL.md §4.4).
-  handle(f: Frame): Promise<void> {
-    const data = encodeEnvelop([f])
+  // sendFrames writes these frames as ONE datagram — one marshaled Envelop of
+  // 1..n frames is the wire unit either way (PROTOCOL.md §4.1) — refusing an
+  // oversize envelop synchronously with MessageTooLargeError before anything
+  // reaches the socket (§4.4).
+  //
+  // It is the envelop-level seam a batching middleware flushes through. The
+  // library ships no batcher: what may share a datagram (which couples the
+  // frames' fate under loss, §4.1) and how long a frame may wait for company
+  // (§10.7) are answerable only against a workload. A user subclasses this
+  // transport, overrides `handle` to buffer, and flushes here — subclassing
+  // keeps reliable/attachConn/close on the prototype, which is where the Conn
+  // discovers them (seam.ts).
+  //
+  // Every frame in one call leaves for one destination; here that is the
+  // connected socket's only one. On a gateway it is a duty, not a given — see
+  // UdpGateway.sendFrames.
+  sendFrames(frames: readonly Frame[]): Promise<void> {
+    const data = encodeEnvelop(frames)
     if (this.max > 0 && data.length > this.max) {
       throw new MessageTooLargeError(`node-udp: ${data.length}-byte envelop over the ${this.max}-byte limit`)
     }
     return sendDatagram(this.socket, data)
+  }
+
+  // handle sends one frame as a single-frame envelop: the no-batching default
+  // (PROTOCOL.md §4.1), and always conformant.
+  handle(f: Frame): Promise<void> {
+    return this.sendFrames([f])
   }
 
   // close closes the socket (stopping the pump) and fails any live calls.
@@ -167,8 +187,16 @@ export class UdpGateway implements FrameHandler {
     })
   }
 
-  // handle sends one frame as a single-frame envelop to the peer named in ctx.
-  handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
+  // sendFrames writes these frames as ONE datagram to the peer named in ctx —
+  // the envelop-level seam a batching middleware flushes through (PROTOCOL.md
+  // §4.1), as on the client transport.
+  //
+  // The ctx IS the address (§6.4): the whole datagram goes to the one peer it
+  // names, never to anything the frames themselves carry. So a batcher above a
+  // gateway may pack together only frames whose contexts name the same peer,
+  // and must flush on a context naming it. Mixing two peers sends one peer's
+  // frames to the other and nothing to the first, and nothing reports it.
+  sendFrames(frames: readonly Frame[], ctx: FrameContext = {}): Promise<void> {
     const key = ctx.peer
     if (typeof key !== 'string') {
       return Promise.reject(new Error(`node-udp: no gateway peer in context (got ${String(key)})`))
@@ -177,11 +205,17 @@ export class UdpGateway implements FrameHandler {
     if (target === undefined) {
       return Promise.reject(new Error(`node-udp: peer ${key} is unknown`))
     }
-    const data = encodeEnvelop([f])
+    const data = encodeEnvelop(frames)
     if (this.max > 0 && data.length > this.max) {
       throw new MessageTooLargeError(`node-udp: ${data.length}-byte envelop over the ${this.max}-byte limit`)
     }
     return sendDatagram(this.socket, data, target)
+  }
+
+  // handle sends one frame as a single-frame envelop to the peer named in ctx:
+  // the no-batching default (§4.1).
+  handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
+    return this.sendFrames([f], ctx)
   }
 
   close(): void {

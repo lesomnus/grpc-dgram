@@ -266,6 +266,24 @@ describe('one message per envelop, transferred (§4.1)', () => {
     await serving
   })
 
+  // An empty flush through the seam is a no-op, not a goodbye. A batching
+  // middleware (§4.1) flushes on a delay budget, so an idle tick hands
+  // sendFrames an empty batch — and here a 0-byte message IS the goodbye
+  // (§4.5), so without the guard in Port.send that flush would tear the
+  // channel down and report it as the peer leaving cleanly.
+  it('an empty sendFrames is a no-op, not a goodbye', async () => {
+    const net = realEnds()
+    expect(await net.conn.invoke(echo.once, { text: 'a' })).toEqual({ text: 'echo:a' })
+
+    await net.transport.sendFrames([])
+    await tick()
+
+    // The channel still carries calls. The gateway funnels into the same
+    // Port.send, and its peer key is deliberately opaque (§6.4), so the client
+    // side is where the guard is reachable from a test.
+    expect(await net.conn.invoke(echo.once, { text: 'b' })).toEqual({ text: 'echo:b' })
+  })
+
   it('never re-posts a detached buffer: that would be a spurious goodbye', async () => {
     const [a] = mockPair()
     a.throwAfterTransfer = true
