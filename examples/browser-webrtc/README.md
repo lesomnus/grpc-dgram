@@ -32,8 +32,8 @@ by the import map in `web/index.html`.
 
 - **One wire, two implementations.** The browser runs the TS port
   (`Conn` + `DataChannelTransport`); the server runs the Go core
-  (`drpc.Server` + `pion.Gateway`). Both implement dRPC v1.0
-  (`PROTOCOL.md`), so the call is just a call.
+  (`drpc.Server` + `pion.Gateway`). Both implement the dRPC wire protocol (`docs/PROTOCOL.md`)
+  so the call is just a call.
 - **Reliable mode, derived from the channel.** `pc.createDataChannel('rpc')`
   is ordered with no retransmit or lifetime cap, so both adapters report
   *reliable* and both cores run with every protocol timer off (§10.6). Pass

@@ -9,7 +9,7 @@
 // then runs until stdin closes (the parent test process going away) — see
 // ts/test/conformance.test.ts.
 //
-// Why two endpoints: half of wire v1.1 is reliable-mode only (per-stream flow
+// Why two endpoints: half of the 2026-07-25 surface is reliable-mode only (per-stream flow
 // control, PROTOCOL.md §4.2.1 — the `window` field and the WINDOW flag), and
 // the unreliable endpoint must be able to prove it advertises NO window. UDP
 // is of course not a reliable channel; the second endpoint overrides the
@@ -19,7 +19,7 @@
 // sends. Nothing else about that endpoint differs.
 //
 // Service behaviour beyond internal/echo lives in conformanceServer: a request
-// whose message is "conf/<directive>" selects one of the v1.1 surfaces (binary
+// whose message is "conf/<directive>" selects one of the gRPC-fidelity surfaces (binary
 // metadata, status details, an eagerly flushed header); anything else falls
 // through to the plain echo handler the older cases use.
 package main
@@ -49,7 +49,7 @@ import (
 // the exact bytes the two implementations pin, independently
 // ---------------------------------------------------------------------------
 //
-// Metadata values are `repeated bytes` on the wire (v1.1). grpc-go keeps the
+// Metadata values are `repeated bytes` on the wire (2026-07-25 round). grpc-go keeps the
 // octets of a "-bin" value inside a string; the TS port cannot (a JS string
 // holds no arbitrary octets) and keeps their base64 instead. Both stacks
 // therefore put IDENTICAL bytes on the wire from DIFFERENT local
@@ -120,7 +120,7 @@ func run() error {
 	defer cancel()
 
 	// The unreliable endpoint: drpc's default mode, and the one every
-	// pre-v1.1 case runs on.
+	// pre-flow-control case runs on.
 	unreliable, err := listen()
 	if err != nil {
 		return err
@@ -177,7 +177,7 @@ func port(c *net.UDPConn) int {
 // the service
 // ---------------------------------------------------------------------------
 
-// conformanceServer serves internal/echo unchanged, plus the wire v1.1
+// conformanceServer serves internal/echo unchanged, plus the gRPC-fidelity
 // surfaces the cross-language suite pins. A request selects one with the
 // message "conf/<directive>"; every other message reaches the plain echo
 // handler, so the older cases (CircularShift, sequences, status codes,
@@ -203,7 +203,7 @@ func (s *conformanceServer) Once(ctx context.Context, req *echo.EchoRequest) (*e
 	}
 }
 
-// metadataCase is the binary-metadata contract (§11, wire v1.1): it verifies
+// metadataCase is the binary-metadata contract (§11, 2026-07-25 round): it verifies
 // the octets the client sent against the hard-coded expectations above, then
 // answers with header and trailer metadata whose bytes the client verifies the
 // same way. keyEchoBin additionally returns the received value verbatim, which

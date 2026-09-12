@@ -1,7 +1,7 @@
 # @lesomnus/grpc-dgram
 
 TypeScript port of [gRPC-dgram](../): gRPC-style RPC over unreliable datagram
-channels, implementing the **dRPC wire protocol v1.1** (`../docs/PROTOCOL.md`).
+channels, implementing the **dRPC wire protocol** (`../docs/PROTOCOL.md`).
 Wire-compatible with the Go implementation — the §5 golden byte vectors are
 shared between the two test suites — so a TS client interoperates with a Go
 server and vice versa.
@@ -25,7 +25,7 @@ server and vice versa.
   default, advertised on every OPEN by a `Conn` and on every H and T by a
   `Server`) that bounds what one peer can pin across *all* of its calls, as
   HTTP/2's does.
-- **v1.1 surface.** Binary metadata (`-bin` keys carry arbitrary octets;
+- **gRPC-fidelity surface.** Binary metadata (`-bin` keys carry arbitrary octets;
   base64 at the TS API, raw bytes on the wire), rich status details on the
   terminal frame, per-message compression (`gzip` via the platform's
   `CompressionStream`, never expanding a payload), per-call recv/send size
@@ -244,7 +244,7 @@ keeps all three. `src/transport/node-udp/batcher.test.ts` is the worked
 example, per-peer gateway batching included.
 
 Receive-path note for browsers: an `RTCDataChannel` cannot pause delivery, so
-adapter-level buffering is unavoidable — but since v1.1 the *protocol* paces
+adapter-level buffering is unavoidable — but since per-stream flow control the *protocol* paces
 the sender instead of the receiver (§4.2.1 flow control), so a slow consumer
 no longer needs the receive path to block at all, and never stalls the other
 calls sharing the channel.
@@ -252,7 +252,7 @@ calls sharing the channel.
 ## Tests
 
 `pnpm test` — 569 tests mirroring the Go suites: the §5 golden wire vectors
-byte-for-byte (including the v1.1 vectors generated from the Go
+byte-for-byte (including the 2026-07-25 vectors generated from the Go
 implementation), e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,
 probes, liveness), the §6.5 restart walkthroughs, §15 caps and §4.2 drop

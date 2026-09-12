@@ -1,18 +1,25 @@
-# dRPC Wire Protocol — v1.1
+# dRPC Wire Protocol
 
-> **Status: v1.1 (2026-07-25), pre-release.** The wire format — frame fields,
+> **Status: pre-release, and unversioned on purpose.** Nothing has been
+> tagged — no Go module tag, no version on the wire (§10.6) — and no
+> implementation exists outside this repository; the TypeScript package on
+> npm (`@lesomnus/grpc-dgram` 0.0.1) is a cut of this same text at one date,
+> not a protocol version. So this text has no number: its rounds are dated
+> below, which says when the text changed and nothing more. The wire format
+> — frame fields,
 > flags, seq/epoch rules, and the OPEN/CLOSE/RESET/PING/WINDOW state machines —
 > is fully implemented (M1–M7) and characterized by an executable test suite
 > (`characterization_test.go`, `timeout_test.go`, `restart_test.go`, and the
 > adapter suites under `transport/`); every §-level guarantee below is pinned
-> by a test, including the adapter duties of §4.4–§4.5. Nothing is released
-> yet, so incompatible changes are still possible — but need a reason, since
-> two implementations (the Go core and a future TS port) will have to agree
-> on everything normative here.
+> by a test, including the adapter duties of §4.4–§4.5. Incompatible changes
+> are therefore still possible — but need a reason, since two
+> implementations (the Go core and the TypeScript port under `ts/`) have
+> to agree on everything normative here, and a third must be able to join
+> them from this text alone.
 >
-> History: v0.1 adversarial review (4 blockers, 12+ majors), an author
-> decision round, v0.2 round-2 verification (2 blockers, 8 majors), v0.3
-> round-3 fixes, and the M4 implementation round-trip which closed two
+> History: a first adversarial review (4 blockers, 12+ majors), an author
+> decision round, a second verification round (2 blockers, 8 majors), a
+> third round of fixes, and the M4 implementation round-trip which closed two
 > code-verified blockers (reliable-mode strict seq §10.6, per-peer live-call
 > cap §15) and one hardening (symmetric client-side incarnation isolation
 > §6.1). A 2026-07-11 three-way audit (spec ↔ implementation ↔ tests, 66
@@ -21,7 +28,7 @@
 > §6.1) — and reconciled every confirmed spec/implementation divergence.
 > Residual limitations are enumerated in §16.
 >
-> **v1.1 (2026-07-25)** is the gRPC-fidelity round, and it is a breaking wire
+> **The 2026-07-25 round** is the gRPC-fidelity round, and it is a breaking wire
 > change (pre-release, no migration): metadata values became `bytes` so gRPC's
 > binary metadata survives; terminal frames carry `google.rpc.Status.details`;
 > a call may name a message `compressor`; and reliable mode gained **per-stream
@@ -29,7 +36,7 @@
 > head-of-line blocking a single blocking receiver used to impose on every call
 > sharing its channel. Appendix A lists the deltas.
 >
-> **v1.1 (2026-09-05)** adds a **per-peer connection window** beside the
+> **The 2026-09-05 round** adds a **per-peer connection window** beside the
 > per-stream one (§4.2.1): a reliable-mode receiver bounds what one peer may
 > have buffered across all of its calls (`Limits.MaxPeerWindow`, §15),
 > advertises that bound as `Frame.conn_window` — the client on every `OPEN`,
@@ -648,7 +655,7 @@ Notes:
 - `timeout` is a **duration** (remaining budget at send), not an absolute
   timestamp — datagram peers do not share a clock. In-flight latency is not
   charged; the same trade-off as gRPC's `grpc-timeout`.
-- All field numbers are renumbered relative to the pre-v1.0 implementation
+- All field numbers are renumbered relative to the pre-spec implementation
   (Appendix A). `Envelope.frames` moves to field 1, removing the old field-8
   collision with `Frame.payload`.
 - `peer_epoch` names the **client incarnation a server frame addresses**: the
@@ -959,7 +966,7 @@ Rules:
     status `Internal`; after call termination it returns `io.EOF` (the status
     comes from `RecvMsg`). `CloseSend` always returns `nil`.
   - For server-streaming, generated `CloseSend` is a local no-op (the request
-    frame already half-closed). The v0 `SkipNextFrame` mechanism is removed.
+    frame already half-closed). The pre-spec `SkipNextFrame` mechanism is removed.
   - The OPEN frame is constructed and sent by the **innermost streamer/invoker**
     so it sees the interceptor-final ctx (metadata!) and merged call options.
 
@@ -1120,7 +1127,7 @@ frames only — junk floods cannot keep a ghost peer alive.
      (Appendix C) cost ~`TTL_tomb`/tick entries per epoch.
 - Method resolution: unknown method or unknown codec → the server
   creates no handler but sends and tombstone-stores `T{UNIMPLEMENTED}` — one
-  bounded answer, replayed on duplicates (this replaces v0's per-frame
+  bounded answer, replayed on duplicates (this replaces the pre-spec implementation's per-frame
   `res_err` amplification).
 - **Cap rejection:** an OPEN refused by the per-peer live-call cap (§15)
   draws `T{RESOURCE_EXHAUSTED}`, sent and tombstone-stored exactly like the
@@ -1443,7 +1450,7 @@ path, where its write deadline would otherwise have been the backstop.
   which fires first. Divergence worth knowing: because `T` always re-carries
   the header (below), `Header()` returns metadata here where gRPC's
   trailers-only response would yield nil. Implementation note: rx-header and tx-header are
-  separate fields with a `headerReady` signal (the v0 single `s.header` field
+  separate fields with a `headerReady` signal (the pre-spec single `s.header` field
   cannot express this).
 - Trailer rides only `T`. Duplicate `T`s are dropped by dedup/tombstone rules
   and MUST NOT rewrite an already-delivered trailer; the same first-wins rule
@@ -1493,7 +1500,7 @@ path, where its write deadline would otherwise have been the backstop.
   method does not resolve draws a `T{UNIMPLEMENTED}`.
 - Registration after serving starts is forbidden (the registry is immutable
   once `Handle` runs).
-- **History — why there is no method index.** v0.x carried a learned
+- **History — why there is no method index.** The pre-spec implementation carried a learned
   per-epoch method *index*: the server numbered methods in registration
   order, attached the index to every frame it sent, and the client cached
   `method → index` keyed by the server epoch, flushing the cache on an
@@ -1608,14 +1615,15 @@ lengths split into message size and wire size (§12.1).
 - Handlers stuck in pure computation (not blocked on the stream) are out of
   scope, as in gRPC.
 
-## 16. v1.0 status & residual limitations
+## 16. What this protocol does not promise
 
 The wire and behaviors above are implemented (M1–M5, adapters included) and
 pinned by an executable characterization suite. This section records what
-the v1.0 protocol does **not** promise — each is either accepted by the
+the protocol does **not** promise — each entry is either accepted by the
 target use case (real-time sensor streams, where a lost reading is
 superseded by the next), bounded by a stated mechanism, or delegated to the
-transport.
+transport. The `L` labels are stable and cited from code and tests; the gaps
+in the numbering are labels that review rounds closed (Appendix A).
 
 | # | Limitation | Condition | Effect | Mitigation |
 |---|---|---|---|---|
@@ -1624,86 +1632,26 @@ transport.
 | L3 | **No wire authentication** (§15) | raw-UDP attacker who can sniff a live `(epoch, sid, seq)` and inject datagrams | a forged same-epoch RESET kills a call; a forged `K_loud` run forces `DATA_LOSS` | deploy over DTLS / WSS / WebRTC (encrypted → unreachable). Incarnation isolation is closed in both directions (§6.1: server keying c→s, `peer_epoch` echo s→c, the server-epoch stream lock); same-epoch injection is the transport's job |
 | L6 | **Status details are a passenger** | a terminal frame that would not fit the channel (§4.4) | `code`+`desc` always travel; the details are dropped to keep the terminal sendable, and a still-oversize terminal degrades to a bare `RESOURCE_EXHAUSTED` | keep details small; the terminal is what every termination bound depends on (§10.7) |
 | L7 | **Best-effort, single-datagram messages** | porting code that needs `WaitForReady`, transparent retry, per-RPC size override, or large/fragmented messages | none of these exist; the core never fragments, and an unreliable adapter rejects a message that doesn't fit its datagram at send with `ResourceExhausted` (§4.4); batched frames fate-share | set explicit deadlines; keep messages within a datagram; don't batch messages that must survive independently |
+| L10 | **A parked sender is bounded only by `T_stall`** | reliable-mode flow control, a peer that grants nothing (§4.2.1) | the send waits, then the call fails `UNAVAILABLE` after `T_stall` (§10.1) — reliable mode runs no other timer that could break the park | set deadlines; the stall counters (§14) name the window and the call |
+| L11 | **Reliable-mode receive floors** | a configured rx buffer below `W_init`, or a `MaxPeerWindow` below `W_conn` (§4.2.1) | silently raised to the floor: a sender assumes that much before the advertisement lands | a byte-tight deployment shrinks `MaxLiveCalls` or the per-call buffer instead; the memory bound is min(`MaxLiveCalls` × per-call buffer, `MaxPeerWindow`) × frame size (§15) |
+| L12 | **An overrun fails the call, never the peer** | a peer past its advertised stream or connection window (§4.2.1), including a coexisting incarnation on a datagram-keyed reliable channel — a client restarted at the same key, where no `DisconnectPeer` fires — that inherits the dead one's buffered count as it inherits its live-call count (§15) | the offending call fails `INTERNAL`; never a hang, never the incarnation's credit (the ledger holds back and grants per incarnation) | a conforming sender never triggers it; `DisconnectPeer` on a channel you know is dead |
+| L13 | **Cross-stream coupling and first-come fairness on the connection window** | stuck consumers pin most of one peer's window; or consumers of streams A and B wait on something the sender can only send on C, with A+B's backlog filling the window (the classic HTTP/2 connection-window deadlock) | every other stream to that peer slows; C parks until `T_stall`; under sustained contention one stream can lose every re-race for a grant for up to `T_stall`, then fails loudly; at the window's edge the starvation rule costs one grant per consumed message | the default is 32 full stream windows; the peer-stall counter (§14) makes it diagnosable; `MaxPeerWindow` is the remedy |
+| L14 | **Past the ledger's cap an incarnation starts over** | more than 2 × `MaxDeadPeers` idle incarnations on one peer key (§9.4): an incarnation coming back takes its own position out before its OPEN's eviction puts another in, so exactly 2 × `MaxDeadPeers` keep every one; past that the oldest position — and the credit held back for it — is dropped | the recreated container's sender starts at the window its OPEN advertises with nothing sent, over-credited by whatever the dropped position had spent, so the client can overrun and fail one call `INTERNAL` (§4.2.1) | raise `MaxDeadPeers`; keep idle incarnations per key below the bound |
+| L15 | **A datagram channel forced reliable is neither authenticated nor strictly ordered** (§4.3) | a single forged or reordered sequenced frame that names the `Conn`'s own `peer_epoch` under a foreign server epoch; or a genuine server restart on a surviving channel | the frame re-locks the `Conn` (§4.2.1 *Restart*): its sender starts over and the credit held back for the live incarnation is dropped, so both directions park until the next sequenced frame re-locks it; after a restart a **receive-only** call locked to the dead epoch never ends without a deadline (reliable mode runs no timers and only a send draws the RESET), so its pinned buffers count against the new incarnation's `MaxPeerWindow` for as long as it lives | the same injection class as L3, closed by an encrypted transport; set deadlines on receive-only calls |
+| L16 | **Credit spent before a `Conn`'s first lock is never recovered** | data frames pipelined behind OPENs that a stopping server answered with RESET — no container exists for them, so nothing returns their credit (§4.2.1 *The receiver's ledger*, §9.4 *Server.Stop*) — on a `Conn` that has accepted no sequenced frame yet | it locks to the first incarnation it does hear with those frames still counted as sent — no earlier lock exists to start over from — a permanent shrink of its sender by up to `W_conn`, the most it can pipeline before an advertisement | reachable only on a datagram channel forced reliable across a server stop; a fresh `Conn` clears it (tracked as #36) |
+| L17 | **Bounded where gRPC is unbounded, and the reverse** | a deadline-less unary; an idle-but-alive client; a foreign PING flood; unknown-sid RESETs in reliable mode | a deadline-less unary is bounded by `T_call` where gRPC would run unbounded; an idle-but-alive client legitimately pins a handler until `T_live` or an explicit close (the peer *is* alive); client peer-liveness can be masked by a foreign PING flood, but the call still fails via deadline or probe; reliable-mode unknown-sid RESETs are 1:1, not rate-limited | set deadlines; run over an encrypted transport (L3) |
 
-**Resolved in v1.1:** rich status details now travel (§5); gRPC's binary
-metadata survives the wire (§11); a call may compress its messages (§12.1);
-and reliable mode gained per-stream flow control (§4.2.1), which removes the
-head-of-line blocking a single blocking receiver used to impose on every call
-sharing a channel — the back-pressure now lands on the sender, as it does in
-HTTP/2. New residuals it introduces, all bounded and stated: a sender parked
-on credit is bounded only by `T_stall` (§10.1); a reliable-mode receiver's rx
-buffer has a floor of `W_init` (§4.2.1); and a peer that overruns its
-advertised window fails **that call** with `INTERNAL` rather than stalling the
-channel.
+The flow-control bounds above (L10–L16) are in messages, not bytes (§15). What each
+round fixed, and the review-round blockers L4, L5, L8 and L9 that are closed,
+are listed in Appendix A — history belongs there, not here.
 
-**Resolved in v1.1 (2026-09-05):** the memory one peer can pin was
-`MaxLiveCalls × window`, a number no receiver chose; the **connection window**
-(§4.2.1, `Limits.MaxPeerWindow` §15) bounds it per transport peer, as HTTP/2's
-connection window does. Its residuals, each bounded and stated: **cross-stream
-coupling** — a peer whose stuck consumers pin most of the window slows every
-other stream to that peer, and an application whose consumers of streams A and
-B wait on something the sender can only send on C, with A+B's backlog filling
-the window, parks C until `T_stall` (the classic HTTP/2 connection-window
-deadlock; the default is 32 full stream windows, the peer-stall counter makes
-it diagnosable, and `MaxPeerWindow` is the remedy); **fairness** among streams
-sharing one window is first-come — every parked sender re-races for the same
-grant, and under sustained contention one stream can lose every race for up
-to `T_stall`, then fail loudly; a **connection overrun** fails the offending
-call `INTERNAL`, never the peer (§4.2.1), so a coexisting incarnation on a
-datagram-keyed reliable channel — a client restarted at the same key, where no
-`DisconnectPeer` fires — inherits the dead one's buffered count as it inherits
-its live-call count, and can cost the new one `INTERNAL` on one call, never a
-hang and never its credit (the ledger holds back and grants per incarnation,
-§4.2.1); a `MaxDeadPeers` eviction of an idle reliable container leaves its
-sender's position in the peer's ledger (§9.4), so the recreated container
-continues at its window and its credit, and a data frame
-the evicted incarnation still had in flight returns its credit to that
-position (§4.2.1) — only past the ledger's own cap, `MaxDeadPeers` held
-positions, does an incarnation start over (reachable only with **more than**
-2 × `MaxDeadPeers` idle incarnations on one key: an incarnation coming back
-takes its own position out before its OPEN's eviction puts another in), and
-it starts over at the window its OPEN advertises with nothing sent —
-over-credited by whatever the dropped position had spent — so the client
-can overrun and fail one call `INTERNAL` there (§4.2.1); and at the
-window's edge the starvation rule costs one grant per consumed message
-(§4.2.1). Two more, both on a **datagram channel forced reliable** (§4.3), where
-frames are neither authenticated nor strictly ordered by the transport: a
-single forged or reordered sequenced frame that names the Conn's own
-`peer_epoch` under a foreign server epoch re-locks the Conn (§4.2.1 Restart)
-— its sender starts over and the credit held back for the live incarnation
-is dropped, so both directions park until the next sequenced frame re-locks
-it (before the connection window such a frame drew only a RESET; the same
-injection class as L3, closed by an encrypted transport); and after a genuine
-server restart a **receive-only** call locked to the dead epoch never ends
-without a deadline (reliable mode runs no timers and only a send draws the
-RESET), so its pinned buffers count against the new incarnation's
-`MaxPeerWindow` for as long as it lives; and a `Conn` that has heard only
-RESETs — data frames it pipelined behind OPENs that a stopping server
-answered with RESET, which returns no credit (§9.3) — locks to the first
-incarnation it does hear with those frames still counted as sent, since no
-earlier lock exists to start over from: a permanent shrink of its sender by
-up to `W_conn`, the most it can pipeline before an advertisement. The bound
-is in messages, not bytes (§15).
+## Appendix A — Changelog against the pre-spec implementation
 
-**Resolved in v1.0 (were blockers L4/L5):** the per-peer live-call cap
-(§15, `Limits.MaxLiveCalls`) and reliable-mode strict-seq fail-loud (§10.6)
-are implemented and tested. **L9 (stale method index across a
-different-build restart)** was resolved by removing index addressing
-altogether — methods are string-addressed, always (§13). **Closed by the
-2026-07-11 audit round:** reliable-mode rx overflow now blocks instead of
-silently dropping (§4.2 — the exact-sequence contract holds under a slow
-consumer); the s→c sid-collision hole across a client restart is closed by
-the `peer_epoch` echo (§6.1); tombstone entry-cap eviction keeps dedup via
-the container floor (§9.2). **Minor edges** (bounded, documented, non-blocking):
-a deadline-less unary is bounded by `T_call` where gRPC would run unbounded; an
-idle-but-alive client legitimately pins a handler until `T_live` or an explicit
-close (the peer *is* alive); client peer-liveness can be masked by a foreign
-PING flood but the call still fails via deadline/probe; reliable-mode
-unknown-sid RESETs are 1:1, not rate-limited.
+This appendix is the history: what each round changed against the in-repo
+implementation that preceded this text, and which review-round findings it
+closed. Nothing here is a released version; the rounds are dated.
 
-## Appendix A — Changes vs current implementation
-
-Wire (all breaking; pre-v1.0, no migration):
+Wire (all breaking; before the first spec text, no migration):
 
 1. `Frame` renumbered; `epoch`, `flags` added; `deadline` (Timestamp) →
    `timeout` (Duration); `payload` gains explicit presence.
@@ -1712,7 +1660,7 @@ Wire (all breaking; pre-v1.0, no migration):
 2. Close signaling moves from "`code` presence" to the CLOSE flag; OPEN flag
    introduced (was: any unknown sid opened a call — ghost execution).
 3. `method`/`codec`/`timeout`/request-header restricted to OPEN;
-   server frames carry real seq numbers (were hard-coded `seq=1`). v0's
+   server frames carry real seq numbers (were hard-coded `seq=1`). The pre-spec implementation's
    `method_index` learning channel is removed outright — methods are
    string-addressed, always; field 6 is reserved (§13).
 4. New frames: header frame `H` (creation ack / SendHeader flush; replayable),
@@ -1724,7 +1672,7 @@ Wire (all breaking; pre-v1.0, no migration):
    hole across a client restart (§6.1) and makes RESET surgical (§9.3).
    Epochs are nonzero from here on.
 
-v1.1 (2026-07-25), breaking, pre-release:
+2026-07-25 round (gRPC fidelity), breaking, pre-release:
 
 7. `Metadata.Entry.values` `string` → `bytes` — gRPC binary metadata (`-bin`)
    could not be represented and failed the encode outright (§11).
@@ -1737,7 +1685,7 @@ v1.1 (2026-07-25), breaking, pre-release:
 10. The unary shape may now carry an `H` before its `T` when the handler
     flushes a header (§8, §11).
 
-v1.1 (2026-09-05), breaking, pre-release:
+2026-09-05 round (connection window), breaking, pre-release:
 
 11. `Frame.conn_window` (18) + `WINDOW sid=0`: a per-peer **connection
     window** (§4.2.1). A conforming reliable-mode receiver bounds
@@ -1759,24 +1707,51 @@ v1.1 (2026-09-05), breaking, pre-release:
     walks that same path, which is why the field exists rather than an
     assumption: a third implementation must not be able to miss it.
 
-Behavioral:
+Behavioral (numbered on from the wire entries, so an "entry N" is unique):
 
-6. Client EOF = server `T` frame (was: inferred from `code=OK` + empty
+12. Client EOF = server `T` frame (was: inferred from `code=OK` + empty
    payload → spurious empty message + permanent hang).
-7. Timeout/liveness/probe/retransmission system per §10 (was: `Conn.timeout`
+13. Timeout/liveness/probe/retransmission system per §10 (was: `Conn.timeout`
    dead code; server streams rooted at `context.Background()`; lost close ⇒
    permanent leak; lost response ⇒ permanent client hang).
-8. `Handle` never blocks in unreliable mode; in reliable mode it blocks on a
+14. `Handle` never blocks in unreliable mode; in reliable mode it blocks on a
    full stream buffer — bounded by the rx ctx and the call's end — instead of
    dropping (was: blocking send under a connection-wide mutex ⇒ deadlock;
    then: silent drop that broke the §14 exact-sequence contract, fixed
    2026-07-11).
-9. Tombstone + aged watermark ⇒ at-most-once unary per incarnation (was:
+15. Tombstone + aged watermark ⇒ at-most-once unary per incarnation (was:
    duplicate request re-executed the handler).
-10. sid exhaustion fails new calls (was: collision-scan loop with sid reuse).
-11. `SkipNextFrame` removed; eager OPEN + creation ack for streaming calls.
-12. `Conn.Close(err)` / `Server.DisconnectPeer(peer, err)` added;
+16. sid exhaustion fails new calls (was: collision-scan loop with sid reuse).
+17. `SkipNextFrame` removed; eager OPEN + creation ack for streaming calls.
+18. `Conn.Close(err)` / `Server.DisconnectPeer(peer, err)` added;
     `Server.Stop`/`GracefulStop` become real (§9.4).
+
+Closed review-round findings, by label (the labels stay cited from tests):
+
+- **L4** — a per-peer live-call cap (§15, `Limits.MaxLiveCalls`) bounds the
+  handler goroutines one peer can pin. **L5** — reliable-mode strict-seq
+  fail-loud (§10.6): a gap or duplicate fails the call `INTERNAL` instead of
+  being hidden. **L8** — an OK response that marshals to zero bytes
+  round-trips as a present, empty message, not an `INTERNAL` error
+  (`payload` has explicit presence, §5). **L9** — a stale method index across
+  a different-build restart: index addressing removed outright, methods are
+  string-addressed, always (§13, entry 3).
+- **2026-07-11 audit round** (spec ↔ implementation ↔ tests): reliable-mode
+  rx overflow blocks instead of silently dropping (§4.2 — the exact-sequence
+  contract holds under a slow consumer); the s→c sid-collision hole across a
+  client restart is closed by the `peer_epoch` echo (§6.1, entry 6);
+  tombstone entry-cap eviction keeps dedup via the container floor (§9.2).
+- **2026-07-25 round**: rich status details travel (§5); gRPC's binary
+  metadata survives the wire (§11); a call may compress its messages
+  (§12.1); reliable mode gained per-stream flow control (§4.2.1), which
+  removed the head-of-line blocking a single blocking receiver used to
+  impose on every call sharing a channel — the residuals it introduced are
+  L10–L12.
+- **2026-09-05 round**: the connection window (§4.2.1, `Limits.MaxPeerWindow`
+  §15) bounds what one peer can pin, which was `MaxLiveCalls × window`, a
+  number no receiver chose — the residuals it introduced are L13–L16 (a
+  forged or reordered frame under a foreign server epoch, which used to draw
+  only a RESET, now re-locks the `Conn`: L15).
 
 ## Appendix B — Defaults
 

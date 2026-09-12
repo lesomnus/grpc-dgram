@@ -370,7 +370,7 @@ function decodeAny(data: Uint8Array): Any {
 // Metadata
 // ---------------------------------------------------------------------------
 //
-// `Metadata.Entry.values` is `repeated bytes` (wire v1.1): the per-key
+// `Metadata.Entry.values` is `repeated bytes` (2026-07-25 round): the per-key
 // transform between the TS representation and those octets lives in
 // metadata.ts ("-bin" = base64 here / raw octets there; anything else UTF-8).
 

@@ -231,7 +231,7 @@ describe('window-overrun fail-loud (§6.3)', () => {
 
 describe('reliable-mode delivery never drops (§4.2, §4.2.1)', () => {
   it('a stalled consumer paces its sender instead of blocking delivery; the exact sequence survives', async () => {
-    // Wire v1.1: the configured buffer of 2 is raised to the flow-control
+    // Since per-stream flow control: the configured buffer of 2 is raised to the flow-control
     // floor W_init, and the sender is paced by the advertised window instead
     // of by a blocking Handle — so delivery does NOT stall here, which is the
     // whole point of §4.2.1 (a blocked read loop would stall every other call
@@ -416,7 +416,7 @@ describe('off-shape frames (§7, §8)', () => {
 
 describe('metadata plumbing (§11)', () => {
   it('later header metadata never overwrites the latched first (first-wins)', async () => {
-    // A handler can no longer flush twice — wire v1.1 makes the second
+    // A handler can no longer flush twice — the 2026-07-25 round makes the second
     // sendHeader grpc-go's ErrIllegalHeaderWrite (pinned in compat.test.ts) —
     // so the two header-bearing frames are crafted directly here: whatever a
     // server puts on a later frame, the client keeps what it latched first

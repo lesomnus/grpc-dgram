@@ -4,7 +4,7 @@
 // boundary if needed, as with grpc-go's metadata.MD).
 //
 // Values travel as raw **bytes** on the wire (`Metadata.Entry.values` is
-// `repeated bytes`, wire v1.1): gRPC's binary metadata carries arbitrary
+// `repeated bytes`, 2026-07-25 round): gRPC's binary metadata carries arbitrary
 // octets, which a proto `string` cannot hold. Go keeps those octets in the
 // string of a metadata.MD value, so its conversion is a plain re-typing; a JS
 // string cannot hold arbitrary octets, so this port draws the boundary the

@@ -128,7 +128,7 @@ positive form, that `Count` delivers `1..N` with no gaps.
 
 ## Flow control
 
-This is the newest part of reliable mode (wire v1.1) and the least obvious.
+This is the newest part of reliable mode (the 2026-07-25 round) and the least obvious.
 It is HTTP/2's per-stream window, counted in **messages** rather than bytes,
 and it exists to remove one specific failure. A second window sits beside it
 — [the connection window](#the-connection-window), one per peer — and bounds
@@ -136,7 +136,7 @@ what a peer can pin across all of its calls at once.
 
 A reliable adapter delivers every call's frames from **one** read loop
 (§4.2), because that is what makes its blocking propagate into TCP/SCTP
-backpressure. Before v1.1 the only back-pressure a receiver had was to stall
+backpressure. Before flow control the only back-pressure a receiver had was to stall
 that loop. So:
 
 - **Before.** A client opens a 200-message server-streaming call and stops
@@ -150,7 +150,7 @@ that loop. So:
 
 `TestFlow_StalledConsumerDoesNotBlockOtherCalls` is exactly that scenario: a
 200-message stream nobody reads, then a unary `Once` on the same channel that
-must still return. Under the pre-v1.1 core that `Once` never returned.
+must still return. Under the core before flow control that `Once` never returned.
 
 ### The advertisement
 
@@ -199,7 +199,7 @@ When the advertisement arrives it is **authoritative**: it replaces the
 assumption and is counted against what the sender has already sent. A window
 smaller than the assumption fails nothing — it parks the sender until the
 receiver drains enough to grant. A window of **0** means "this peer does no
-flow control": the sender becomes unlimited, the pre-v1.1 behavior.
+flow control": the sender becomes unlimited, the behavior before flow control.
 
 ### Grants
 

@@ -21,7 +21,7 @@ todopb.RegisterTodoServiceServer(srv, impl)
 log.Fatal(gw.Serve(context.Background(), srv))
 ```
 
-The wire between them is dRPC v1.1 — the same bytes a WebSocket carries, one
+The wire between them is dRPC (`docs/PROTOCOL.md`) — the same bytes a WebSocket carries, one
 marshaled `Envelope` per posted message (§4.1). And the server is not a mock of
 the server: `todo/` implements `todopb.TodoServiceServer` with generated stubs,
 request validation, real statuses and a server-streaming method, and nothing in

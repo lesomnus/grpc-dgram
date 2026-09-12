@@ -1,7 +1,7 @@
 // Cross-language conformance: a TypeScript client drives a REAL Go
 // drpc.Server over UDP, proving the two implementations agree on the wire
 // format AND the behavior — method dispatch, the OPEN/CLOSE/seq/epoch state
-// machine, the proto codec, all four RPC shapes, and the wire v1.1 surfaces
+// machine, the proto codec, all four RPC shapes, and the 2026-07-25 surfaces
 // (binary metadata, status details, per-stream flow control, compression).
 // The TS client uses descriptors derived from the generated EchoService
 // (fromService); the Go server is conformance/udpserver, serving internal/echo
@@ -366,7 +366,7 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
   })
 
   // -------------------------------------------------------------------------
-  // wire v1.1
+  // the 2026-07-25 round
   // -------------------------------------------------------------------------
 
   it('binary metadata is RAW BYTES on the wire and base64 in the TS API (§11)', async () => {
@@ -449,7 +449,7 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
   })
 
   it('a unary SendHeader flushes an H frame before the response (§8, §11)', async () => {
-    // The v1.1 change: SendHeader now flushes at once even on a unary call, so
+    // The 2026-07-25 change: SendHeader now flushes at once even on a unary call, so
     // Header() returns while the handler is still working. The Go handler
     // flushes, then sits for 300 ms; it also asserts a SECOND SendHeader is
     // refused (grpc-go's ErrIllegalHeaderWrite) and fails the call if it is not.

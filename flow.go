@@ -31,7 +31,7 @@ import (
 //   - WINDOW frames (§7) then add credit as the receiving application consumes
 //     messages, batched at half the window;
 //   - an advertisement of 0 means the peer does no flow control: unlimited,
-//     which is the pre-v1.1 behavior and what unreliable mode always uses
+//     which is the behavior before flow control and what unreliable mode always uses
 //     (there a full buffer drops by policy, §4.2, and blocking never arises).
 //
 // The receiver's blocking enqueue stays as the safety net for the window in

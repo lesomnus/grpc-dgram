@@ -2,7 +2,7 @@
   "name": "@lesomnus/grpc-dgram",
   "type": "module",
   "version": "0.0.1",
-  "description": "gRPC over unreliable datagram channels \u2014 TypeScript port of gRPC-dgram (dRPC wire protocol v1.1)",
+  "description": "gRPC over unreliable datagram channels \u2014 TypeScript port of gRPC-dgram (the dRPC wire protocol, docs/PROTOCOL.md)",
   "license": "Apache-2.0",
   "author": "lesomnus",
   "homepage": "https://github.com/lesomnus/grpc-dgram/tree/main/ts",

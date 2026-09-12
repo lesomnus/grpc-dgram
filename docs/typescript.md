@@ -40,7 +40,7 @@ Two mechanisms, doing different jobs.
 as hex, and every vector is pinned byte for byte against what the Go
 implementation marshals (`metadata_internal_test.go` holds the same metadata
 vectors); both sides emit metadata entries in ascending key order (§11), so no
-marshal option is needed for the bytes to agree — including the v1.1 fields
+marshal option is needed for the bytes to agree — including the 2026-07-25 fields
 (`window`, `compressor`, `details`) and the awkward metadata cases: a `-bin`
 value containing `00 01 ff 80 7f`, a present-but-empty `Metadata`, a key with
 no values, a key with one empty value. If either side's encoder drifts, the
@@ -242,7 +242,7 @@ no retransmission to repair the reorder. Keep one flush in flight.
 
 One genuine environmental difference: a browser `RTCDataChannel` cannot pause
 delivery, so inbound messages queue in the adapter while a slow consumer
-drains. Since v1.1 the protocol paces the *sender* instead
+drains. Since per-stream flow control the protocol paces the *sender* instead
 ([reliable-mode.md](./reliable-mode.md)), so this no longer costs ordering or
 stalls other calls — it is only adapter memory.
 

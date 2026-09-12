@@ -10,7 +10,7 @@
 // that one runs over loopback UDP, where reliable mode has to be faked frame by
 // frame (drpc.NewReliableContext) because the channel is not actually reliable.
 // A message port IS reliable — it neither loses, duplicates nor reorders — so
-// the half of wire v1.1 that exists in reliable mode only (per-stream flow
+// the half of the 2026-07-25 surface that exists in reliable mode only (per-stream flow
 // control, PROTOCOL.md §4.2.1) is exercised across implementations here on a
 // channel that earns it, with neither side passing a mode option: the gateway
 // reports Reliable() and each core discovers it (§4.3).

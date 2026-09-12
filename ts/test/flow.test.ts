@@ -32,7 +32,7 @@ const isGrant = (f: Frame): boolean => shapeOf(f) === FlagWindow && f.seq === 0 
 
 // ---------------------------------------------------------------------------
 // §4.2 / §4.2.1: the head-of-line fix. A reliable adapter delivers every
-// call's frames from ONE loop, so before v1.1 a consumer that stopped reading
+// call's frames from ONE loop, so before per-stream flow control a consumer that stopped reading
 // blocked that loop and with it every other call on the channel. Now the
 // producer parks on credit instead, and the channel stays live.
 // ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ describe('head-of-line blocking (§4.2.1)', () => {
     expect(net.s2c.sent.filter(isData)).toHaveLength(W_INIT)
 
     // The shared delivery loop is therefore free, and a second call on the
-    // same channel completes. Under the pre-v1.1 core this never returned: the
+    // same channel completes. Under the core before flow control this never returned: the
     // pump was blocked handing frame 33 to the stalled call.
     expect(await net.conn.invoke(echo.once, { text: 'abc' })).toEqual({ text: 'echo:abc' })
 

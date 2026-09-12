@@ -2,7 +2,7 @@
 // into single-threaded async TypeScript. Synchronous code paths need no
 // locks — an await point is the only place interleaving can happen.
 //
-// It also holds the two pieces of wire v1.1 both endpoints share, so the
+// It also holds the two pieces of the 2026-07-25 round both endpoints share, so the
 // client and the server cannot drift apart on them: flow control — the
 // per-stream window and, beside it, the per-peer connection window
 // (PROTOCOL.md §4.2.1, Go's flow.go) — and message compression with the

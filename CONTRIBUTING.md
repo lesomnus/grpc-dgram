@@ -24,7 +24,7 @@ Nothing about that restricts what you may do with what is here. It is Apache
 
 - what you did, what you expected, and what happened
 - the smallest exchange that shows it, and which transport it ran over
-- versions — this module and Go
+- the commit of this module you built against (there are no releases yet), and the Go version
 
 A good report is worth more than a patch, and it is the harder half to come by.
 If you have worked out why something breaks, say why in prose -- that is an

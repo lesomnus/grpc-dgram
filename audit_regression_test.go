@@ -65,7 +65,7 @@ func TestReliableRxOverflowBlocks(t *testing.T) {
 // code, with nothing draining, deterministically dropped 98 of the 100 frames
 // here.
 //
-// Since v1.1 the back-pressure lands on the SENDER instead of the receiver's
+// Since per-stream flow control the back-pressure lands on the SENDER instead of the receiver's
 // Handle (§4.2 flow control): the client parks in Send once it has used the
 // window the creation ack advertised, which is why the burst runs in its own
 // goroutine here. The exact-sequence guarantee is what both versions pin.

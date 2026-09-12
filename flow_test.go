@@ -101,7 +101,7 @@ func (e *flowEvents) count(k drpc.ProtocolEventKind) int {
 
 // ---------------------------------------------------------------------------
 // §4.2 / §4.2.1: the head-of-line fix. A reliable adapter delivers every
-// call's frames from ONE loop, so before v1.1 a consumer that stopped reading
+// call's frames from ONE loop, so before per-stream flow control a consumer that stopped reading
 // blocked that loop and with it every other call on the channel. Now the
 // producer parks on credit instead, and the channel stays live.
 // ---------------------------------------------------------------------------
@@ -132,7 +132,7 @@ func TestFlow_StalledConsumerDoesNotBlockOtherCalls(t *testing.T) {
 			"the producer must park on credit, not the receiver on its buffer")
 
 		// The shared delivery goroutine is therefore free, and a second call
-		// on the same channel completes. Under the pre-v1.1 core this Once
+		// on the same channel completes. Under the core before flow control this Once
 		// never returned: the pump was blocked handing frame 33 to the stalled
 		// call.
 		res, err := client.Once(t.Context(), echo.EchoRequest_builder{

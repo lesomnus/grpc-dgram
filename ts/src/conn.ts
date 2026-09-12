@@ -88,7 +88,7 @@ export interface FlowTiming extends Timing {
   stallMs?: number
 }
 
-// CallConfig is CallOptions plus the wire v1.1 per-call knobs. They live here
+// CallConfig is CallOptions plus the per-call knobs of the 2026-07-25 round. They live here
 // for the same reason as FlowTiming — desc.ts is shared and unchanged — and
 // mirror grpc-go's UseCompressor / MaxCallRecvMsgSize / MaxCallSendMsgSize
 // call options (§12.1, §16).

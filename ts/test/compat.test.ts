@@ -1,4 +1,4 @@
-// The gRPC-fidelity surface of wire v1.1 (PROTOCOL.md §5, §11, §16) — the TS
+// The gRPC-fidelity surface (PROTOCOL.md §5, §11, §16; the 2026-07-25 round) — the TS
 // twin of the Go compat_test.go / header_md_test.go coverage:
 //
 //   - the per-call size caps (MaxCallRecvMsgSize / MaxCallSendMsgSize), on
@@ -186,7 +186,7 @@ describe('binary metadata (§11, §5)', () => {
 
     // ...and they were RAW BYTES on the wire: no base64, no UTF-8 coercion.
     // This is exactly what a proto string field could not hold, and why the
-    // v1.1 wire made metadata values `bytes`.
+    // 2026-07-25 round made metadata values `bytes`.
     const wire = encodeFrame(net.sentC2S.find(isOpen)!)
     expect(indexOfBytes(wire, raw)).toBeGreaterThanOrEqual(0)
     expect(indexOfBytes(wire, new TextEncoder().encode(b64))).toBe(-1)

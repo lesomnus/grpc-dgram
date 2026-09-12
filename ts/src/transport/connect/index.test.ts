@@ -103,7 +103,7 @@ describe('Connect client over drpc', () => {
   })
 
   it('binary metadata reaches the Connect client without crashing the call', async () => {
-    // Since wire v1.1 a handler cannot even set metadata gRPC would reject
+    // Since the 2026-07-25 round a handler cannot even set metadata gRPC would reject
     // (§11 validation), so the old hazard — arbitrary strings meeting
     // Headers.append — can now only arrive as BINARY metadata, whose base64
     // is header-safe, or from a non-conforming peer. Both must deliver the

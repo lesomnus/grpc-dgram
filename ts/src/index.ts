@@ -1,5 +1,5 @@
 // grpc-dgram TypeScript port: gRPC-style RPC over unreliable datagram
-// channels, implementing the drpc wire protocol v1.1 (PROTOCOL.md). Each
+// channels, implementing the drpc wire protocol (PROTOCOL.md). Each
 // transport adapter lives in its own './transport/*' entry.
 
 export {

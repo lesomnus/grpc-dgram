@@ -91,7 +91,7 @@ describe('golden bytes (§5)', () => {
     expect(g.header).toBeUndefined()
     expect(g.trailer).toBeUndefined()
     expect(g.peerEpoch).toBe(0x0a0b0c0d)
-    // v1.1 fields at their defaults on a v1.0 vector.
+    // later fields at their defaults on the original vector.
     expect(g.window).toBe(0)
     expect(g.compressor).toBe('')
     expect(g.details).toBeUndefined()
@@ -120,13 +120,13 @@ describe('golden bytes (§5)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// wire v1.1 — the fields and metadata encoding added on top of v1.0. Every
+// the 2026-07-25 round — the fields and metadata encoding it added. Every
 // vector below was produced by google.golang.org/protobuf marshaling the same
 // message against the Go core (which emits metadata entries in ascending key
 // order, as this codec does), so the two implementations are pinned byte-for-byte.
 // ---------------------------------------------------------------------------
 
-describe('golden bytes — wire v1.1 (§5)', () => {
+describe('golden bytes — the 2026-07-25 fields (§5)', () => {
   it('a "-bin" metadata value carries raw octets (0x00/0xff), base64 in the TS API', () => {
     // Metadata{entries:[{key:"x-bin", values:[00 01 ff 80 7f]}]} on Frame{epoch:1}:
     // 62 10 | 0a 0e | 0a 05 "x-bin" | 12 05 00 01 ff 80 7f.
@@ -244,7 +244,7 @@ describe('golden bytes — wire v1.1 (§5)', () => {
     expect(hasUnknownFlags(g)).toBe(false)
   })
 
-  it('every v1.1 field at once, in field-number order', () => {
+  it('every 2026-07-25 field at once, in field-number order', () => {
     const want =
       '0d0403020115050000001d060000002010788020820104677a69708a011c0a17747970652e676f6f676c65617069732e636f6d2f612e421201aa'
     const f = frame({
@@ -564,7 +564,7 @@ describe('robustness', () => {
     expect(g.seq).toBe(3)
   })
 
-  it('a v1.1 field arriving with the wrong wire type is skipped, not fatal', () => {
+  it('a later field arriving with the wrong wire type is skipped, not fatal', () => {
     // window (15) as a length-delimited value, compressor (16) as a varint.
     const joined = new Uint8Array([...encodeFrame(frame({ epoch: 1 })), 0x7a, 0x01, 0x09, 0x80, 0x01, 0x07])
     const g = decodeFrame(joined)

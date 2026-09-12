@@ -827,8 +827,8 @@ func TestCompat_SendHeaderTwice(t *testing.T) {
 	})
 }
 
-// TestCompat_UnarySendHeaderReleasesHeaderEarly pins PROTOCOL.md §11's v1.1
-// rule: on a unary call SendHeader flushes an H at once, so a client blocked
+// TestCompat_UnarySendHeaderReleasesHeaderEarly pins PROTOCOL.md §11's
+// rule (2026-07-25): on a unary call SendHeader flushes an H at once, so a client blocked
 // in Header() is released BEFORE the response exists — gRPC's behavior, which
 // its separate HEADERS frame gives for free. The handler here is still parked
 // when Header() returns, so nothing but the flush could have released it.
@@ -915,7 +915,7 @@ func TestCompat_HeaderOnCallerCancel(t *testing.T) {
 // TestCompat_BinaryMetadata pins PROTOCOL.md §11 and §5: metadata values are
 // bytes on the wire, so a "-bin" key carries arbitrary octets — NUL bytes and
 // invalid UTF-8 included — verbatim, in both directions. This is exactly what
-// a proto string field could not hold, and why the v1.1 wire uses bytes.
+// a proto string field could not hold, and why the wire uses bytes.
 func TestCompat_BinaryMetadata(t *testing.T) {
 	client, stop := PipeOption{}.Use(t)
 	defer stop()

@@ -114,7 +114,7 @@ datagram carries one address, so that boundary is a duty above, not a choice.
 cost 1 ms, 7 ms and 28 ms. How much age a reading can take is the operator's
 number.
 
-**Interaction with flow control (new in v1.1)** — *dissolves*. Credit is
+**Interaction with flow control (2026-07-25 round)** — *dissolves*. Credit is
 accounted in messages (§4.2.1) and the core takes it on the way *into* the tx
 path, before the frame it will send exists (`stream.go`: `acquire2` runs ahead
 of the frame build, and refunds it if the call ends before the wire). Every
@@ -128,12 +128,13 @@ without one — a count-only flush, and §4.1 allows it — the peer stays parke
 until `T_stall` and its call fails `UNAVAILABLE`. Hence the duty above: flush
 uncredited control frames immediately.
 
-**Interaction with compression (new in v1.1)** — *stays ours*, if we ever want
+**Interaction with compression (2026-07-25 round)** — *stays ours*, if we ever want
 it. Per-frame compression belongs to the core and `COMPRESSED` is a frame flag
 (§12.1), so a batcher below the core only ever packs frames whose compression
 is already decided, and must pack them unchanged. Per-batch compression would
-need an envelope-level flag to carry the marker — a wire change, and one that is
-cheap only before the freeze (item 2).
+need an envelope-level flag to carry the marker — a wire change, cheap while no
+implementation outside this repository exists and a real cost once one does
+(item 2).
 
 **TypeScript has the same seam**, in the shape the language makes natural.
 Discovery there is structural — `hasConnAttacher` is a `typeof
@@ -176,10 +177,13 @@ chaining each on the last.
   real version, and re-tag the adapters.
 - **TypeScript packaging** — done (`@lesomnus/grpc-dgram` 0.0.1, Apache-2.0,
   `publishConfig.access: public`). Still open: the versioning relationship to
-  the Go modules (they share a wire version, not a release cadence).
-- **Wire freeze.** PROTOCOL.md is v1.1 and still pre-release, which is what
-  makes breaking wire changes cheap. A release fixes that; anything the wire
-  should carry natively (see below) is cheaper to add before it.
+  the Go modules (they share a wire text, not a release cadence).
+- **Wire freeze.** PROTOCOL.md is unversioned and untagged: no independent
+  implementation exists outside this repository, which is what makes breaking
+  wire changes cheap.
+  The first tag changes that — from then on independent implementations must
+  agree on the text as it stands — so anything the wire should carry natively
+  (see below) is cheaper to add before it.
 
 ## 3. TypeScript parity, if and when it is wanted
 
@@ -196,7 +200,7 @@ port: `W_CONN`, `FlowSender.observe`, `acquireBoth`, `PeerFlowRx`,
 `maxPeerWindow` and the two `peer-flow-*` event kinds mirror `flow.go`, and
 both cross-language suites move more than `W_conn` messages each way across
 three streams with the `sid = 0` grants asserted in both directions — so the
-Direction A failure Appendix A entry 11 describes no longer has a peer in
+partial-implementation hazard Appendix A entry 11 describes has no peer in
 this repo to happen against, and issue #4 is complete on both sides.
 
 ## 4. Smaller, unowned

@@ -4,9 +4,9 @@ Read this before continuing the port.
 
 ## TL;DR
 
-The TypeScript port of dRPC **v1.1** (`../docs/PROTOCOL.md`) is **functionally
+The TypeScript port of dRPC (`../docs/PROTOCOL.md`) is **functionally
 complete, green, and adversarially audited**. Cross-language interop with the
-Go server is verified at runtime over UDP — including the v1.1 surface, where
+Go server is verified at runtime over UDP — including the gRPC-fidelity surface, where
 a Go/TS split would be silent: binary metadata, status details and the
 flow-control advertisements are asserted against exact bytes, not mirrored
 shapes. Nothing is outstanding: the last gap, an
@@ -14,7 +14,7 @@ envelope-level send for an application's own batcher to call, closed with
 `sendFrames` on every exported adapter class (`../docs/TODO.md` §1 — the
 batching policy is the workload's, and neither language ships a batcher).
 
-**v1.1 round (2026-07-25)** — mirrored from the Go core: metadata values are
+**2026-07-25 round** — mirrored from the Go core: metadata values are
 bytes on the wire (`-bin` keys hold base64 in the TS API), `Frame.window` /
 `WINDOW` per-stream flow control, `Frame.compressor` / `COMPRESSED`
 per-message compression via `CompressionStream`, `Frame.details` status
@@ -28,7 +28,7 @@ server compiled to `js/wasm` serve the page it runs in
 empty message is the goodbye) and a second cross-language proof,
 `test/wasm.test.ts`, this one on a channel that is *actually* reliable.
 
-**Connection-window round (2026-09-11; advertised since 2026-09-12)** — the
+**Connection-window round** (the spec's 2026-09-05 round; mirrored 2026-09-11, the advertisement 2026-09-12) — the
 mirror of Go's `flow.go` for the per-peer **connection window** (§4.2.1, PR
 #12's Go core and spec; issue #4 part 2, issue #20 for the advertisement): a
 reliable-mode data frame needs one credit from its stream window *and* one
@@ -244,7 +244,7 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
    vitest process with the toolchain's own `wasm_exec.js`, and served over a
    `MessageChannel` — so the channel between the two implementations really is
    reliable instead of being annotated as such per frame, which is all loopback
-   UDP could offer. That buys the part of v1.1 that exists in reliable mode
+   UDP could offer. That buys the part of the 2026-07-25 round that exists in reliable mode
    only: mode discovered from the transport with zero options on either side,
    the §4.2.1 windows advertised — the stream window on the OPEN and the
    creation ack, the connection window on the OPEN and on every H and T —

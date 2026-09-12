@@ -91,7 +91,7 @@ missing at the client rather than mangled.
 
 ### Binary keys carry arbitrary octets
 
-Wire v1.1 made metadata values `bytes` precisely so gRPC's binary metadata
+The 2026-07-25 round made metadata values `bytes` precisely so gRPC's binary metadata
 survives: a proto `string` cannot hold a NUL or an invalid UTF-8 sequence, and
 base64-ing everything would have changed what the peer receives. A `-bin` key
 therefore travels verbatim.

@@ -18,7 +18,7 @@ import (
 
 // These tests pin the server-header metadata rules of PROTOCOL.md §11 against
 // the wire shapes of §8: the SendHeader immediate-H flush (on streaming calls
-// and, since v1.1, on unary ones too — gRPC parity, so Header() returns before
+// and, since the 2026-07-25 round, on unary ones too — gRPC parity, so Header() returns before
 // the response), the SetHeader defer-to-next-frame path, the T header re-carry
 // that survives first-frame loss (§10.3 recovers the call, T recovers the
 // header), and the first-wins latch shared with trailers (§7).
