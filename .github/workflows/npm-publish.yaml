@@ -4,7 +4,11 @@ name: npm publish
 # exchange — so no token lives in this repository. Three things make it work:
 #   - npmjs.com lists this workflow as the package's trusted publisher
 #     (package settings → Trusted Publisher → GitHub Actions: owner lesomnus,
-#     repository grpc-dgram, workflow filename npm-publish.yaml, no environment);
+#     repository grpc-dgram, workflow filename npm-publish.yaml, no environment,
+#     and — the trap — "Allowed actions" with `npm publish` ticked: a
+#     configuration made after 2026-09-03 allows only `npm stage publish` by
+#     default, and then the token exchange succeeds while the PUT fails with
+#     `403 OIDC permission denied for this action`);
 #   - the job has `id-token: write`, and its npm is ≥ 11.5.1 on Node ≥ 22;
 #   - the tag names the version in ts/package.json (ts-v0.1.0 ↔ 0.1.0), so a
 #     publish is always of the commit the tag pins, with provenance attached
