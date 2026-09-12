@@ -272,7 +272,12 @@ from the stream window.
   incarnation on the first sequenced frame it hears from it, for a live call
   or for one it has already released, and takes the advertisement from that
   frame when it is an `H` or `T`: a call cancelled before its ack arrived
-  still teaches the `Conn` the server's window. And because the
+  still teaches the `Conn` the server's window, and a call RESET before any
+  lock hands back the connection credit its frames spent — on an ordered
+  channel only a stopping server can RESET before it has locked the `Conn`,
+  and what its ledger still returns credits an incarnation the `Conn` starts
+  over from (`TestPeerWindow_ResetBeforeFirstLockRefundsConnectionCredit`).
+  And because the
   ledger is per peer while grants are per incarnation, what it holds back is
   held back per incarnation too: a restarted client's returned credit never
   rides in a grant addressed to its dead predecessor

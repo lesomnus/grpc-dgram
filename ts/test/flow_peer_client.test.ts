@@ -36,7 +36,7 @@ import type { FrameHandler } from '../src/seam'
 import { Counters, type ProtocolEvent, type ProtocolEventKind, type ProtocolStats } from '../src/stats'
 import { Code, MessageTooLargeError, type StatusError } from '../src/status'
 import { W_CONN, W_INIT } from '../src/util'
-import { FlagClose, FlagWindow, frame, isData, isOpen, isReset, isTerminal, shapeOf, type Frame } from '../src/wire'
+import { FlagClose, FlagReset, FlagWindow, frame, isData, isOpen, isReset, isTerminal, shapeOf, type Frame } from '../src/wire'
 import { echo, tick, wireClone, type TestReq, type TestRes } from '../src/testing'
 
 const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v))
@@ -985,5 +985,75 @@ describe('peer-flow-stall / peer-flow-resume (§14)', () => {
     expect(counters.snapshot()).toMatchObject({ peerFlowStall: 1, peerFlowResume: 1, flowStall: 0, flowResume: 0 })
     expect(log.first('peer-flow-resume')).toMatchObject({ sid: extra.sid, method: echo.count.path })
     conn.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// §4.2.1 Sending: a call that ends by RESET before its Conn has locked to any
+// server incarnation takes back the connection credit its data frames spent —
+// no container can exist for the epoch before a lock, so nothing else ever
+// returns it — and a call RESET after the lock takes back nothing, since that
+// credit is the server's ledger's to return.
+// ---------------------------------------------------------------------------
+
+describe('a call RESET before the first lock refunds its connection credit (§4.2.1 Sending)', () => {
+  const window = 4 * W_CONN
+  const streams = 8
+  const per = 32 // 256 frames on the W_CONN assumption, W_INIT each
+
+  // resetFor builds the RESET a server sends for one of this client's calls:
+  // it echoes the client's epoch and names the sid (§9.3).
+  const resetFor = (srv: PeerSrv, sid: number) => frame({ epoch: srv.clientEpoch, sid, flags: FlagReset })
+
+  // spend sends n messages on a fresh call and returns the call's sid.
+  async function spend(srv: PeerSrv, conn: Conn, n: number): Promise<number> {
+    const s = conn.newStream(echo.count, {})
+    await sendN(s, n)
+    return srv.lastOpen()
+  }
+  // parksAfter asserts that exactly n more messages go out unparked and the
+  // next one parks on the connection window.
+  async function parksAfter(conn: Conn, counters: Counters, n: number): Promise<void> {
+    const s = conn.newStream(echo.count, {})
+    await sendN(s, n)
+    expect(counters.snapshot().peerFlowStall).toBe(0)
+    const p = park(s)
+    await tick()
+    expect(counters.snapshot().peerFlowStall).toBe(1)
+    conn.close() // releases the parked send
+    await p.done
+  }
+
+  it('before the lock: refunded, so the advertisement is worth its full amount', async () => {
+    const { srv, conn, counters } = clientFixture(SRV_A, window, {}, window)
+    // A stopping server: every OPEN and every data frame behind it draws a
+    // RESET, and no container is ever created for this epoch.
+    srv.muted = true
+    const sids: number[] = []
+    for (let i = 0; i < streams; i++) sids.push(await spend(srv, conn, per))
+    expect(srv.tx.filter(isData)).toHaveLength(streams * per)
+    for (const sid of sids) await conn.handle(resetFor(srv, sid), {})
+    await tick()
+    srv.muted = false
+    // The next call's H advertises `window`; with the RESET calls' credit
+    // back, exactly `window` frames go out before the park.
+    await parksAfter(conn, counters, window)
+  })
+
+  it("after the lock: not refunded — that credit is the server's ledger's to return", async () => {
+    const { srv, conn, counters } = clientFixture(SRV_A, window, {}, window)
+    // Locked by a call the server answered: its H advertises `window`.
+    conn.newStream(echo.count, {})
+    await tick()
+    // A call the server RESETs after `per` data frames. A real server holds
+    // a container for this epoch by now and returns that credit through its
+    // ledger (a sid-0 grant); the fake returns nothing, which is what makes
+    // the absence of a client-side refund visible.
+    srv.muted = true
+    const sid = await spend(srv, conn, per)
+    await conn.handle(resetFor(srv, sid), {})
+    await tick()
+    srv.muted = false
+    await parksAfter(conn, counters, window - per)
   })
 })

@@ -368,9 +368,32 @@ export class FlowSender {
   // on the connection window, shared by every call to the peer and cumulative
   // for the incarnation's life, each such leak is a permanent shrink
   // (§4.2.1).
-  undo(): void {
-    if (this.sent > 0) this.sent--
+  undo(): boolean {
+    return this.refund(1) === 1
+  }
+
+  // refund returns up to n messages of credit — sent is floored at zero — and
+  // wakes parked senders; it reports how many it returned. undo is the
+  // one-frame case. The many-frame case is a call RESET before its Conn
+  // locked to any server incarnation: drain on the stream's sender, then
+  // refund the same amount here on the connection's (§4.2.1 Sending).
+  refund(n: number): number {
+    const r = Math.min(n, this.sent)
+    this.sent -= r
     wake(this.waiters)
+    return r
+  }
+
+  // drain takes back every credit this sender holds and reports how many. It
+  // exists for one caller: a call that ends by RESET before its Conn has
+  // locked to any server incarnation refunds the connection credit its data
+  // frames took, in one go (§4.2.1 Sending). Afterwards undo reports false,
+  // so an in-flight send that ends up refunding its own frame does not
+  // return the connection half a second time.
+  drain(): number {
+    const n = this.sent
+    this.sent = 0
+    return n
   }
 
   // release wakes every parked sender; the call is over.

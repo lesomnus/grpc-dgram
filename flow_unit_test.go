@@ -980,3 +980,49 @@ func TestPeerFlowRx_StashHoldsAnEvictedSender(t *testing.T) {
 		t.Fatalf("cap 0: pending = %d, want 0", got)
 	}
 }
+
+// A RESET before the Conn's first lock drains the stream's sender and refunds
+// the connection's by the same amount (§4.2.1 Sending). Two things make that
+// exact under a racing send: tryAcquire2 takes the pair under the stream's
+// lock, so a drain sees both halves taken or neither; and undo reports
+// whether the stream still held the credit, so a send that refunds its own
+// frame after the drain does not return the connection half again.
+func TestFlowSender_DrainAndTheTwoCreditTake(t *testing.T) {
+	var stream, conn flowSender
+	stream.assume(32)
+	conn.assume(1024)
+	for i := 0; i < 5; i++ {
+		if _, ok, peer := stream.tryAcquire2(&conn); !ok || peer {
+			t.Fatalf("take %d: ok=%v peer=%v, want both credits", i, ok, peer)
+		}
+	}
+	if got := conn.state().sent; got != 5 {
+		t.Fatalf("connection sent = %d, want 5", got)
+	}
+	if n := stream.drain(); n != 5 {
+		t.Fatalf("drain = %d, want 5", n)
+	}
+	if n := conn.refund(5); n != 5 || conn.state().sent != 0 {
+		t.Fatalf("refund = %d, connection sent = %d; want 5 and 0", n, conn.state().sent)
+	}
+	if stream.undo() {
+		t.Fatal("undo after a drain must report nothing to return")
+	}
+	if conn.refund(3) != 0 || conn.state().sent != 0 {
+		t.Fatal("refund floors at zero")
+	}
+
+	// A connection shortfall puts the stream credit back inside the take.
+	var short flowSender
+	short.assume(1)
+	if _, ok := short.tryAcquire(); !ok {
+		t.Fatal("the one credit")
+	}
+	w, ok, peer := stream.tryAcquire2(&short)
+	if ok || !peer || w == nil {
+		t.Fatalf("ok=%v peer=%v w=%v, want a park on the connection window", ok, peer, w != nil)
+	}
+	if got := stream.state().sent; got != 0 {
+		t.Fatalf("stream sent = %d after a connection shortfall, want 0", got)
+	}
+}

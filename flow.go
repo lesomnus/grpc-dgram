@@ -166,17 +166,40 @@ func (f *flowSender) grant(n uint32) {
 // ignores such errors leaks its whole window and parks forever — and on the
 // connection window, shared by every call to the peer and cumulative for the
 // incarnation's life, each such leak is a permanent shrink (§4.2.1).
-func (f *flowSender) undo() {
+func (f *flowSender) undo() bool { return f.refund(1) == 1 }
+
+// refund returns up to n messages of credit — sent is floored at zero — and
+// wakes parked senders; it reports how many it returned. undo is the
+// one-frame case. The many-frame case is a call RESET before its Conn locked
+// to any server incarnation: drain on the stream's sender, then refund the
+// same amount here on the connection's (§4.2.1 Sending).
+func (f *flowSender) refund(n int64) int64 {
 	f.mu.Lock()
-	if f.sent > 0 {
-		f.sent--
+	if n > f.sent {
+		n = f.sent
 	}
+	f.sent -= n
 	w := f.waiters
 	f.waiters = nil
 	f.mu.Unlock()
 	if w != nil {
 		close(w)
 	}
+	return n
+}
+
+// drain takes back every credit this sender holds and reports how many. It
+// exists for one caller: a call that ends by RESET before its Conn has locked
+// to any server incarnation refunds the connection credit its data frames
+// took, in one go (§4.2.1 Sending). Afterwards undo reports false, so an
+// in-flight send that ends up refunding its own frame does not return the
+// connection half a second time.
+func (f *flowSender) drain() int64 {
+	f.mu.Lock()
+	n := f.sent
+	f.sent = 0
+	f.mu.Unlock()
+	return n
 }
 
 // saturateAdd keeps the credit accumulator from wrapping on a hostile or
@@ -238,6 +261,10 @@ func (f *flowSender) acquire(ctx context.Context, done <-chan struct{}, stall ti
 func (f *flowSender) tryAcquire() (wait <-chan struct{}, ok bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.tryAcquireLocked()
+}
+
+func (f *flowSender) tryAcquireLocked() (wait <-chan struct{}, ok bool) {
 	if !f.on || f.sent < f.granted {
 		f.sent++
 		return nil, true
@@ -246,6 +273,33 @@ func (f *flowSender) tryAcquire() (wait <-chan struct{}, ok bool) {
 		f.waiters = make(chan struct{})
 	}
 	return f.waiters, false
+}
+
+// tryAcquire2 takes one credit from this sender — the stream's — and, when
+// conn is not nil, one from conn: both or neither, without letting go of the
+// stream's lock in between. A drain (a RESET before the Conn's first lock,
+// clientStream.finishReset) that landed between the two takes would count a
+// stream credit whose connection twin was never taken, and refund one credit
+// too many. The mutexes nest stream → conn here and nowhere the other way
+// round, so the nesting cannot deadlock. On a stream shortfall the stream's
+// channel comes back; on a connection shortfall the stream credit is already
+// put back, the connection's channel comes back and peer is true.
+func (f *flowSender) tryAcquire2(conn *flowSender) (wait <-chan struct{}, ok, peer bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w, ok := f.tryAcquireLocked()
+	if !ok || conn == nil {
+		return w, ok, false
+	}
+	if cw, cok := conn.tryAcquire(); !cok {
+		f.sent-- // the stream credit goes back before the park (acquire2)
+		if w := f.waiters; w != nil {
+			f.waiters = nil
+			close(w) // a returned credit wakes the parked, as undo would
+		}
+		return cw, false, true
+	}
+	return nil, true, false
 }
 
 // empty reports, taking nothing, whether a send would park here right now:
@@ -263,11 +317,12 @@ func (f *flowSender) empty() bool {
 // A nil conn means no connection window (unreliable mode).
 //
 // Stream credit is taken first; if the connection is then short the stream
-// credit is refunded (undo) before parking. The order is load-bearing:
-// connection-first would let streams parked on their own window hoard the
-// shared budget until every stream parks — a mutual T_stall. Never holding
-// one credit while parked on the other is what keeps a stuck stream from
-// starving the healthy ones, and the two mutexes are never nested.
+// credit is put back before parking — both under the stream's lock
+// (tryAcquire2), the one place the two mutexes nest. The order is
+// load-bearing: connection-first would let streams parked on their own
+// window hoard the shared budget until every stream parks — a mutual
+// T_stall. Never holding one credit while parked on the other is what keeps
+// a stuck stream from starving the healthy ones.
 //
 // A call that has already ended spends nothing: once both credits are taken
 // the fast path re-checks done and refunds both, so a dead call cannot spend
@@ -293,21 +348,15 @@ func acquire2(stream, conn *flowSender, ctx context.Context, done <-chan struct{
 	}()
 	stalled := false
 	for {
-		w, ok := stream.tryAcquire()
-		peer := false
-		if ok && conn != nil {
-			if cw, cok := conn.tryAcquire(); !cok {
-				stream.undo()
-				w, ok, peer = cw, false, true
-			}
-		}
+		w, ok, peer := stream.tryAcquire2(conn)
 		if ok {
 			select {
 			case <-done:
 				// Ended between the caller's own check and here: nothing
-				// will be sent, so nothing may stay spent.
-				stream.undo()
-				if conn != nil {
+				// will be sent, so nothing may stay spent — both halves or
+				// neither: if a drain (finishReset) already took the stream
+				// credit back, the connection half went with it.
+				if stream.undo() && conn != nil {
 					conn.undo()
 				}
 				return errCallEnded

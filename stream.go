@@ -444,8 +444,10 @@ func (s *clientStream) unpin() bool {
 // undoCredit refunds the credit a data frame took from both windows: it
 // never reached the wire (§4.2.1, §4.4).
 func (s *clientStream) undoCredit() {
-	s.flowTx.undo()
-	if s.conn.mode.reliable {
+	// Both halves or neither: once a RESET before the Conn's first lock has
+	// drained the stream's credit (finishReset), the connection half is
+	// already back, and a late undo must not return it twice.
+	if s.flowTx.undo() && s.conn.mode.reliable {
 		s.conn.connTx.undo()
 	}
 }
@@ -1089,6 +1091,18 @@ func (s *clientStream) finishReset() {
 	}
 	s.sendAbort(codes.Canceled)
 	s.finishLocal(status.Error(codes.Unavailable, "call reset by peer"))
+	// Before the Conn has locked to any server incarnation, a RESET can only
+	// come from a server holding no state for this call and admitting
+	// nothing more from this Conn — a stopping one (§9.4): a live server
+	// answers an OPEN with an H or a T before it could RESET anything behind
+	// it, and that frame locks. So nothing that could be overrun will ever
+	// return the connection credit this call's data frames took: take it
+	// back here, after the call is over and no send can add to the count
+	// (§4.2.1 Sending). Once locked, a RESET-drawn frame's credit is the
+	// server's to return (§4.2.1 The receiver's ledger): refund nothing.
+	if s.conn.mode.reliable && !s.conn.locked() {
+		s.conn.connTx.refund(s.flowTx.drain())
+	}
 }
 
 func (s *clientStream) release() {

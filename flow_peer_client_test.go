@@ -924,3 +924,100 @@ func TestPeerWindow_AdvertisementLandsOnAReleasedCall(t *testing.T) {
 		})
 	})
 }
+
+// resetFrom builds the RESET a server sends for one of this client's calls:
+// it echoes the client's epoch and names the sid (§9.3).
+func resetFrom(p *peerSrv, sid uint32) *drpc.Frame {
+	f := &drpc.Frame{}
+	f.SetEpoch(p.client())
+	f.SetSid(sid)
+	f.SetFlags(drpc.FlagReset)
+	return f
+}
+
+// Pins §4.2.1 Sending: a call that ends by RESET before its Conn has locked
+// to any server incarnation takes back the connection credit its data frames
+// spent — no container can exist for the epoch before a lock, so nothing else
+// ever returns it — and a call RESET after the lock takes back nothing, since
+// that credit is the server's ledger's to return.
+func TestPeerWindow_ResetBeforeFirstLockRefundsConnectionCredit(t *testing.T) {
+	const window = 4 * wConnTest
+	const streams, per = 8, 32 // 256 frames on the W_conn assumption, W_init each
+	msg := echo.EchoRequest_builder{Message: "m"}.Build()
+
+	// spend sends n messages on a fresh call and returns the call's sid.
+	spend := func(t *testing.T, srv *peerSrv, client echo.EchoServiceClient, n int) uint32 {
+		t.Helper()
+		s, err := client.Buff(t.Context())
+		x.NoError(t, err)
+		sendN(t, s, n)
+		return srv.lastOpen()
+	}
+	// parksAfter asserts that exactly n more messages go out unparked and the
+	// next one parks on the connection window.
+	parksAfter := func(t *testing.T, conn *drpc.Conn, client echo.EchoServiceClient, events *flowEvents, n int) {
+		t.Helper()
+		s, err := client.Buff(t.Context())
+		x.NoError(t, err)
+		sendN(t, s, n)
+		x.Equal(t, 0, events.count(drpc.EventPeerFlowStall))
+		done := make(chan error, 1)
+		go func() { done <- s.Send(msg) }()
+		synctest.Wait()
+		x.Equal(t, 1, events.count(drpc.EventPeerFlowStall))
+		conn.Close(nil) // releases the parked send
+		<-done
+	}
+
+	t.Run("before the lock: refunded, so the advertisement is worth its full amount", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			events := &flowEvents{}
+			srv, conn, client := clientFixture(t, srvEpochA, window, events)
+			defer conn.Close(nil)
+			srv.advertise(window)
+
+			// A stopping server: every OPEN and every data frame behind it
+			// draws a RESET, and no container is ever created for this epoch.
+			srv.mute(true)
+			sids := make([]uint32, 0, streams)
+			for i := 0; i < streams; i++ {
+				sids = append(sids, spend(t, srv, client, per))
+			}
+			x.Equal(t, streams*per, countMatch(srv.txFrames(), isDataFrame))
+			for _, sid := range sids {
+				x.NoError(t, conn.Handle(context.Background(), resetFrom(srv, sid)))
+			}
+			synctest.Wait()
+			srv.mute(false)
+
+			// The next call's H advertises `window`; with the RESET calls'
+			// credit back, exactly `window` frames go out before the park.
+			parksAfter(t, conn, client, events, int(window))
+		})
+	})
+	t.Run("after the lock: not refunded — that credit is the server's ledger's to return", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			events := &flowEvents{}
+			srv, conn, client := clientFixture(t, srvEpochA, window, events)
+			defer conn.Close(nil)
+			srv.advertise(window)
+
+			// Locked by a call the server answered: its H advertises `window`.
+			_, err := client.Buff(t.Context())
+			x.NoError(t, err)
+			synctest.Wait()
+
+			// A call the server RESETs after `per` data frames. A real server
+			// holds a container for this epoch by now and returns that credit
+			// through its ledger (a sid-0 grant); the fake returns nothing,
+			// which is what makes the absence of a client-side refund visible.
+			srv.mute(true)
+			sid := spend(t, srv, client, per)
+			x.NoError(t, conn.Handle(context.Background(), resetFrom(srv, sid)))
+			synctest.Wait()
+			srv.mute(false)
+
+			parksAfter(t, conn, client, events, int(window)-per)
+		})
+	})
+}

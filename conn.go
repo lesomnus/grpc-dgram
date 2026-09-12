@@ -303,6 +303,14 @@ func (c *Conn) observeAdvertisement(f *Frame) {
 	c.connTx.observe(f.GetConnWindow())
 }
 
+// locked reports whether the Conn has locked its connection sender to a
+// server incarnation yet (§4.2.1 Restart).
+func (c *Conn) locked() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.srvEpochSet
+}
+
 // serverEpochIs reports whether epoch names the server incarnation the Conn
 // is locked to — what a connection grant must echo to count.
 func (c *Conn) serverEpochIs(epoch uint32) bool {

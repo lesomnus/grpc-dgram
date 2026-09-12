@@ -630,6 +630,13 @@ export class Conn {
     this.connTx.observe(f.connWindow)
   }
 
+  // locked reports whether the Conn has locked its connection sender to a
+  // server incarnation yet (§4.2.1 Restart).
+  /** @internal */
+  get locked(): boolean {
+    return this.srvEpochSet
+  }
+
   // serverEpochIs reports whether epoch names the server incarnation the Conn
   // is locked to — what a connection grant must echo to count.
   private serverEpochIs(epoch: number): boolean {
@@ -995,8 +1002,10 @@ export class ClientStream<Req, Res> {
   // undoCredit refunds the credit a data frame took from both windows: it
   // never reached the wire (§4.2.1, §4.4).
   private undoCredit(): void {
-    this.flowTx.undo()
-    if (this.conn.isReliable) this.conn.connTx.undo()
+    // Both halves or neither: once a RESET before the Conn's first lock has
+    // drained the stream's credit (finishReset), the connection half is
+    // already back, and a late undo must not return it twice.
+    if (this.flowTx.undo() && this.conn.isReliable) this.conn.connTx.undo()
   }
 
   // handleRx processes one server frame for this stream. Called by
@@ -1617,6 +1626,16 @@ export class ClientStream<Req, Res> {
     if (this.done.tripped) return
     this.sendAbort(Code.CANCELLED)
     this.finishLocal(statusError(Code.UNAVAILABLE, 'call reset by peer'))
+    // Before the Conn has locked to any server incarnation, a RESET can only
+    // come from a server holding no state for this call and admitting
+    // nothing more from this Conn — a stopping one (§9.4): a live server
+    // answers an OPEN with an H or a T before it could RESET anything behind
+    // it, and that frame locks. So nothing that could be overrun will ever
+    // return the connection credit this call's data frames took: take it
+    // back here, after the call is over and no send can add to the count
+    // (§4.2.1 Sending). Once locked, a RESET-drawn frame's credit is the
+    // server's to return (§4.2.1 The receiver's ledger): refund nothing.
+    if (this.conn.isReliable && !this.conn.locked) this.conn.connTx.refund(this.flowTx.drain())
   }
 
   private release(): void {

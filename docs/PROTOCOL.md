@@ -380,7 +380,22 @@ frames are uncredited, `T_stall` bounds a park, a grant never enables.
   the first park, measures the whole wait across both windows, and on expiry
   the call fails `UNAVAILABLE` naming the window it was parked on.
   `Conn.Close` and `DisconnectPeer` (§4.5) release a parked connection sender,
-  as a call's end releases a parked stream sender.
+  as a call's end releases a parked stream sender. A call that ends by RESET
+  before its `Conn` has locked to any server incarnation (*Restart*, below)
+  takes back the connection credit its data frames spent. On an ordered
+  channel the only server that can RESET such a call holds no state for it
+  and will admit nothing more from this `Conn` — a stopping one (§9.4): a
+  live server answers an OPEN with an `H` or a `T` before it could RESET
+  anything behind it, and that frame locks the `Conn`. A container may exist
+  for the epoch even so — a unary call admitted before the stop, its `T`
+  still to come — and its ledger may return the same credit once more; that
+  reaches an incarnation the `Conn` starts over from (*Restart*), or one that
+  admits no call that could carry client data, so nothing that could be
+  overrun is ever over-credited. Once locked, the client refunds nothing for
+  a RESET: a RESET-drawn frame's credit is the server's to return (*The
+  receiver's ledger*, below), and returning it twice would over-credit the
+  sender. A datagram channel forced reliable can reorder an `H` behind a
+  later call's RESETs, and then both do return it (§16, L16).
 - **The receiver's ledger.** A receiver MUST NOT hold more than
   `MaxPeerWindow` buffered messages from one peer (its scope above), and it
   MUST return **one credit for every reliable-mode data frame it received
@@ -1650,7 +1665,7 @@ in the numbering are labels that review rounds closed (Appendix A).
 | L13 | **Cross-stream coupling and first-come fairness on the connection window** | stuck consumers pin most of one peer's window; or consumers of streams A and B wait on something the sender can only send on C, with A+B's backlog filling the window (the classic HTTP/2 connection-window deadlock) | every other stream to that peer slows; C parks until `T_stall`; under sustained contention one stream can lose every re-race for a grant for up to `T_stall`, then fails loudly; at the window's edge the starvation rule costs one grant per consumed message | the default is 32 full stream windows; the peer-stall counter (§14) makes it diagnosable; `MaxPeerWindow` is the remedy |
 | L14 | **Past the ledger's cap an incarnation starts over** | more than 2 × `MaxDeadPeers` idle incarnations on one peer key (§9.4): an incarnation coming back takes its own position out before its OPEN's eviction puts another in, so exactly 2 × `MaxDeadPeers` keep every one; past that the oldest position — and the credit held back for it — is dropped | the recreated container's sender starts at the window its OPEN advertises with nothing sent, over-credited by whatever the dropped position had spent, so the client can overrun and fail one call `INTERNAL` (§4.2.1) | raise `MaxDeadPeers`; keep idle incarnations per key below the bound |
 | L15 | **A datagram channel forced reliable is neither authenticated nor strictly ordered** (§4.3) | a single forged or reordered sequenced frame that names the `Conn`'s own `peer_epoch` under a foreign server epoch; or a genuine server restart on a surviving channel | the frame re-locks the `Conn` (§4.2.1 *Restart*): its sender starts over and the credit held back for the live incarnation is dropped, so both directions park until the next sequenced frame re-locks it; after a restart a **receive-only** call locked to the dead epoch never ends without a deadline (reliable mode runs no timers and only a send draws the RESET), so its pinned buffers count against the new incarnation's `MaxPeerWindow` for as long as it lives | the same injection class as L3, closed by an encrypted transport; set deadlines on receive-only calls |
-| L16 | **Credit spent before a `Conn`'s first lock is never recovered** | data frames pipelined behind OPENs that a stopping server answered with RESET — no container exists for them, so nothing returns their credit (§4.2.1 *The receiver's ledger*, §9.4 *Server.Stop*) — on a `Conn` that has accepted no sequenced frame yet | it locks to the first incarnation it does hear with those frames still counted as sent — no earlier lock exists to start over from — a permanent shrink of its sender by up to `W_conn`, the most it can pipeline before an advertisement | reachable only on a datagram channel forced reliable across a server stop; a fresh `Conn` clears it (tracked as #36) |
+| L16 | **Around the first lock, a RESET's credit can come back twice or not at all** | a datagram channel forced reliable (§4.3) across a server stop: an `H` or `T` reordered behind a later call's RESETs makes the client refund, still unlocked, what the server's ledger then returns as well (§4.2.1 *Sending*); or RESETs from the stopping incarnation arrive after the `Conn` has locked to the next one, for frames in flight at the lock — and a RESET does not say which incarnation sent it (§9.3) | over-credit by what that call pipelined before its first RESET, at most `W_conn`, so one conforming call can overrun and fail `INTERNAL` (L12); or a permanent shrink of the sender by a few frames | reachable only on a datagram channel forced reliable across a server stop; a fresh `Conn` clears both |
 | L17 | **Bounded where gRPC is unbounded, and the reverse** | a deadline-less unary; an idle-but-alive client; a foreign PING flood; unknown-sid RESETs in reliable mode | a deadline-less unary is bounded by `T_call` where gRPC would run unbounded; an idle-but-alive client legitimately pins a handler until `T_live` or an explicit close (the peer *is* alive); client peer-liveness can be masked by a foreign PING flood, but the call still fails via deadline or probe; reliable-mode unknown-sid RESETs are 1:1, not rate-limited | set deadlines; run over an encrypted transport (L3) |
 
 The flow-control bounds above (L10–L16) are in messages, not bytes (§15). What each
