@@ -495,7 +495,17 @@ describe('malformed messages are ignored, never fatal (§4.2)', () => {
     net.a.postMessage('hello' as unknown as Uint8Array) // some other library sharing the port
     net.a.postMessage({ kind: 'not-an-envelope' } as unknown as Uint8Array)
     net.a.postMessage(new Uint8Array([0xff, 0xff, 0xff])) // truncated varint
+    // A well-formed envelope whose frame carries a metadata key that is not
+    // valid UTF-8: a proto `string` field, so the envelope is undecodable
+    // (§5, §11) — dropped whole, exactly as Go's proto.Unmarshal makes its
+    // adapters drop it.
+    // Dropped before the core: a lossy decoder would deliver a frame with a
+    // U+FFFD key here, and the server would have to answer it.
+    const spy = vi.spyOn(net.server, 'handle')
+    net.a.postMessage(new Uint8Array([0x0a, 0x0f, 0x0d, 1, 0, 0, 0, 0x62, 0x08, 0x0a, 0x06, 0x0a, 0x01, 0xff, 0x12, 0x01, 0x61]))
     await settle()
+    expect(spy).not.toHaveBeenCalled()
+    spy.mockRestore()
 
     expect(await net.conn.invoke(echo.once, { text: 'after' })).toEqual({ text: 'echo:after' })
     expect(net.counts.once).toBe(2)

@@ -122,7 +122,7 @@ export function decodeBase64(s: string): Uint8Array {
 // ---------------------------------------------------------------------------
 
 const textEncoder = new TextEncoder()
-const textDecoder = new TextDecoder()
+const textDecoder = new TextDecoder('utf-8', { ignoreBOM: true }) // lossy on purpose (§11), a BOM kept as Go keeps the bytes
 
 // encodeMetadataValue renders one value as the octets that go on the wire:
 // base64-decoded for a "-bin" key, UTF-8 for any other. An unparseable binary

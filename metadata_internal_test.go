@@ -108,3 +108,30 @@ func TestMetadata_KeyWithNoValuesIsPresentAndEmpty(t *testing.T) {
 		t.Fatalf("round trip = %s, want 0a050a03782d61", h)
 	}
 }
+
+// A proto `string` field that is not valid UTF-8 — a metadata key here, or
+// any other — makes the envelope undecodable: proto.Unmarshal rejects it and
+// every adapter drops what it cannot unmarshal (§5, §11). The TS decoder
+// throws on the same bytes (ts/src/wire.test.ts), so the two receivers agree:
+// neither surfaces a partial frame. Metadata VALUES are bytes and are not
+// validated (§11).
+func TestMetadata_InvalidUTF8StringFieldIsUndecodable(t *testing.T) {
+	for name, wire := range map[string]string{
+		"metadata key": "0d0100000062080a060a01ff120161", // Metadata{entries:[{key: ff, values:["a"]}]}
+		"method":       "0d010000002a01ff",               // method = 0xff
+	} {
+		raw, err := hex.DecodeString(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := proto.Unmarshal(raw, &Frame{}); err == nil {
+			t.Errorf("%s: an invalid-UTF-8 string field unmarshalled; want the envelope rejected", name)
+		}
+	}
+	// A value is bytes: the same octet in a value is fine.
+	raw, _ := hex.DecodeString("0a080a03782d611201ff")
+	var m Metadata
+	if err := proto.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("a non-UTF-8 metadata VALUE must decode (values are bytes, §11): %v", err)
+	}
+}

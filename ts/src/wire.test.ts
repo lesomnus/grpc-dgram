@@ -657,3 +657,30 @@ describe('conn_window — field 18 (§4.2.1)', () => {
     expect(decodeFrame(unhex('0d01000000920101ff')).connWindow).toBe(0)
   })
 })
+
+describe('proto string fields are strict UTF-8, like protobuf-go (§5, §11)', () => {
+  it('a metadata key that is not valid UTF-8 makes the frame undecodable', () => {
+    // Metadata{entries:[{key: ff, values:["a"]}]}: 62 08 | 0a 06 | 0a 01 ff | 12 01 61.
+    // Go's proto.Unmarshal rejects this envelope outright, and its adapters
+    // drop it; the TS adapters drop what decodeEnvelope throws on, so the two
+    // receivers agree — neither surfaces a partial frame.
+    expect(() => decodeFrame(unhex('0d0100000062080a060a01ff120161'))).toThrow(/not valid UTF-8/)
+  })
+
+  it('so does any other string field — method here', () => {
+    // 2a 01 ff: method = one byte, 0xff.
+    expect(() => decodeFrame(unhex('0d010000002a01ff'))).toThrow(/not valid UTF-8/)
+  })
+
+  it('a text metadata value that is not valid UTF-8 still decodes lossily (§11: values are bytes)', () => {
+    const g = decodeFrame(unhex('0d01000000620a0a080a03782d611201ff'))
+    expect(g.header!['x-a']).toEqual(['\ufffd'])
+  })
+
+  it('a leading BOM in a string field survives the round trip, as Go keeps the bytes', () => {
+    const f = frame({ epoch: 1, method: '\ufeff/a.B/C' })
+    const g = decodeFrame(encodeFrame(f))
+    expect(g.method).toBe('\ufeff/a.B/C')
+    expect(hex(encodeFrame(f))).toBe('0d010000002a09efbbbf2f612e422f43')
+  })
+})

@@ -684,6 +684,13 @@ Notes:
   anywhere else the field means nothing. A two-byte tag, deliberately: it
   rides only frames that are rare and already large, so field 6 stays for a
   per-frame field (`ack`, §10.3).
+- **Every proto `string` field is valid UTF-8** — `method`, `codec`, `desc`,
+  `compressor`, `Metadata.Entry.key`, `Any.type_url` — because protobuf says
+  so and protobuf-go enforces it at unmarshal. An envelope carrying one that
+  is not is **undecodable**: a receiver drops it whole and silently, as it
+  drops any datagram it cannot parse (§4.2), and never surfaces a partial or
+  replacement-charactered frame. Both implementations agree on this byte for
+  byte; a conforming sender cannot produce such an envelope.
 - **Metadata values are `bytes`, not text** (§11). gRPC's binary metadata
   (`-bin` keys) carries arbitrary octets, which a proto `string` cannot hold;
   `bytes` and `string` share wire type 2, so text metadata encodes
@@ -976,8 +983,9 @@ Rules:
 
 On every received frame, in order:
 
-1. Unmarshal; malformed → drop (the malformed-frame counter is part of the
-   protocol stats surface, §14).
+1. Unmarshal; malformed → drop, silently, in the adapter (§4.2, §5): the
+   core never sees such an envelope, so no counter counts it — an adapter
+   that wants the number keeps it itself.
 2. `RESET` → §9.3. (RESET is processed but **never** refreshes liveness; a
    RESET matching a tombstoned call clears its pending retransmission, §10.3.)
 3. **Client only — incarnation echo gate (§6.1):** a frame whose `peer_epoch`
@@ -1415,7 +1423,11 @@ path, where its write deadline would otherwise have been the backstop.
   (`%x20-%x7E`); `-bin` values are unvalidated. A sender MUST reject a
   violation locally, with `INTERNAL`, naming the key — never by failing an
   encode deep inside an adapter. Credential-produced metadata (§15) goes
-  through the same gate.
+  through the same gate. A key that is not even valid UTF-8 cannot be
+  represented at all: it is a proto `string` (§5), and a receiver drops the
+  whole envelope it arrived in, silently, as it drops anything it cannot
+  decode (§4.2) — both implementations do, and neither surfaces a partial
+  frame. Values are `bytes` and are never rejected for their content.
 - **Ordering.** `entries` is an ordered list (§5): a sender emits keys in
   ascending bytewise order and never repeats one, and a receiver merges the
   values of a repeated key onto the earlier entry, in wire order. Order

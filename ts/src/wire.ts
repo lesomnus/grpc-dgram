@@ -182,7 +182,11 @@ export function resetFor(f: Frame): Frame {
 // ---------------------------------------------------------------------------
 
 const textEncoder = new TextEncoder()
-const textDecoder = new TextDecoder()
+// Strict, like protobuf-go: a proto `string` field that is not valid UTF-8
+// makes the whole envelope undecodable, and the adapter drops it (§5, §11).
+// Metadata values are `bytes` and decode lossily in metadata.ts (§11).
+// ignoreBOM keeps a leading U+FEFF, as Go keeps the raw bytes.
+const strictTextDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
 class Writer {
   private buf: number[] = []
@@ -280,7 +284,12 @@ class Reader {
   }
 
   string(): string {
-    return textDecoder.decode(this.bytes())
+    const b = this.bytes()
+    try {
+      return strictTextDecoder.decode(b)
+    } catch {
+      throw new Error('drpc: malformed frame: string field is not valid UTF-8')
+    }
   }
 
   skip(wire: number): void {
