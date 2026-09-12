@@ -176,8 +176,12 @@ chaining each on the last.
   repo. Tagging a release means: tag the core, drop the replace, require the
   real version, and re-tag the adapters.
 - **TypeScript packaging** — done (`@lesomnus/grpc-dgram` 0.1.0, Apache-2.0,
-  `publishConfig.access: public`). Still open: the versioning relationship to
-  the Go modules (they share a wire text, not a release cadence).
+  `publishConfig.access: public`), published by
+  `.github/workflows/npm-publish.yaml` on a `ts-v*` tag through npm trusted
+  publishing (GitHub OIDC: no token in the repo, provenance attached; the tag
+  must name the version in `ts/package.json`). Still open: the versioning
+  relationship to the Go modules (they share a wire text, not a release
+  cadence).
 - **Wire freeze.** PROTOCOL.md is unversioned and untagged: no independent
   implementation exists outside this repository, which is what makes breaking
   wire changes cheap.
