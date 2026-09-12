@@ -81,6 +81,17 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The two comparison runs below stay on the root package (`.`) on
+      # purpose, so transport/udp's benchmarks (issue #5) are NOT tracked by
+      # benchstat: every op there is a loopback write syscall, and on a shared
+      # runner that number measures the runner's neighbours — benchstat would
+      # report regressions nobody caused, and a bench job that cries wolf gets
+      # ignored. Those benchmarks exist for one careful run on a quiet machine,
+      # reported as the table transport/udp/benchtable_test.go prints. What CI
+      # owes them is proof that they still run: one iteration each, no numbers.
+      - name: Bench smoke (transport/udp, deliberately not compared)
+        run: go test -run '^$' -bench . -benchtime 1x ./transport/udp
+
       - name: Lookup last successful commit
         id: last-success
         continue-on-error: true
