@@ -42,11 +42,14 @@ message Frame {
   // where it MUST be present — methods are addressed by string, always.
   string method = 5;
 
-  // Field 6 carried a learned method index; removed pre-release (a stale
-  // index could silently dispatch the wrong method across a different-build
-  // server restart, and the savings were negligible for stream workloads).
-  reserved 6;
-  reserved method_index;
+  // Field 6 once carried a learned method index; it was removed before
+  // anything shipped (a stale index could silently dispatch the wrong method
+  // across a different-build server restart, and the savings were negligible
+  // for stream workloads — do not reintroduce one, §13). The number is NOT
+  // reserved: no peer ever put it on the wire. It is the last unassigned
+  // one-byte tag (1–15), and it is held for the per-server-frame `ack` that
+  // §10.3 anticipates — a field that rides every server frame belongs in a
+  // one-byte tag. Cold fields go at 18 and up.
 
   // Codec name; OPEN frames only; "" means proto.
   string codec = 7;

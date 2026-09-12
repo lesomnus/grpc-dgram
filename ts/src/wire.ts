@@ -435,7 +435,8 @@ export function encodeFrame(f: Frame): Uint8Array {
     w.varint(f.flags)
   }
   if (f.method !== '') w.string(5, f.method)
-  // field 6 reserved: was method_index, removed pre-release (§13).
+  // field 6 is unassigned, held for `ack` (§10.3); was method_index, removed
+  // before anything shipped (§13).
   if (f.codec !== '') w.string(7, f.codec)
   if (f.timeoutMs !== undefined) w.bytes(8, encodeDuration(f.timeoutMs))
   if (f.payload !== undefined) w.bytes(9, f.payload)

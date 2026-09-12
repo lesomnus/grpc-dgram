@@ -217,7 +217,10 @@ this repo to happen against, and issue #4 is complete on both sides.
   own suite is the bar today.
 - **A `Peer()` for the pion adapter that names the ICE candidate pair** instead
   of the DataChannel label, so `peer.FromContext` reports a routable address.
-- **Reserved wire space.** §5 lists what is reserved for future work: the `ack`
+- **Reserved wire space.** §5 lists what is held for future work: the `ack`
   field that would let a long-lived half-closed stream stop retransmitting its
-  CLOSE (§10.3), and any further status plumbing. Field 18 is the next free
-  number.
+  CLOSE (§10.3), and any further status plumbing. `ack` rides every server
+  frame, so it takes field 6 — the last one-byte tag, kept unassigned for it.
+  Cold fields (OPEN/H/T only) start at 18. `ack` is genuinely additive: a
+  receiver that never sends one just leaves the sender retransmitting, which
+  is today's behaviour, so it can land after a release at no cost.

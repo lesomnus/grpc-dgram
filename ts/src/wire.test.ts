@@ -544,10 +544,10 @@ describe('metadata validation (§11, grpc-go parity)', () => {
 })
 
 describe('robustness', () => {
-  it('unknown fields are skipped (field 6 reserved; future additions)', () => {
-    // field 6 varint 7, field 99 length-delimited "xx" appended to a valid frame.
+  it('unknown fields are skipped (future additions)', () => {
+    // field 200 varint 7, field 99 length-delimited "xx" appended to a valid frame.
     const base = encodeFrame(frame({ epoch: 1, sid: 2, seq: 3 }))
-    const extra = new Uint8Array([0x30, 0x07, 0x9a, 0x06, 0x02, 0x78, 0x78])
+    const extra = new Uint8Array([0xc0, 0x0c, 0x07, 0x9a, 0x06, 0x02, 0x78, 0x78])
     const joined = new Uint8Array([...base, ...extra])
     const g = decodeFrame(joined)
     expect(g.epoch).toBe(1)

@@ -621,7 +621,8 @@ message Frame {
                               // 16=WINDOW 32=COMPRESSED (§7); the frame's
                               // shape is flags & 0x1F (§7.1).
   string  method       = 5;   // full method name; OPEN frames only (§13).
-  reserved 6;                 // was method_index; removed pre-release (§13).
+  // 6: unassigned — the last one-byte tag, held for `ack` (§10.3); was
+  //    method_index, removed before anything shipped (§13).
   string  codec        = 7;   // codec name; OPEN frames only; "" = proto (§12).
   google.protobuf.Duration timeout = 8;  // remaining call budget; OPEN only (§10.2).
   bytes   payload      = 9 [features.field_presence = EXPLICIT];  // §7.
@@ -1489,7 +1490,8 @@ path, where its write deadline would otherwise have been the backstop.
   negligible for the stream workloads this protocol targets — while its
   learning channel cost a field on every server frame. Wrong-method dispatch
   is now structurally impossible: there is nothing stale to send. Frame
-  field 6 is reserved (§5, Appendix A).
+  field 6 is unassigned and held for `ack` (§5, §10.3); it is not reserved,
+  because no peer ever put it on the wire.
 
 ## 14. Delivery contract per RPC type (normative)
 

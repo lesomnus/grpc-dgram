@@ -32,7 +32,8 @@ const (
 //	2  = CLOSE      — sender's direction finished; with `code` it is terminal.
 //	4  = RESET      — stateless "no such call"; `epoch` echoes the offending frame.
 //	8  = PING       — sid 0: peer keepalive; sid≠0: stream probe.
-//	16 = WINDOW     — stateless flow-control credit for `sid` (reliable mode).
+//	16 = WINDOW     — stateless flow-control credit for `sid` (reliable mode);
+//	                  sid 0: the peer's connection window.
 //	32 = COMPRESSED — `payload` is compressed with the call's compressor.
 type Frame struct {
 	state                  protoimpl.MessageState `protogen:"opaque.v1"`
@@ -330,10 +331,11 @@ type Frame_builder struct {
 	// Exception: RESET frames echo the epoch of the frame they answer.
 	Epoch uint32
 	// Stream id, client-allocated, starting at 1, never reused within an
-	// epoch. 0 is reserved for peer-scope control frames (PING).
+	// epoch. 0 is reserved for peer-scope control frames (PING keepalive
+	// §10.4, WINDOW connection credit §4.2.1).
 	Sid uint32
 	// Per-stream, per-direction sequence, starting at 1.
-	// Stateless frames (RESET, PING) carry 0.
+	// Stateless frames (RESET, PING, WINDOW) carry 0.
 	Seq uint32
 	// Flag bitmask; see message comment.
 	Flags uint32
@@ -357,17 +359,18 @@ type Frame_builder struct {
 	Header  *Metadata
 	Trailer *Metadata
 	// The client incarnation this frame addresses (PROTOCOL.md §6.1).
-	// Server→client call frames (H, data, T, stream probes, keepalive) echo the
-	// client epoch of the call they belong to; the client accepts a frame into
-	// a stream only when this names its own epoch — a sid alone does not,
-	// because a restarted client re-allocates sids from 1. A client→server
-	// RESET echoes the offending frame's peer_epoch so the server can reset
-	// exactly that incarnation's call. Client→server call frames leave it 0
-	// (their field 1 already names the incarnation).
+	// Server→client call frames (H, data, T, stream probes, keepalive,
+	// connection grants) echo the client epoch of the call they belong to; the
+	// client accepts a frame into a stream only when this names its own epoch
+	// — a sid alone does not, because a restarted client re-allocates sids
+	// from 1. A client→server RESET echoes the offending frame's peer_epoch so
+	// the server can reset exactly that incarnation's call. Client→server call
+	// frames leave it 0 (their field 1 already names the incarnation).
 	PeerEpoch uint32
-	// Flow-control credit, in messages, for this stream — reliable mode only
-	// (§4.2). On OPEN and on the creation-ack H it advertises the sender's
-	// initial receive window; on a WINDOW frame it is an additive grant.
+	// Flow-control credit, in messages — reliable mode only (§4.2.1). On OPEN
+	// and on the creation-ack H it advertises the sender's initial per-stream
+	// receive window; on a WINDOW frame it is an additive grant — for this
+	// stream, or for the peer's connection window when sid is 0.
 	// Field 15 — the last one-byte tag — because it rides frequent frames.
 	Window uint32
 	// Message compressor name; OPEN frames only; "" = none. Like `codec`, it
@@ -414,7 +417,7 @@ var File_drpc_frame_proto protoreflect.FileDescriptor
 
 const file_drpc_frame_proto_rawDesc = "" +
 	"\n" +
-	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x19google/protobuf/any.proto\x1a\x1egoogle/protobuf/duration.proto\"\xf7\x03\n" +
+	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x19google/protobuf/any.proto\x1a\x1egoogle/protobuf/duration.proto\"\xe3\x03\n" +
 	"\x05Frame\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\aR\x05epoch\x12\x10\n" +
 	"\x03sid\x18\x02 \x01(\aR\x03sid\x12\x10\n" +
@@ -435,7 +438,7 @@ const file_drpc_frame_proto_rawDesc = "" +
 	"\n" +
 	"compressor\x18\x10 \x01(\tR\n" +
 	"compressor\x12.\n" +
-	"\adetails\x18\x11 \x03(\v2\x14.google.protobuf.AnyR\adetailsJ\x04\b\x06\x10\aR\fmethod_indexB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
+	"\adetails\x18\x11 \x03(\v2\x14.google.protobuf.AnyR\adetailsB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
 
 var file_drpc_frame_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_drpc_frame_proto_goTypes = []any{
