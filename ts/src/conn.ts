@@ -248,11 +248,12 @@ export class Conn {
     this.limits = resolveLimits(opts.limits)
     if (this.mode.reliable) {
       // The connection window (§4.2.1): this side paces itself by W_CONN
-      // from its first data frame — the server's first per-stream
-      // advertisement settles it, a sid-0 WINDOW adds to it — and bounds the
-      // server by maxPeerWindow. Unreliable mode has neither: a full buffer
-      // there drops by policy (§4.2). A client evicts no container, so its
-      // ledger keeps no evicted sender.
+      // from its first data frame until the server's first H or T advertises
+      // its window (observeAdvertisement), a sid-0 WINDOW adds to it — and
+      // bounds the server by maxPeerWindow, which every OPEN advertises.
+      // Unreliable mode has neither: a full buffer there drops by policy
+      // (§4.2). A client evicts no container, so its ledger keeps no evicted
+      // sender.
       this.connTx.assume(W_CONN)
       this.connRx.enable(this.limits.maxPeerWindow, 0)
     }
@@ -363,12 +364,13 @@ export class Conn {
     // A sequenced server frame for a call this side no longer has still
     // names the incarnation that answered one of this Conn's OPENs — as
     // validated as the RESET decision below — so the Conn locks to it here
-    // exactly as a live call's first accepted frame would (§4.2.1 Restart).
-    // The one raise the server sends rides right behind its first H, and a
-    // Conn whose first streaming call died before that H arrived would
-    // otherwise drop the raise as a stranger's and stay at W_CONN against a
-    // larger window for its whole life: a forever-park (§4.2.1 Raise).
+    // exactly as a live call's first accepted frame would, and if it is an H
+    // or a T it carries the server's connection-window advertisement, which
+    // the Conn applies as it locks (§4.2.1 Restart): a Conn whose first call
+    // died before its ack arrived would otherwise stay at the assumed W_CONN
+    // against a larger — or an absent — window until its next H or T.
     this.lockServerEpoch(f.epoch)
+    this.observeAdvertisement(f)
 
     // Whatever happens to it below, a data frame for a call this side no
     // longer has spent one connection credit at the server and is never
@@ -596,13 +598,14 @@ export class Conn {
   // answers one of this Conn's calls — a live call's first accepted frame, or
   // one for a call already released (handle's no-live-stream path, a done
   // stream): the Conn locks to the first incarnation it hears and starts its
-  // connection sender over when it hears a new one (§4.2.1, §10.6). The dead
-  // incarnation's calls die by RESET on their own; what must not survive it
-  // is the sender's count, which the new server never saw. The new
-  // incarnation has never seen this side's window either, so the raise is
-  // due again — its container exists, it just answered a call. A reliable
-  // channel is ordered, so a dead incarnation's frame never follows a live
-  // one's (§10.6).
+  // connection sender over when it hears a new one (§4.2.1, §10.6) — assumed
+  // at W_CONN again, unadvertised, so that the new incarnation's first H or T
+  // is adopted as the old one's was (observeAdvertisement, the caller's next
+  // step). The dead incarnation's calls die by RESET on their own; what must
+  // not survive it is the sender's count, which the new server never saw,
+  // nor the credit the ledger held back for it. A reliable channel is
+  // ordered, so a dead incarnation's frame never follows a live one's
+  // (§10.6).
   /** @internal */
   lockServerEpoch(epoch: number): void {
     const changed = this.srvEpochSet && this.srvEpoch !== epoch
@@ -611,7 +614,20 @@ export class Conn {
     if (!changed || !this.mode.reliable) return
     this.connTx.reassume(W_CONN)
     this.connRx.renew()
-    this.raise()
+  }
+
+  // observeAdvertisement applies the server's connection-window advertisement
+  // (§4.2.1) that f carries, if f is a frame that carries one — a header
+  // frame or a terminal; every server H and T does, so whichever the Conn
+  // accepts first from an incarnation is right, on a live call or on one it
+  // has already released. Once per server incarnation: observe latches, and
+  // lockServerEpoch re-arms the latch for a new one. A data frame carries no
+  // advertisement and must not be fed here — its 0 would read as "no
+  // connection flow control" and turn the window off.
+  /** @internal */
+  observeAdvertisement(f: Frame): void {
+    if (!this.mode.reliable || !(isHeaderFrame(f) || isTerminal(f))) return
+    this.connTx.observe(f.connWindow)
   }
 
   // serverEpochIs reports whether epoch names the server incarnation the Conn
@@ -650,17 +666,12 @@ export class Conn {
     if (g > 0) this.grantPeer(g)
   }
 
-  // raise lifts the server's assumed W_CONN to this side's maxPeerWindow,
-  // once per server incarnation (§4.2.1): a sid-0 grant of the difference,
-  // right behind the first OPEN — the server's container for this
-  // incarnation exists from then on. It is a MUST, not an optimisation: this
-  // side's grant cadence is computed against maxPeerWindow, so a sender left
-  // at W_CONN against a larger window would park before any batched grant
-  // fired.
+  // peerWindow is this side's connection window, maxPeerWindow (§15): what
+  // the ledger enforces, and what every OPEN advertises as Frame.connWindow
+  // (§4.2.1).
   /** @internal */
-  raise(): void {
-    const g = this.connRx.raise()
-    if (g > 0) this.grantPeer(g)
+  get peerWindow(): number {
+    return this.limits.maxPeerWindow
   }
 
   // grantPeer transmits a connection-window grant: sid 0, seq 0, no payload
@@ -1007,10 +1018,11 @@ export class ClientStream<Req, Res> {
     if (this.done.tripped) {
       // The call ended under it (done, not yet retired): never buffered.
       // The frame still answers one of this Conn's calls, so the Conn locks
-      // to its incarnation as handle's no-live-stream path does — the
-      // server's raise may ride right behind it — and the server spent a
-      // connection credit on it if it is data (§4.2.1).
+      // to its incarnation as handle's no-live-stream path does — adopting
+      // the advertisement it carries if it is an H or T — and the server
+      // spent a connection credit on it if it is data (§4.2.1).
       this.conn.lockServerEpoch(f.epoch)
+      this.conn.observeAdvertisement(f)
       this.conn.creditUnbuffered(f)
       return
     }
@@ -1049,7 +1061,7 @@ export class ClientStream<Req, Res> {
       this.srvEpochSet = true
       // A stream locks to one incarnation, so the Conn can only hear a new
       // one here: this is where the connection sender starts over after a
-      // server restart (§4.2.1, §10.6) — before the confirm below.
+      // server restart (§4.2.1, §10.6) — before the advertisement below.
       this.conn.lockServerEpoch(f.epoch)
     }
     if (v !== RxVerdict.Accept) {
@@ -1095,13 +1107,11 @@ export class ClientStream<Req, Res> {
       // advertises the server's receive window and replaces the assumed one
       // (§4.2.1). Absent means the peer does no flow control.
       this.flowTx.observe(f.window)
-      if (first && isHeaderFrame(f) && (this.desc.clientStreams || this.desc.serverStreams)) {
-        // The same advertisement settles the connection window, once per
-        // Conn (§4.2.1) — and ONLY a streaming call's creation ack does: a
-        // unary T or a sendHeader-flushed H carries no window, and would
-        // switch it off while the server enforces.
-        this.conn.connTx.confirm(f.window)
-      }
+      // Every server H and T also carries the server's connection window;
+      // the Conn adopts the first one it hears from this incarnation and
+      // ignores the rest (§4.2.1 Advertisement). A data frame carries none
+      // and is not fed to it.
+      this.conn.observeAdvertisement(f)
     }
 
     if (isTerminal(f)) {
@@ -1133,9 +1143,11 @@ export class ClientStream<Req, Res> {
           return
         }
         if (!this.pin()) {
-          // The call ended between the done check above and here — an
-          // adapter that answers a transmit from inside it can finish the
-          // call under a raise: the frame is never delivered.
+          // The call ended between the done check above and here — nothing
+          // on this path transmits any more, so only something re-entering
+          // the Conn synchronously could end it — after the bulk return at
+          // release ran: the frame is never delivered, and pinning it now
+          // would return its credit twice.
           this.conn.retirePeer(1, f.epoch)
           return
         }
@@ -1238,9 +1250,12 @@ export class ClientStream<Req, Res> {
     // whole call in both directions (§12.1).
     if (this.ci.compressorName !== '') f.compressor = this.ci.compressorName
     if (this.conn.isReliable) {
-      // Advertise this side's receive window (§4.2.1); unreliable mode does
-      // no flow control and leaves the field absent.
+      // Advertise this side's receive window and, beside it, the Conn's
+      // connection window — on every OPEN, so whichever one the server's
+      // container is created by carries it (§4.2.1); unreliable mode does no
+      // flow control and leaves both fields absent.
       f.window = this.rxSize
+      f.connWindow = this.conn.peerWindow
     }
     if (this.openHdr !== undefined) f.header = this.openHdr
     if (this.deadlineAt !== undefined) {
@@ -1272,11 +1287,7 @@ export class ClientStream<Req, Res> {
       await this.transmit(f)
     } catch (e) {
       this.finishLocal(toStatusError(e))
-      return
     }
-    // The raise rides right behind the first OPEN (§4.2.1): from here on the
-    // server has a container for this incarnation to credit.
-    this.conn.raise()
   }
 
   // sendRaw marshals and transmits one message, throwing any error. The
@@ -1378,11 +1389,6 @@ export class ClientStream<Req, Res> {
     } catch (e) {
       this.undoRefused(f, e)
       throw e
-    }
-    if (opening) {
-      // The piggybacked OPEN of a unary / server-streaming call is the
-      // Conn's first OPEN as often as the eager one is (§4.2.1).
-      this.conn.raise()
     }
   }
 

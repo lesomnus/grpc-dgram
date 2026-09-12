@@ -637,3 +637,23 @@ describe('metadata keys that collide with Object.prototype (§11)', () => {
     expect(g.header!['a']).toHaveLength(20000)
   })
 })
+
+describe('conn_window — field 18 (§4.2.1)', () => {
+  it('rides a two-byte tag and round-trips', () => {
+    // Frame{epoch: 1, conn_window: 2048}: 0d 01000000 | 90 01 (field 18,
+    // varint) | 80 10. Pinned against the Go core (wire_shape_test.go).
+    const f = frame({ epoch: 1, connWindow: 2048 })
+    expect(hex(encodeFrame(f))).toBe('0d0100000090018010')
+    expect(decodeFrame(encodeFrame(f)).connWindow).toBe(2048)
+  })
+
+  it('absent decodes as 0, and 0 is not emitted', () => {
+    expect(decodeFrame(unhex('0d01000000')).connWindow).toBe(0)
+    expect(hex(encodeFrame(frame({ epoch: 1, connWindow: 0 })))).toBe('0d01000000')
+  })
+
+  it('a wrong wire type for field 18 is skipped, not misread', () => {
+    // 92 01 = field 18, wire type 2 (length-delimited), length 1, byte ff.
+    expect(decodeFrame(unhex('0d01000000920101ff')).connWindow).toBe(0)
+  })
+})

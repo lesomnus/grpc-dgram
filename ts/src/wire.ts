@@ -88,6 +88,11 @@ export interface Frame {
   // frames only (§5). A repeated field: absent and empty are the same bytes,
   // so undefined is the canonical "none".
   details?: Any[]
+  // The sender's connection window, in messages — reliable mode only
+  // (§4.2.1). Advertised on every OPEN (client) and every H and T (server);
+  // 0 = absent, i.e. "this side does no connection flow control". Meaningless
+  // on any other frame.
+  connWindow: number
 }
 
 // frame builds a Frame with every implicit-presence field at its default.
@@ -103,6 +108,7 @@ export function frame(init?: Partial<Frame>): Frame {
     peerEpoch: 0,
     window: 0,
     compressor: '',
+    connWindow: 0,
     ...init,
   }
 }
@@ -459,6 +465,10 @@ export function encodeFrame(f: Frame): Uint8Array {
   }
   if (f.compressor) w.string(16, f.compressor)
   if (f.details !== undefined) for (const d of f.details) w.bytes(17, encodeAny(d))
+  if (f.connWindow) {
+    w.tag(18, 0)
+    w.varint(f.connWindow)
+  }
   return w.finish()
 }
 
@@ -533,6 +543,10 @@ export function decodeFrame(data: Uint8Array): Frame {
       case 17:
         if (wire !== 2) r.skip(wire)
         else (f.details ??= []).push(decodeAny(r.bytes()))
+        break
+      case 18:
+        if (wire !== 0) r.skip(wire)
+        else f.connWindow = r.varint32()
         break
       default:
         r.skip(wire)

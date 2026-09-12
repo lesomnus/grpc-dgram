@@ -3,14 +3,17 @@
 // scripted client driving Server.handle directly, and then the whole TS↔TS
 // path end to end:
 //
-//   - the server paces itself by W_CONN per client incarnation and parks —
-//     on the connection window, not the stream window — bounded by T_stall;
+//   - the server paces itself, per client incarnation, by the connection
+//     window that incarnation's OPEN advertised, and parks — on the
+//     connection window, not the stream window — bounded by T_stall;
 //   - a sid-0 WINDOW credits only an existing (peer, client-epoch) container
 //     and only in reliable mode; anything else is dropped in silence and
 //     creates no state;
-//   - the container's first admitted OPEN settles the window: 0 turns it off;
-//   - the raise rides right behind the first H sent to an incarnation, once
-//     per incarnation, and a rejected first OPEN still gives it a home;
+//   - every H and T the server sends carries its own connection window,
+//     maxPeerWindow, and no other server frame does;
+//   - the container's sender is created from the OPEN that creates the
+//     container — admitted or rejected — absent meaning off, a later OPEN
+//     ignored;
 //   - an overrun fails the offending call INTERNAL and nothing else;
 //   - every reliable-mode data frame received returns exactly one credit on
 //     sid 0 — consumed, discarded with its call, or never buffered — except
@@ -28,6 +31,7 @@
 //     streams past W_CONN both ways complete on sid-0 grants.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { unaryMethod } from '../src/desc'
 import type { StreamServerInterceptor, UnaryServerInterceptor } from '../src/interceptor'
 import { Server, type ServerContext, type ServerOptions } from '../src/server'
 import { abortCause, Code, type StatusError } from '../src/status'
@@ -35,7 +39,7 @@ import { Counters, type ProtocolEvent, type ProtocolEventKind, type ProtocolStat
 import type { Timing } from '../src/timing'
 import { noop, W_CONN, W_INIT, type SenderState } from '../src/util'
 import { FlagClose, FlagOpen, FlagWindow, frame, isData, isHeaderFrame, isOpen, isReset, isTerminal, shapeOf, type Frame } from '../src/wire'
-import { echo, makeLoopNet, makeNet, registerEcho, tick, wireClone } from '../src/testing'
+import { echo, jsonCodec, makeLoopNet, makeNet, registerEcho, tick, wireClone, type TestReq, type TestRes } from '../src/testing'
 
 const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v))
 
@@ -59,26 +63,22 @@ const terminalOn =
   (f: Frame): boolean =>
     isTerminal(f) && f.sid === sid
 
-// afterFirstH returns the frame the server sent right behind its first
-// creation-ack H, if any.
-function afterFirstH(frames: readonly Frame[]): Frame | undefined {
-  const i = frames.findIndex(isHeaderFrame)
-  return i < 0 ? undefined : frames[i + 1]
-}
+// Every reliable-mode OPEN below advertises the client's per-stream window
+// and, beside it, its connection window (§8, §4.2.1) — W_CONN unless a test
+// says otherwise, so the server's sender toward the incarnation is created
+// at the value the old assumption had; 0 leaves the field absent.
 
-// streamOpen builds the eager, bare OPEN of a client-streaming or bidi call,
-// advertising the client's window (§8, §4.2.1).
-const streamOpen = (epoch: number, sid: number, window: number, method: string): Frame => frame({ epoch, sid, seq: 1, flags: FlagOpen, method, window })
+// streamOpen builds the eager, bare OPEN of a client-streaming or bidi call.
+const streamOpen = (epoch: number, sid: number, window: number, method: string, connWindow = W_CONN): Frame =>
+  frame({ epoch, sid, seq: 1, flags: FlagOpen, method, window, connWindow })
 
-// manyOpen builds a server-streaming OPEN|CLOSE asking for n responses,
-// advertising the client's window (§8, §4.2.1).
-const manyOpen = (epoch: number, sid: number, window: number, n: number): Frame =>
-  frame({ epoch, sid, seq: 1, flags: FlagOpen | FlagClose, method: echo.many.path, window, payload: enc({ text: 'm', n }) })
+// manyOpen builds a server-streaming OPEN|CLOSE asking for n responses.
+const manyOpen = (epoch: number, sid: number, window: number, n: number, connWindow = W_CONN): Frame =>
+  frame({ epoch, sid, seq: 1, flags: FlagOpen | FlagClose, method: echo.many.path, window, connWindow, payload: enc({ text: 'm', n }) })
 
-// onceOpen builds a unary OPEN|CLOSE (§8), advertising a window like every
-// reliable-mode OPEN does.
-const onceOpen = (epoch: number, sid: number): Frame =>
-  frame({ epoch, sid, seq: 1, flags: FlagOpen | FlagClose, method: echo.once.path, window: 32, payload: enc({ text: 'x' }) })
+// onceOpen builds a unary OPEN|CLOSE (§8).
+const onceOpen = (epoch: number, sid: number, connWindow = W_CONN): Frame =>
+  frame({ epoch, sid, seq: 1, flags: FlagOpen | FlagClose, method: echo.once.path, window: 32, connWindow, payload: enc({ text: 'x' }) })
 
 // data builds a client data frame (flags 0, payload present).
 const data = (epoch: number, sid: number, seq: number): Frame => frame({ epoch, sid, seq, payload: enc({ text: 'd' }) })
@@ -169,7 +169,6 @@ async function prime(sf: ReturnType<typeof srvFixture>, n: number): Promise<void
 // peer's slot, and the slot's ledger.
 interface Container {
   connTx: { state(): SenderState }
-  raised: boolean
 }
 interface Slot {
   epochs: Map<number, Container>
@@ -193,9 +192,10 @@ afterEach(() => {
 // at T_stall naming that window.
 // ---------------------------------------------------------------------------
 
-describe('the server paces itself by W_CONN per client incarnation (§4.2.1 Scope, Sending)', () => {
+describe('the server paces itself by the advertised window per client incarnation (§4.2.1 Scope, Sending)', () => {
   // Pins "the sender's credit is per peer incarnation: on the server one
-  // window per (peer, client-epoch) container".
+  // window per (peer, client-epoch) container" — the window the OPENs
+  // advertise, W_CONN here.
   it('parks on the connection window across calls, then resumes on a sid-0 grant', async () => {
     const sf = srvFixture()
     // Two calls in turn: the connection window is per incarnation, not per
@@ -288,7 +288,7 @@ describe('sid-0 grants (§4.2.1 Grants)', () => {
     await sf.handle(manyOpen(EPOCH_A, 1, 4096, W_CONN + 100))
     await settle()
     expect(sf.tx.find(isHeaderFrame), 'the OPEN is admitted').toBeDefined()
-    expect(sf.tx.filter(isData), 'the sender starts at W_CONN: the early grant credited nothing').toHaveLength(W_CONN)
+    expect(sf.tx.filter(isData), "the sender is created from the OPEN's advertisement (W_CONN): the early grant credited nothing").toHaveLength(W_CONN)
     await sf.server.stop()
   })
 
@@ -318,19 +318,19 @@ describe('sid-0 grants (§4.2.1 Grants)', () => {
     await server.stop()
   })
 
-  // Pins "window = 0 turns the connection window off toward that peer" and
-  // "a grant never enables".
-  it('after the peer advertised 0: off, and a grant never enables', async () => {
+  // Pins "A conn_window of 0 (absent) ... the sender's connection window is
+  // then off toward that incarnation" and "a grant never enables".
+  it('after the peer advertised no connection window: off, and a grant never enables', async () => {
     const sf = srvFixture()
-    // Window 0 on the container's first admitted OPEN: the client does no
+    // No window at all on the container's first OPEN: the client does no
     // flow control, on either window.
-    await sf.handle(manyOpen(EPOCH_A, 1, 0, 2 * W_CONN))
+    await sf.handle(manyOpen(EPOCH_A, 1, 0, 2 * W_CONN, 0))
     await settle()
     expect(sf.tx.filter(isData), 'no window binds').toHaveLength(2 * W_CONN)
     expect(sf.counters.snapshot()).toMatchObject({ peerFlowStall: 0, flowStall: 0 })
 
     await sf.handle(grant(EPOCH_A, 1)) // dropped: never enables
-    await sf.handle(manyOpen(EPOCH_A, 2, 0, 2 * W_CONN))
+    await sf.handle(manyOpen(EPOCH_A, 2, 0, 2 * W_CONN, 0))
     await settle()
     expect(sf.tx.filter(isData)).toHaveLength(4 * W_CONN)
     expect(sf.counters.snapshot().peerFlowStall).toBe(0)
@@ -339,80 +339,219 @@ describe('sid-0 grants (§4.2.1 Grants)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// §4.2.1 raise: a server whose maxPeerWindow exceeds W_CONN lifts the
-// client's assumption once per client incarnation, with a sid-0 grant of the
-// difference right behind the first H it sends to that incarnation, naming it
-// in peer_epoch. At the floor there is nothing to raise by.
+// §4.2.1 advertisement, the server's half: every H and every T the server
+// sends carries its connection window, maxPeerWindow — the creation ack, a
+// sendHeader flush, a unary or streaming T, a rejection terminal, stop's
+// UNAVAILABLE — and no other server frame does. Nothing rides behind the
+// first H.
 // ---------------------------------------------------------------------------
 
-describe('the raise (§4.2.1 Raise)', () => {
+describe('every H and T advertises the connection window (§4.2.1 Advertisement)', () => {
   const limits = { limits: { maxPeerWindow: 2048 } }
+  // flush is a unary method whose handler flushes a header before answering
+  // (§8, §11): the one server header frame no creation ack covers.
+  const flush = unaryMethod<TestReq, TestRes>('/test.Echo/Flush', { request: jsonCodec(), response: jsonCodec() })
+  const flushOpen = (epoch: number, sid: number): Frame =>
+    frame({ epoch, sid, seq: 1, flags: FlagOpen | FlagClose, method: flush.path, window: 32, connWindow: W_CONN, payload: enc({ text: 'x' }) })
+  const registerFlush = (server: Server): void =>
+    server.register(flush, async (req, ctx) => {
+      await ctx.sendHeader({ k: ['v'] })
+      return { text: req.text }
+    })
+  const halfClose = (epoch: number, sid: number, seq: number): Frame => frame({ epoch, sid, seq, flags: FlagClose })
 
-  // Pins "the server right behind the first creation-ack H it sends to a
-  // (peer, client-epoch) container".
-  it('rides right behind the first H, once per incarnation', async () => {
-    const sf = srvFixture({ ...limits, streamInterceptors: [blockStreams] })
+  // Pins "the server on every H and T (§7). Every frame of those kinds
+  // carries it ... not a creation ack from a SendHeader flush, not a
+  // streaming call from a unary one, not an admitted OPEN from a rejected
+  // one".
+  it("creation ack, sendHeader H, unary T, streaming T, rejection T and stop's T all carry conn_window = maxPeerWindow (2048)", async () => {
+    const key = 'flow-live'
+    const sf = srvFixture({ ...limits, streamInterceptors: [blockUnlessMarked(key)] })
+    registerFlush(sf.server)
+    await sf.handle(streamOpen(EPOCH_A, 1, 32, echo.count.path)) // blocked: alive at stop
+    await sf.handle(onceOpen(EPOCH_A, 2))
+    await sf.handle(flushOpen(EPOCH_A, 3))
+    const open = streamOpen(EPOCH_A, 4, 32, echo.count.path)
+    open.header = { [key]: ['1'] }
+    await sf.handle(open)
+    await sf.handle(halfClose(EPOCH_A, 4, 2)) // the count call ends: a streaming T
+    await sf.handle(streamOpen(EPOCH_A, 5, 32, '/test.Echo/Nope'))
+    await settle()
+
+    const on = (sid: number): Frame[] => sf.tx.filter((f) => f.sid === sid)
+    expect(on(1).filter(isHeaderFrame).map((f) => f.connWindow), 'the creation ack').toEqual([2048])
+    expect(on(2).filter(isTerminal).map((f) => f.connWindow), 'the unary T').toEqual([2048])
+    expect(on(3).filter(isHeaderFrame).map((f) => f.connWindow), 'the sendHeader H').toEqual([2048])
+    expect(on(3).filter(isTerminal).map((f) => f.connWindow), 'the T behind it').toEqual([2048])
+    expect(on(4).filter(isHeaderFrame).map((f) => f.connWindow), 'the creation ack of the live call').toEqual([2048])
+    expect(on(4).filter(isTerminal).map((f) => f.connWindow), 'the streaming T').toEqual([2048])
+    const rej = on(5).find(isTerminal)
+    expect(rej?.code).toBe(Code.UNIMPLEMENTED)
+    expect(rej!.connWindow, 'the rejection T').toBe(2048)
+    expect(sf.tx.filter(isPeerGrant), 'nothing rides behind the first H: the advertisement is the whole of it').toHaveLength(0)
+
+    await sf.server.stop()
+    await settle()
+    const stopped = on(1).find(isTerminal)
+    expect(stopped?.code).toBe(Code.UNAVAILABLE)
+    expect(stopped!.connWindow, "stop's T").toBe(2048)
+  })
+
+  it('a live-call cap rejection T carries it too', async () => {
+    const sf = srvFixture({ limits: { maxPeerWindow: 2048, maxLiveCalls: 1 }, streamInterceptors: [blockStreams] })
     await sf.handle(streamOpen(EPOCH_A, 1, 32, echo.count.path))
     await sf.handle(streamOpen(EPOCH_A, 2, 32, echo.count.path))
-    const raise = afterFirstH(sf.tx)
-    expect(raise !== undefined && isPeerGrant(raise), 'the raise rides right behind the first H').toBe(true)
-    expect(raise!.window).toBe(2048 - W_CONN)
-    expect(raise!.peerEpoch, 'names the incarnation it lifts (§6.1)').toBe(EPOCH_A)
-    expect(sf.tx.filter(isPeerGrant), 'once per incarnation').toHaveLength(1)
-
-    // A second incarnation of the same transport peer: its own sender starts
-    // at W_CONN too, so it is owed its own raise.
-    await sf.handle(streamOpen(EPOCH_B, 1, 32, echo.count.path))
-    expect(sf.tx.filter(isPeerGrant)).toHaveLength(2)
-    expect(sf.tx[sf.tx.length - 1]!.peerEpoch).toBe(EPOCH_B)
+    const rej = sf.tx.find(terminalOn(2))
+    expect(rej?.code).toBe(Code.RESOURCE_EXHAUSTED)
+    expect(rej!.connWindow).toBe(2048)
     await sf.server.stop()
   })
 
-  // Pins "a unary-only incarnation is owed nothing until its first streaming
-  // call".
-  it('a unary-first incarnation is raised behind its first streaming H', async () => {
-    const sf = srvFixture({ ...limits, streamInterceptors: [blockStreams] })
+  // Pins Appendix B: MaxPeerWindow defaults to W_conn.
+  it('W_CONN by default', async () => {
+    const sf = srvFixture({ streamInterceptors: [blockStreams] })
     await sf.handle(onceOpen(EPOCH_A, 1))
+    await sf.handle(streamOpen(EPOCH_A, 2, 32, echo.count.path))
     await settle()
-    expect(sf.tx.filter(isTerminal)).toHaveLength(1)
-    expect(sf.tx.filter(isPeerGrant), 'a unary T carries no advertisement and draws no raise').toHaveLength(0)
-
-    await sf.handle(streamOpen(EPOCH_A, 2, 32, echo.live.path))
-    const raise = afterFirstH(sf.tx)
-    expect(raise !== undefined && isPeerGrant(raise)).toBe(true)
-    expect(raise!.window).toBe(2048 - W_CONN)
+    expect(sf.tx.find(isTerminal)!.connWindow).toBe(W_CONN)
+    expect(sf.tx.find(isHeaderFrame)!.connWindow).toBe(W_CONN)
     await sf.server.stop()
   })
 
-  // Pins "A receiver at the floor sends none".
-  it('at the floor there is nothing to raise by', async () => {
-    const sf = srvFixture({ limits: { maxPeerWindow: 100 }, streamInterceptors: [blockStreams] })
-    await sf.handle(streamOpen(EPOCH_A, 1, 32, echo.count.path))
-    expect(sf.tx.filter(isPeerGrant), 'maxPeerWindow is floored at W_CONN').toHaveLength(0)
+  // Pins "Data frames, WINDOW, PING, RESET never carry it".
+  it('no other server frame carries it: data, WINDOW on either sid, RESET', async () => {
+    const sf = srvFixture({ ...limits, rxBuffer: { size: W_CONN } })
+    await sf.handle(manyOpen(EPOCH_A, 1, 4096, 5)) // five data frames and a T
+    await sf.handle(streamOpen(EPOCH_A, 2, 32, echo.count.path))
+    for (let i = 0; i < W_CONN; i++) await sf.handle(data(EPOCH_A, 2, 2 + i)) // consumed: grants on sid 2 and sid 0
+    await sf.handle(data(EPOCH_A, 77, 2)) // an unknown sid: RESET
+    await settle()
+    expect(sf.tx.filter(isData)).toHaveLength(5)
+    expect(sf.tx.filter(isPeerGrant).length, 'the sweep below includes a sid-0 grant').toBeGreaterThan(0)
+    expect(sf.tx.filter((f) => shapeOf(f) === FlagWindow && f.sid === 2).length, 'and a per-stream grant').toBeGreaterThan(0)
+    expect(sf.tx.filter(isReset)).toHaveLength(1)
+    for (const f of sf.tx) {
+      if (!isHeaderFrame(f) && !isTerminal(f)) expect(f.connWindow, `flags 0x${f.flags.toString(16)} sid ${f.sid}`).toBe(0)
+    }
     await sf.server.stop()
   })
 
-  // Pins §4.2.1 Settle / §9.4: "A rejected OPEN creates the container (§9.4)
-  // but settles nothing" — so the client's raise right behind it has a home,
-  // and this side's sender toward that incarnation runs on the lifted window
-  // from the first admitted call on.
-  it('a rejected first OPEN creates the container, so the raise behind it lands', async () => {
+  // Pins "Unreliable mode has no connection window: no advertisement".
+  it('unreliable mode advertises nothing', async () => {
+    const tx: Frame[] = []
+    const server = new Server({ handle: (f: Frame) => void tx.push(wireClone(f)) }, { reliable: false, timing: fast, ...limits })
+    registerEcho(server)
+    await server.handle(onceOpen(EPOCH_A, 1), { peer: PEER })
+    await server.handle(streamOpen(EPOCH_A, 2, 32, echo.live.path), { peer: PEER })
+    await settle()
+    expect(tx.find(isTerminal)).toMatchObject({ connWindow: 0 })
+    expect(tx.find(isHeaderFrame)).toMatchObject({ window: 0, connWindow: 0 })
+    await server.stop()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// §4.2.1 / §9.4: the container's sender is created from the OPEN that creates
+// the container — admitted or rejected — the first advertisement winning, a
+// later OPEN ignored, an absent one meaning off, the two windows apart.
+// ---------------------------------------------------------------------------
+
+describe("the container's sender is created from the OPEN's advertisement (§4.2.1 Advertisement, §9.4)", () => {
+  const sender = (sf: ReturnType<typeof srvFixture>, epoch: number): SenderState | undefined =>
+    slotsOf(sf.server).get(PEER)?.epochs.get(epoch)?.connTx.state()
+
+  // Pins "the server from the OPEN that creates the (peer, client-epoch)
+  // container (§9.4)" and "honours the advertisement from then on".
+  it("honours the client's 2048: 2048 frames unparked, the 2049th parks until a sid-0 grant", async () => {
+    const sf = srvFixture()
+    await sf.handle(manyOpen(EPOCH_A, 1, 4096, 2049, 2048))
+    await settle()
+    expect(sf.tx.filter(isData), 'exactly the advertised window reaches the wire').toHaveLength(2048)
+    expect(sf.counters.snapshot()).toMatchObject({ peerFlowStall: 1, flowStall: 0 })
+    expect(sender(sf, EPOCH_A)).toMatchObject({ on: true, observed: true, granted: 2048, sent: 2048 })
+
+    await sf.handle(grant(EPOCH_A, 1))
+    await settle()
+    expect(sf.tx.filter(isData)).toHaveLength(2049)
+    expect(sf.tx.filter(terminalOn(1))).toHaveLength(1)
+    expect(sf.counters.snapshot().peerFlowResume).toBe(1)
+    await sf.server.stop()
+  })
+
+  // Pins "A peer applies the first advertisement it hears from a peer
+  // incarnation and ignores the rest".
+  it('a later OPEN with a different value is ignored', async () => {
+    const sf = srvFixture()
+    await sf.handle(onceOpen(EPOCH_A, 1, 2048)) // creates the container: 2048
+    await settle()
+    expect(sender(sf, EPOCH_A)).toMatchObject({ on: true, observed: true, granted: 2048 })
+    await sf.handle(manyOpen(EPOCH_A, 2, 4096, 3000, 8192)) // 8192: ignored
+    await settle()
+    expect(sf.tx.filter(isData), 'the first advertisement rules').toHaveLength(2048)
+    expect(sf.counters.snapshot().peerFlowStall).toBe(1)
+    expect(sender(sf, EPOCH_A)).toMatchObject({ granted: 2048 })
+    await sf.server.stop()
+  })
+
+  // Pins "A conn_window of 0 (absent) ... the sender's connection window is
+  // then off toward that incarnation, whatever the per-stream window said —
+  // which is what makes a partial implementation harmless".
+  it('absent: off — the server streams unpaced on the connection window while the stream window still paces', async () => {
+    const sf = srvFixture()
+    await sf.handle(manyOpen(EPOCH_A, 1, 4096, 3 * W_CONN, 0))
+    await settle()
+    expect(sf.tx.filter(isData), 'no connection window binds').toHaveLength(3 * W_CONN)
+    expect(sf.counters.snapshot()).toMatchObject({ peerFlowStall: 0, flowStall: 0 })
+    expect(sender(sf, EPOCH_A)).toMatchObject({ on: false, observed: true })
+
+    // Another incarnation whose OPEN advertises only its stream window (32):
+    // the handler parks there, and only there.
+    await sf.handle(manyOpen(EPOCH_B, 1, 32, 40, 0))
+    await settle()
+    expect(sf.tx.filter((f) => isData(f) && f.peerEpoch === EPOCH_B)).toHaveLength(32)
+    expect(sf.counters.snapshot()).toMatchObject({ peerFlowStall: 0, flowStall: 1 })
+    await sf.server.stop()
+  })
+
+  // The two advertisements are read apart: a per-stream window of 0 says
+  // nothing about the connection window beside it.
+  it('a stream window of 0 beside conn_window 1024 still parks on the connection window', async () => {
+    const sf = srvFixture()
+    await sf.handle(manyOpen(EPOCH_A, 1, 0, W_CONN + 1, W_CONN))
+    await settle()
+    expect(sf.tx.filter(isData)).toHaveLength(W_CONN)
+    expect(sf.counters.snapshot()).toMatchObject({ peerFlowStall: 1, flowStall: 0 })
+    await sf.server.stop()
+  })
+
+  // Pins §9.4 Container on rejection: "the OPEN was validated (§9.1) and
+  // carries the client's advertisement, from which the container's sender
+  // is created".
+  it("a rejected first OPEN — unknown method — creates the container's sender from its advertisement", async () => {
     const sf = srvFixture()
     // The incarnation's first OPEN names a method that does not exist.
-    await sf.handle(streamOpen(EPOCH_A, 1, 32, '/test.Echo/Nope'))
+    await sf.handle(streamOpen(EPOCH_A, 1, 32, '/test.Echo/Nope', 2048))
     const rej = sf.tx.find(isTerminal)
     expect(rej?.code, 'rejected').toBe(Code.UNIMPLEMENTED)
     expect(rej!.peerEpoch).toBe(EPOCH_A)
+    expect(sender(sf, EPOCH_A), 'created from the rejected OPEN').toMatchObject({ on: true, observed: true, granted: 2048, sent: 0 })
 
-    // The client's raise (its maxPeerWindow is 2048) follows at once.
-    await sf.handle(grant(EPOCH_A, W_CONN))
-
-    // 1500 unread responses: past W_CONN, within the lifted window.
-    await sf.handle(manyOpen(EPOCH_A, 2, 4096, 1500))
+    // The incarnation's next OPEN advertises something else — ignored — and
+    // asks for 2049 unread responses: exactly the advertised 2048 go out.
+    await sf.handle(manyOpen(EPOCH_A, 2, 4096, 2049, 8192))
     await settle()
-    expect(sf.tx.filter(isData), 'the raise landed on the container the rejection created').toHaveLength(1500)
-    expect(sf.tx.filter(terminalOn(2))).toHaveLength(1)
-    expect(sf.counters.snapshot().peerFlowStall, 'no park at W_CONN').toBe(0)
+    expect(sf.tx.filter(isData), "the rejected OPEN's window rules").toHaveLength(2048)
+    expect(sf.counters.snapshot().peerFlowStall).toBe(1)
+    await sf.server.stop()
+  })
+
+  it("a first OPEN refused by the live-call cap creates the container's sender from its advertisement", async () => {
+    const sf = srvFixture({ limits: { maxLiveCalls: 1 }, streamInterceptors: [blockStreams] })
+    await sf.handle(streamOpen(EPOCH_A, 1, 32, echo.count.path)) // A fills the peer's cap
+    await sf.handle(streamOpen(EPOCH_B, 1, 32, echo.count.path, 2048)) // B's first OPEN: refused
+    const rej = sf.tx.find((f) => isTerminal(f) && f.peerEpoch === EPOCH_B)
+    expect(rej?.code).toBe(Code.RESOURCE_EXHAUSTED)
+    expect(sender(sf, EPOCH_B), "created from B's refused OPEN").toMatchObject({ on: true, observed: true, granted: 2048, sent: 0 })
     await sf.server.stop()
   })
 })
@@ -762,27 +901,28 @@ describe('credit is granted to the incarnation that spent it (§4.2.1 Cadence)',
 
 // ---------------------------------------------------------------------------
 // §9.4 / §15: the ledger keeps the evicted container's connection sender —
-// its credit, its settle and the raise it already got — so that the
-// incarnation's next OPEN continues it; a sid-0 grant addressed to it in the
-// meantime still lands. (The server_internal_test.go twin.)
+// its window and its credit — so that the incarnation's next OPEN continues
+// it instead of recreating it from that OPEN's advertisement; a sid-0 grant
+// addressed to it in the meantime still lands. (The server_internal_test.go
+// twin.)
 // ---------------------------------------------------------------------------
 
-describe('an evicted container continues its sender (§4.2.1 Raise, §9.4)', () => {
-  it('is recreated from the held position, not at W_CONN, and not raised twice', async () => {
+describe('an evicted container continues its sender (§4.2.1, §9.4)', () => {
+  it("is recreated from the held position — its window and its credit — not from its next OPEN's advertisement", async () => {
     const sf = srvFixture({ limits: { maxDeadPeers: 2 } })
-    const open = async (epoch: number, sid: number): Promise<void> => {
-      await sf.handle(onceOpen(epoch, sid))
+    const open = async (epoch: number, sid: number, connWindow = W_CONN): Promise<void> => {
+      await sf.handle(onceOpen(epoch, sid, connWindow))
       await settle() // the call ran to completion: the container is idle
       vi.advanceTimersByTime(1000) // containers are evicted oldest first
     }
     const container = (epoch: number): Container | undefined => slotsOf(sf.server).get(PEER)?.epochs.get(epoch)
 
-    // Incarnation 1: settled by its OPEN, raised by this side (by hand: the
-    // unary service sends no H), lifted by the client to 4096.
+    // Incarnation 1: its sender created from its OPEN's advertisement
+    // (W_CONN), lifted by the client's grants to 4096.
     await open(1, 1)
     const ps = container(1)
     expect(ps, 'a container for epoch 1').toBeDefined()
-    ps!.raised = true
+    expect(ps!.connTx.state()).toMatchObject({ on: true, observed: true, granted: W_CONN, sent: 0 })
     await sf.handle(grant(1, 3 * W_CONN))
     expect(ps!.connTx.state()).toMatchObject({ on: true, granted: 4 * W_CONN, sent: 0 })
 
@@ -804,15 +944,14 @@ describe('an evicted container continues its sender (§4.2.1 Raise, §9.4)', () 
     await open(4, 1)
     expect(container(2), 'epoch 2 must have been evicted by the cap').toBeUndefined()
 
-    // Its next OPEN recreates the container from that position — not at
-    // W_CONN, not owed a second raise. That OPEN itself evicts 3 into a full
-    // ledger: the position of the one coming back must not be what the trim
-    // drops.
-    await open(1, 2)
+    // Its next OPEN recreates the container from that position — not from
+    // what that OPEN advertises (8192: ignored, the position's latch is set).
+    // That OPEN itself evicts 3 into a full ledger: the position of the one
+    // coming back must not be what the trim drops.
+    await open(1, 2, 8192)
     const back = container(1)
     expect(back, 'epoch 1 must be back').toBeDefined()
-    expect(back!.connTx.state()).toMatchObject({ on: true, granted: 4 * W_CONN + 5, sent: 0 })
-    expect(back!.raised, 'the raise it already got must not be repeated').toBe(true)
+    expect(back!.connTx.state(), 'the held position, advertisement latch included').toMatchObject({ on: true, observed: true, granted: 4 * W_CONN + 5, sent: 0 })
     const pf = slotsOf(sf.server).get(PEER)!.flow!
     expect(pf.unstash(1), 'the position went back into the container: the ledger holds it no more').toBeUndefined()
     // The ledger holds the two the cap evicted and nothing was trimmed: 2,

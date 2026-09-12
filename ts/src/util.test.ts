@@ -4,10 +4,11 @@
 //
 // The second half is the twin of Go's flow_unit_test.go: white-box tests of
 // the connection-window primitives (PROTOCOL.md §4.2.1, reliable mode only),
-// no transport — the sender's settle (confirm), the combined acquire over
-// both windows (acquireBoth), and the receiver's physical ledger
-// (PeerFlowRx). Each pins one normative sentence the end-to-end tests of
-// test/flow.test.ts can only observe indirectly.
+// no transport — the sender's adoption of the peer's advertisement (observe)
+// and its restart (reassume), the combined acquire over both windows
+// (acquireBoth), and the receiver's physical ledger (PeerFlowRx). Each pins
+// one normative sentence the end-to-end tests of test/flow.test.ts can only
+// observe indirectly.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { acquireBoth, FlowSender, FrameQueue, Latch, PeerFlowRx, tryAcquireBoth, W_CONN, type FlowAcquireBoth } from './util'
@@ -239,18 +240,19 @@ describe('PeerFlowRx (§4.2.1)', () => {
     expect(snapshot(p).pending).toBe(0)
   })
 
-  // So does the window (Go's is a uint32 parameter): it is what the raise
-  // puts on the wire and what the grant rule measures against, and an
-  // unbounded one would do neither — a raise of Infinity encodes as 0, and
-  // no threshold is ever met against Infinity.
-  it('the window saturates at uint32: the raise fits the wire, the grant rule stays reachable', () => {
+  // So does the window (Go's is a uint32 parameter): it is what the
+  // advertisement puts on the wire and what the grant rule measures against,
+  // and an unbounded one would do neither — no threshold is ever met against
+  // Infinity.
+  it('the window saturates at uint32, what the advertisement carries: the grant rule stays reachable', () => {
     const p = newPeerFlowRx(Infinity)
     expect(p.active).toBe(true)
-    expect(p.raise()).toBe(0xffff_ffff - W_CONN)
+    expect(p['window'], 'the ledger enforces exactly what the advertisement says').toBe(0xffff_ffff)
     expect(p.unadmitted(epochT, 2 ** 40), 'half the window is a reachable amount').toBe(0xffff_ffff)
   })
 
-  // Pins §4.2.1 Unreliable mode: "no assumption, no ledger, no raise".
+  // Pins §4.2.1 Unreliable mode: "no advertisement, no assumption, no
+  // ledger".
   it('window 0 is off: admits everything, grants nothing, counts nothing', () => {
     const p = newPeerFlowRx(0) // unreliable mode: no bound, no grants
     expect(p.active).toBe(false)
@@ -258,36 +260,20 @@ describe('PeerFlowRx (§4.2.1)', () => {
     expect(p.retire(epochT, 3000, true)).toBe(0)
     expect(p.unadmitted(epochT, 3000)).toBe(0)
     expect(snapshot(p)).toEqual({ outstanding: 0, pending: 0 })
-    expect(p.raise()).toBe(0)
   })
 
-  // The raise: window − W_conn, once per incarnation, 0 ever after.
-  // Pins §4.2.1 Raise: "once per peer incarnation with a sid = 0 grant of
-  // MaxPeerWindow − W_conn ... A receiver at the floor sends none".
-  it('raise is window − W_CONN, once', () => {
-    const p = newPeerFlowRx(2048)
-    expect(p.active).toBe(true)
-    expect(p.raise()).toBe(1024)
-    expect(p.raise(), 'second raise').toBe(0)
-    // At the floor there is nothing to raise by — and it still counts as
-    // the incarnation's one raise.
-    const q = newPeerFlowRx(W_CONN)
-    expect(q.raise()).toBe(0)
-    expect(q.raise()).toBe(0)
-  })
-
-  // Pins §4.2.1 Restart: the Conn must "treat the raise as due again" — the
-  // new incarnation's sender starts at W_conn and has never seen this
-  // window — while the ledger itself carries over.
-  it('renew makes the raise due again and keeps outstanding', () => {
+  // Pins §4.2.1 Restart: the Conn must "drop grants naming the old epoch, and
+  // stop returning credit for frames of the incarnation it moved past" —
+  // what the ledger held back for the dead incarnation is dropped, while the
+  // ledger itself carries over.
+  it('renew drops the credit held back for the dead incarnation and keeps outstanding', () => {
     const p = newPeerFlowRx(2048)
     for (let i = 0; i < 3; i++) p.admit()
-    expect(p.raise()).toBe(1024)
-    expect(p.raise()).toBe(0)
+    expect(p.unadmitted(epochT, 5), 'held back, nothing due').toBe(0)
+    expect(pendingOf(p, epochT)).toBe(5)
     p.renew()
-    expect(p.raise(), 'after renew').toBe(1024)
-    expect(p.excess(), 'the amount without the latch (the server\'s per-container raise)').toBe(1024)
-    expect(snapshot(p).outstanding, 'the dead incarnation\'s frames still count until they drain').toBe(3)
+    expect(pendingOf(p, epochT), "the dead incarnation's credit has no one to go to").toBe(0)
+    expect(snapshot(p).outstanding, "the dead incarnation's frames still count until they drain").toBe(3)
   })
 
   // outstanding is one bound, pending is per incarnation, so a dead
@@ -337,13 +323,14 @@ describe('PeerFlowRx (§4.2.1)', () => {
   // sender ... so that the incarnation's next OPEN continues it".
   it('stash holds an evicted sender, bounded at evictCap, oldest first', () => {
     const p = newPeerFlowRx(4 * W_CONN, 2)
+    // The server's sender: created off, adopted from the OPEN's
+    // advertisement, lifted by the client's grants.
     const tx = new FlowSender()
-    tx.assume(W_CONN)
-    tx.confirm(32)
+    tx.observe(W_CONN)
     tx.grant(3 * W_CONN)
     for (let i = 0; i < 5; i++) tx.tryAcquire()
     p.unadmitted(1, 10) // held back for incarnation 1
-    p.stash(1, tx.state(), true)
+    p.stash(1, tx.state())
     p.creditEvicted(1, 7) // the client returns credit while it is evicted
     // A RESET-drawn data frame it sent while evicted returns its credit to
     // the held position; one from an incarnation held nowhere returns
@@ -353,28 +340,27 @@ describe('PeerFlowRx (§4.2.1)', () => {
     expect(pendingOf(p, 5)).toBe(0)
 
     const held = p.unstash(1)
-    expect(held?.raised).toBe(true)
-    expect(held?.state).toEqual({ on: true, observed: true, granted: 4 * W_CONN + 7, sent: 5 })
+    expect(held, 'the position: window, credit and the advertisement latch').toEqual({ on: true, observed: true, granted: 4 * W_CONN + 7, sent: 5 })
     expect(pendingOf(p, 1), '10 + 3 while evicted').toBe(13)
     expect(p.unstash(1), 'a position is handed back once').toBeUndefined()
 
     // Past the cap (2) the oldest goes, held-back credit included.
     for (let epoch = 2; epoch <= 4; epoch++) {
       p.unadmitted(epoch, 1)
-      p.stash(epoch, tx.state(), false)
+      p.stash(epoch, tx.state())
     }
     expect(p.unstash(2), 'the oldest of three on a cap of two').toBeUndefined()
     expect(pendingOf(p, 2)).toBe(0)
     for (let epoch = 3; epoch <= 4; epoch++) expect(p.unstash(epoch), `incarnation ${epoch}`).toBeDefined()
 
     // A grant never enables: a stashed sender that is off stays off.
-    p.stash(9, new FlowSender().state(), false)
+    p.stash(9, new FlowSender().state())
     p.creditEvicted(9, 5)
-    expect(p.unstash(9)?.state).toMatchObject({ on: false, granted: 0 })
+    expect(p.unstash(9)).toMatchObject({ on: false, granted: 0 })
 
     // Enough RESET-drawn frames while evicted tip the batch: the grant is
     // due, and it is the held incarnation's.
-    p.stash(10, tx.state(), false)
+    p.stash(10, tx.state())
     expect(p.unadmittedEvicted(10, 2 * W_CONN), 'half the window').toBe(2 * W_CONN)
     expect(pendingOf(p, 10)).toBe(0)
     expect(p.unstash(10), 'the grant does not drop the position').toBeDefined()
@@ -382,7 +368,7 @@ describe('PeerFlowRx (§4.2.1)', () => {
     // A ledger with no cap (the client's) holds nothing.
     const c = newPeerFlowRx(W_CONN)
     c.unadmitted(1, 3)
-    c.stash(1, tx.state(), false)
+    c.stash(1, tx.state())
     expect(c.unstash(1)).toBeUndefined()
     expect(pendingOf(c, 1)).toBe(0)
   })
@@ -392,69 +378,88 @@ describe('PeerFlowRx (§4.2.1)', () => {
   it('a re-stash keeps its eviction order', () => {
     const p = newPeerFlowRx(W_CONN, 2)
     const st = new FlowSender().state()
-    p.stash(1, st, false)
-    p.stash(2, st, false)
-    p.stash(1, st, true) // still the oldest
-    p.stash(3, st, false) // evicts 1, not 2
+    p.stash(1, st)
+    p.stash(2, st)
+    p.stash(1, st) // still the oldest
+    p.stash(3, st) // evicts 1, not 2
     expect(p.unstash(1)).toBeUndefined()
     expect(p.unstash(2)).toBeDefined()
     expect(p.unstash(3)).toBeDefined()
   })
 })
 
-// FlowSender.confirm: the settle. 0 turns the window off and a later grant
-// is dropped; > 0 keeps the credit as it stands, including a grant that
-// raced ahead of the settle (observe would have replaced it).
-describe('FlowSender.confirm / reassume (§4.2.1)', () => {
-  // Pins §4.2.1 Settle: "window = 0 turns the connection window off toward
-  // that peer", and Grants: "A grant toward a window that is off is
-  // dropped".
-  it('confirm(0) turns the window off and drops later grants', () => {
+// FlowSender.observe: the advertisement. The first one heard from a peer
+// incarnation is adopted — authoritative, replacing the assumption, 0 meaning
+// off — and the rest are ignored; a grant never enables; reassume starts over
+// for a new incarnation.
+describe('FlowSender.observe / reassume (§4.2.1 Advertisement, Initial window, Restart)', () => {
+  // Pins §4.2.1 Initial window: "The advertisement is authoritative and
+  // replaces the assumption, counted against what the sender has already
+  // sent ... a smaller window simply parks the sender until the receiver
+  // drains".
+  it('observe replaces the assumption, counted against what was already sent', () => {
     const f = new FlowSender()
     f.assume(W_CONN)
-    f.confirm(0)
+    for (let i = 0; i < 100; i++) expect(f.tryAcquire()).toBe(true)
+    f.observe(2048) // the server's first H: a larger window
+    expect(f.state()).toMatchObject({ on: true, observed: true, granted: 2048, sent: 100 })
+    for (let i = 100; i < 2048; i++) expect(f.tryAcquire(), `send ${i}`).toBe(true)
+    expect(f.tryAcquire(), 'the 2049th parks').toBe(false)
+
+    const g = new FlowSender()
+    g.assume(W_CONN)
+    for (let i = 0; i < 100; i++) g.tryAcquire()
+    g.observe(50) // a smaller one: already past it
+    expect(g.empty(), 'parked until the receiver drains').toBe(true)
+    g.grant(51)
+    expect(g.tryAcquire()).toBe(true)
+  })
+
+  // Pins §4.2.1 Advertisement: "A conn_window of 0 (absent) on one of those
+  // frames means 'this peer does no connection flow control': the sender's
+  // connection window is then off", and Grants: "A grant toward a window
+  // that is off is dropped".
+  it('observe(0) turns the window off and drops later grants; a later advertisement cannot turn it on', () => {
+    const f = new FlowSender()
+    f.assume(W_CONN)
+    f.observe(0)
     f.grant(5)
-    expect(f.state()).toMatchObject({ on: false, granted: W_CONN })
+    expect(f.state()).toMatchObject({ on: false, observed: true })
     // Off means unlimited: far past W_conn without a park.
     for (let i = 0; i < 3 * W_CONN; i++) expect(f.tryAcquire(), `send ${i}`).toBe(true)
     expect(f.empty()).toBe(false)
-    // And the settle is once only: a later advertisement cannot turn it on.
-    f.confirm(32)
+    // Once only: the first advertisement wins, the rest are ignored.
+    f.observe(32)
     expect(f.state().on).toBe(false)
   })
 
-  // Pins §4.2.1 Settle: "window > 0 confirms it: the credit stays as
-  // assumed, plus anything already granted on sid = 0, counted against what
-  // was already sent".
-  it('confirm(> 0) keeps an early grant where observe would replace it', () => {
+  // Pins §4.2.1 Advertisement: "A peer applies the first advertisement it
+  // hears from a peer incarnation and ignores the rest".
+  it('the first advertisement wins: a later one with another value is ignored', () => {
     const f = new FlowSender()
-    f.assume(W_CONN)
-    f.grant(5) // the peer's raise, landed ahead of its advertisement
-    f.confirm(32)
-    expect(f.state()).toMatchObject({ on: true, observed: true, granted: W_CONN + 5 })
-    // Contrast observe, which is authoritative and replaces (per-stream).
-    const g = new FlowSender()
-    g.assume(W_CONN)
-    g.grant(5)
-    g.observe(32)
-    expect(g.state().granted).toBe(32)
+    f.observe(2048)
+    f.observe(8192)
+    f.observe(0)
+    expect(f.state()).toMatchObject({ on: true, observed: true, granted: 2048 })
   })
 
-  // Pins §4.2.1 Grants: a sid-0 WINDOW "never enables" — and neither does
-  // an advertisement toward a sender that assumed nothing.
-  it('confirm never enables an unassumed sender', () => {
-    const f = new FlowSender() // never assumed: unreliable mode, or a Conn without one
-    f.confirm(32)
-    expect(f.state().on, 'an advertisement is not a grant').toBe(false)
+  // Pins §4.2.1 Initial window: "the server's sender is created by an OPEN
+  // that carries the advertisement (§9.4), so it never assumes" — an
+  // unassumed sender is enabled by the advertisement alone — and Grants: a
+  // sid-0 WINDOW "never enables".
+  it("observe enables a sender that never assumed (the server's); a grant alone never does", () => {
+    const f = new FlowSender() // the server's, created off by its container
     f.grant(1000)
     expect(f.state().on, 'a grant never enables').toBe(false)
-    f.assume(W_CONN) // too late: the settle already happened
-    expect(f.state().on, 'assume after the settle is refused, as after observe').toBe(false)
+    f.observe(2048) // the OPEN's advertisement
+    expect(f.state()).toMatchObject({ on: true, observed: true, granted: 2048, sent: 0 })
+    f.assume(W_CONN) // too late, and never the server's to do
+    expect(f.state().granted, 'assume after the advertisement is refused').toBe(2048)
   })
 
-  // Pins §4.2.1 Settle: a settle to off makes the sender unlimited — a park
-  // under the assumption ends with it.
-  it('confirm(0) wakes a parked sender', async () => {
+  // Pins §4.2.1 Advertisement: an advertisement of 0 makes the sender
+  // unlimited — a park under the assumption ends with it.
+  it('observe(0) wakes a parked sender: the peer does no connection flow control after all', async () => {
     const f = new FlowSender()
     f.assume(1)
     expect(f.tryAcquire()).toBe(true)
@@ -462,16 +467,30 @@ describe('FlowSender.confirm / reassume (§4.2.1)', () => {
     const park = watch(acquireBoth(f, undefined, new Latch(), 0))
     await tick()
     expect(park.settled, 'parked at zero credit').toBe(false)
-    f.confirm(0) // the peer does no flow control after all
+    f.observe(0)
     expect(await park.result).toBe('ok')
   })
 
+  // Pins §4.2.1 Initial window: a larger advertisement wakes a sender parked
+  // on the spent assumption, onto the advertised credit.
+  it('a larger advertisement wakes a parked sender onto the advertised credit', async () => {
+    const f = new FlowSender()
+    f.assume(1)
+    f.tryAcquire()
+    const park = watch(acquireBoth(f, undefined, new Latch(), 0))
+    await tick()
+    expect(park.settled).toBe(false)
+    f.observe(2)
+    expect(await park.result).toBe('ok')
+    expect(f.state()).toMatchObject({ granted: 2, sent: 2 })
+  })
+
   // Pins §4.2.1 Restart: "the Conn MUST start its sender over — assumed at
-  // W_conn, unsettled, nothing sent".
-  it('reassume starts over and wakes the parked sender onto the fresh window', async () => {
+  // W_conn, unadvertised, nothing sent".
+  it('reassume starts over, unadvertised, and wakes the parked sender onto the fresh window', async () => {
     const f = new FlowSender()
     f.assume(W_CONN)
-    f.confirm(32)
+    f.observe(W_CONN)
     for (let i = 0; i < W_CONN; i++) f.tryAcquire() // the whole window, toward the old incarnation
     const park = watch(acquireBoth(f, undefined, new Latch(), 0))
     await tick()
@@ -480,23 +499,22 @@ describe('FlowSender.confirm / reassume (§4.2.1)', () => {
     // was parked re-races on the fresh window.
     f.reassume(W_CONN)
     expect(await park.result).toBe('ok')
-    expect(f.state(), 'assumed at W_conn, nothing sent but the woken one').toMatchObject({ on: true, granted: W_CONN, sent: 1 })
-    // Unsettled again: the new incarnation's first advertisement settles it
-    // — and 0 turns it off, as it would have the first time.
-    f.confirm(0)
+    expect(f.state(), 'assumed at W_conn, unadvertised, nothing sent but the woken one').toMatchObject({ on: true, observed: false, granted: W_CONN, sent: 1 })
+    // Unadvertised again: the new incarnation's first H or T is adopted —
+    // and 0 turns it off, as it would have the first time.
+    f.observe(0)
     expect(f.state().on).toBe(false)
   })
 
-  it('state / restore carry a position across a fresh sender', () => {
+  it('state / restore carry a position across a fresh sender, latch included', () => {
     const f = new FlowSender()
-    f.assume(W_CONN)
-    f.confirm(32)
+    f.observe(W_CONN)
     f.grant(3)
     f.tryAcquire()
     const g = new FlowSender()
     g.restore(f.state())
     expect(g.state()).toEqual({ on: true, observed: true, granted: W_CONN + 3, sent: 1 })
-    g.confirm(0) // already settled: ignored, the position stands
+    g.observe(0) // already advertised: a returning OPEN's value is ignored, the position stands
     expect(g.state().on).toBe(true)
   })
 })

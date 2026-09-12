@@ -159,7 +159,7 @@ serializer. If you already use Connect-ES, `createDrpcTransport(conn)` keeps
 | `drpc.ErrMessageTooLarge` | `MessageTooLargeError` |
 | `drpc.EnvelopeHandler` (`Send(ctx, *Envelope)`) — the §4.1 batching seam | `EnvelopeSender` (`sendFrames(frames, ctx?)`), implemented by every exported adapter class; the transports that have one destination take no ctx |
 | `NewPeerContext` / `NewReliableContext` | a `FrameContext { peer, reliable, signal }` argument |
-| `WithLimits(Limits{MaxPeerWindow: n})` — the §4.2.1 connection window | `limits: { maxPeerWindow: n }` on `ConnOptions` / `ServerOptions`; same floor (`W_CONN` = 1024), same default, same `sid = 0` grants on the wire |
+| `WithLimits(Limits{MaxPeerWindow: n})` — the §4.2.1 connection window | `limits: { maxPeerWindow: n }` on `ConnOptions` / `ServerOptions`; same floor (`W_CONN` = 1024), same default, same `conn_window` advertisement and `sid = 0` grants on the wire |
 | `EventPeerFlowStall` / `EventPeerFlowResume` (with the stream pair) | `'peer-flow-stall'` / `'peer-flow-resume'` — see [observability.md](./observability.md#typescript) |
 | mutexes and atomics | none: state transitions are synchronous between `await` points |
 

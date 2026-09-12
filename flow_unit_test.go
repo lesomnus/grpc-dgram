@@ -2,13 +2,15 @@ package drpc
 
 // White-box unit tests for the connection-window primitives of flow.go
 // (PROTOCOL.md §4.2.1, reliable mode only), no transport: the sender's
-// settle (confirm), the combined acquire over both windows (acquire2), and
-// the receiver's physical ledger (peerFlowRx). Each pins one normative
-// sentence the end-to-end tests of flow_test.go can only observe indirectly.
+// advertisement (observe on a connection sender), the combined acquire over
+// both windows (acquire2), and the receiver's physical ledger (peerFlowRx).
+// Each pins one normative sentence the end-to-end tests of flow_test.go can
+// only observe indirectly.
 
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -217,7 +219,7 @@ func TestPeerFlowRx_UnadmittedReturnsCreditWithoutTouchingOutstanding(t *testing
 	}
 }
 
-// Pins §4.2.1 Unreliable mode: "no assumption, no ledger, no raise".
+// Pins §4.2.1 Unreliable mode: "no advertisement, no assumption, no ledger".
 func TestPeerFlowRx_OffAdmitsEverythingAndGrantsNothing(t *testing.T) {
 	p := newPeerFlowRx(0) // unreliable mode: no bound, no grants
 	if p.active() {
@@ -238,50 +240,26 @@ func TestPeerFlowRx_OffAdmitsEverythingAndGrantsNothing(t *testing.T) {
 	if out != 0 || pend != 0 {
 		t.Fatalf("off: nothing may be counted, outstanding/pending = %d/%d", out, pend)
 	}
-	if g := p.raise(); g != 0 {
-		t.Fatalf("off: nothing to raise, got %d", g)
-	}
-}
-
-// The raise: window − W_conn, once per incarnation, 0 ever after.
-// Pins §4.2.1 Raise: "once per peer incarnation with a sid = 0 grant of
-// MaxPeerWindow − W_conn ... A receiver at the floor sends none".
-func TestPeerFlowRx_RaiseIsWindowMinusWConnOnce(t *testing.T) {
-	p := newPeerFlowRx(2048)
-	if g := p.raise(); g != 1024 {
-		t.Fatalf("raise = %d, want 2048 − 1024", g)
-	}
-	if g := p.raise(); g != 0 {
-		t.Fatalf("second raise = %d, want 0", g)
-	}
-
-	// At the floor there is nothing to raise by — and it still counts as
-	// the incarnation's one raise.
-	q := newPeerFlowRx(wConn)
-	if g := q.raise(); g != 0 {
-		t.Fatalf("window == W_conn: raise = %d, want 0", g)
-	}
-	if g := q.raise(); g != 0 {
-		t.Fatalf("window == W_conn, again: raise = %d, want 0", g)
-	}
 }
 
 // ---------------------------------------------------------------------------
-// flowSender.confirm: the settle. 0 turns the window off and a later grant is
-// dropped; > 0 keeps the credit as it stands, including a grant that raced
-// ahead of the settle (observe would have replaced it).
+// flowSender.observe on a connection sender: the advertisement. Absent (0)
+// turns the window off and a later grant is dropped; > 0 replaces the
+// client's assumption, or creates the server's never-assumed sender; either
+// way the first one counts and the rest are ignored.
 // ---------------------------------------------------------------------------
 
-// Pins §4.2.1 Settle: "window = 0 turns the connection window off toward that
-// peer", and Grants: "A grant toward a window that is off is dropped".
-func TestFlowSender_ConfirmZeroTurnsOffAndDropsGrants(t *testing.T) {
+// Pins §4.2.1 Advertisement: "A conn_window of 0 (absent) ... means 'this
+// peer does no connection flow control': the sender's connection window is
+// then off", and Grants: "A grant toward a window that is off is dropped".
+func TestFlowSender_ObserveAbsentTurnsOffAndDropsGrants(t *testing.T) {
 	var f flowSender
 	f.assume(wConn)
-	f.confirm(0)
+	f.observe(0)
 	f.grant(5)
 	on, granted, _ := f.snapshot()
 	if on {
-		t.Fatal("confirm(0): the peer does no flow control, the window must be off")
+		t.Fatal("observe(0): the peer does no connection flow control, the window must be off")
 	}
 	if granted != int64(wConn) {
 		t.Fatalf("a grant to an off window must be dropped: granted = %d", granted)
@@ -292,68 +270,89 @@ func TestFlowSender_ConfirmZeroTurnsOffAndDropsGrants(t *testing.T) {
 			t.Fatalf("send %d parked on an off window", i)
 		}
 	}
-	// And the settle is once only: a later advertisement cannot turn it on.
-	f.confirm(32)
+	// And the advertisement is once only: a later one cannot turn it on.
+	f.observe(32)
 	if on, _, _ := f.snapshot(); on {
-		t.Fatal("a second confirm must be ignored")
+		t.Fatal("a second advertisement must be ignored")
 	}
 }
 
-// Pins §4.2.1 Settle: "window > 0 confirms it: the credit stays as assumed,
-// plus anything already granted on sid = 0, counted against what was already
-// sent".
-func TestFlowSender_ConfirmKeepsAnEarlyGrant(t *testing.T) {
+// Pins §4.2.1 Initial window: "The advertisement is authoritative and
+// replaces the assumption, counted against what the sender has already sent
+// ... a smaller window simply parks the sender until the receiver drains".
+func TestFlowSender_ObserveReplacesTheAssumption(t *testing.T) {
+	// Larger than assumed: the client streamed 1000 on the assumption, the
+	// server's H says 2048 — 1048 more before a park, not 24.
 	var f flowSender
 	f.assume(wConn)
-	f.grant(5) // the peer's raise, landed ahead of its advertisement
-	f.confirm(32)
-	on, granted, _ := f.snapshot()
-	if !on {
-		t.Fatal("confirm(32): the window must stay on")
+	for range 1000 {
+		f.tryAcquire()
 	}
-	if granted != int64(wConn)+5 {
-		t.Fatalf("granted = %d, want W_conn + 5: confirm must keep what was granted, not replace it", granted)
+	f.observe(2048)
+	on, granted, sent := f.snapshot()
+	if !on || granted != 2048 || sent != 1000 {
+		t.Fatalf("on/granted/sent = %v/%d/%d, want true/2048/1000", on, granted, sent)
 	}
-	// Contrast observe, which is authoritative and replaces (per-stream).
+	for i := range 1048 {
+		if _, ok := f.tryAcquire(); !ok {
+			t.Fatalf("send %d parked short of the advertised window", i)
+		}
+	}
+	if _, ok := f.tryAcquire(); ok {
+		t.Fatal("the 2049th must park: the advertisement is exact")
+	}
+
+	// Smaller than what was already sent: the sender parks until the
+	// receiver drains — 1000 sent against an advertised 32 is 968 in the
+	// hole, so a grant of 968 buys nothing and the 969th credit one send.
 	var g flowSender
 	g.assume(wConn)
-	g.grant(5)
+	for range 1000 {
+		g.tryAcquire()
+	}
 	g.observe(32)
-	if _, granted, _ := g.snapshot(); granted != 32 {
-		t.Fatalf("observe replaces: granted = %d, want 32", granted)
+	if _, ok := g.tryAcquire(); ok {
+		t.Fatal("1000 sent against a window of 32: must park")
+	}
+	g.grant(968)
+	if _, ok := g.tryAcquire(); ok {
+		t.Fatal("968 granted only covers what was already sent past the window")
+	}
+	g.grant(1)
+	if _, ok := g.tryAcquire(); !ok {
+		t.Fatal("one more credit frees one send")
 	}
 }
 
-// Pins §4.2.1 Grants: a sid-0 WINDOW "never enables" — and neither does an
-// advertisement toward a sender that assumed nothing.
-func TestFlowSender_ConfirmNeverEnablesAnUnassumedSender(t *testing.T) {
-	var f flowSender // never assumed: unreliable mode, or a Conn without one
-	f.confirm(32)
-	if on, _, _ := f.snapshot(); on {
-		t.Fatal("an advertisement is not a grant: an unassumed sender stays off")
-	}
+// Pins §4.2.1 Initial window: "the server's sender is created by an OPEN
+// that carries the advertisement (§9.4), so it never assumes" — and Grants:
+// a sid-0 WINDOW "never enables", so before the OPEN nothing does.
+func TestFlowSender_ObserveCreatesTheServerSender(t *testing.T) {
+	var f flowSender // the server's: never assumed, off until its OPEN
 	f.grant(1000)
 	if on, _, _ := f.snapshot(); on {
 		t.Fatal("a grant never enables (§4.2.1)")
 	}
-	f.assume(wConn) // too late: the settle already happened
-	if on, _, _ := f.snapshot(); on {
-		t.Fatal("assume after the settle must be refused, as after observe")
+	f.observe(2048) // the OPEN's advertisement
+	on, granted, sent := f.snapshot()
+	if !on || granted != 2048 || sent != 0 {
+		t.Fatalf("on/granted/sent = %v/%d/%d, want true/2048/0: created at exactly the advertised window", on, granted, sent)
+	}
+	f.assume(wConn) // an assumption after the advertisement is refused
+	f.observe(0)    // as is a later OPEN's value, absent or not
+	if on, granted, _ := f.snapshot(); !on || granted != 2048 {
+		t.Fatalf("on/granted = %v/%d after a late assume and a second advertisement, want true/2048", on, granted)
 	}
 }
 
-// Pins §4.2.1 Settle: a settle to off makes the sender unlimited — a park
-// under the assumption ends with it.
-func TestFlowSender_ConfirmWakesAParkedSender(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		var f flowSender
-		f.assume(1)
-		if _, ok := f.tryAcquire(); !ok {
-			t.Fatal("the one assumed credit")
-		}
+// Pins §4.2.1 Advertisement: an advertisement that turns the window off, or
+// one larger than the assumption, ends a park under the assumption.
+func TestFlowSender_ObserveWakesAParkedSender(t *testing.T) {
+	park := func(t *testing.T, f *flowSender) chan error {
+		t.Helper()
 		res := make(chan error, 1)
 		go func() {
-			res <- acquire2(&f, nil, context.Background(), nil, 0, nil)
+			res <- acquire2(f, nil, context.Background(), nil, 0, nil)
 		}()
 		synctest.Wait()
 		select {
@@ -361,20 +360,42 @@ func TestFlowSender_ConfirmWakesAParkedSender(t *testing.T) {
 			t.Fatalf("must be parked at zero credit, got %v", err)
 		default:
 		}
-		f.confirm(0) // the peer does no flow control after all
+		return res
+	}
+	synctest.Test(t, func(t *testing.T) {
+		var f flowSender
+		f.assume(1)
+		if _, ok := f.tryAcquire(); !ok {
+			t.Fatal("the one assumed credit")
+		}
+		res := park(t, &f)
+		f.observe(0) // the peer does no connection flow control after all
 		if err := <-res; err != nil {
-			t.Fatalf("confirm(0) must unpark: %v", err)
+			t.Fatalf("observe(0) must unpark: %v", err)
+		}
+	})
+	synctest.Test(t, func(t *testing.T) {
+		var f flowSender
+		f.assume(1)
+		f.tryAcquire()
+		res := park(t, &f)
+		f.observe(2) // advertised past what was sent
+		if err := <-res; err != nil {
+			t.Fatalf("a larger advertisement must unpark: %v", err)
+		}
+		if _, _, sent := f.snapshot(); sent != 2 {
+			t.Fatalf("sent = %d, want 2", sent)
 		}
 	})
 }
 
 // Pins §4.2.1 Restart: "the Conn MUST start its sender over — assumed at
-// W_conn, unsettled, nothing sent".
+// W_conn, unadvertised, nothing sent".
 func TestFlowSender_ReassumeStartsOver(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var f flowSender
 		f.assume(wConn)
-		f.confirm(32)
+		f.observe(wConn) // the old incarnation advertised exactly W_conn
 		for range wConn {
 			f.tryAcquire() // the whole window, toward the old incarnation
 		}
@@ -400,38 +421,37 @@ func TestFlowSender_ReassumeStartsOver(t *testing.T) {
 			t.Fatalf("on/granted/sent = %v/%d/%d, want true/W_conn/1: assumed at W_conn, nothing sent but the woken one", on, granted, sent)
 		}
 
-		// Unsettled again: the new incarnation's first advertisement settles
-		// it — and 0 turns it off, as it would have the first time.
-		f.confirm(0)
+		// Unadvertised again: the new incarnation's first H or T is applied
+		// — and absent turns it off, as it would have the first time.
+		f.observe(0)
 		if on, _, _ := f.snapshot(); on {
-			t.Fatal("the settle must be due again after a reassume")
+			t.Fatal("the advertisement must be due again after a reassume")
 		}
 	})
 }
 
-// Pins §4.2.1 Restart: the Conn must "treat the raise as due again" — the
-// new incarnation's sender starts at W_conn and has never seen this window —
-// while the ledger itself carries over.
-func TestPeerFlowRx_RenewMakesTheRaiseDueAgain(t *testing.T) {
+// Pins §4.2.1 Restart: the Conn must "stop returning credit for frames of
+// the incarnation it moved past" — what the ledger held back for it is
+// dropped — while the ledger itself carries over.
+func TestPeerFlowRx_RenewDropsHeldCreditAndKeepsOutstanding(t *testing.T) {
 	p := newPeerFlowRx(2048)
 	for range 3 {
 		p.admit()
 	}
-	if g := p.raise(); g != 1024 {
-		t.Fatalf("raise = %d, want 2048 − 1024", g)
-	}
-	if g := p.raise(); g != 0 {
-		t.Fatalf("second raise = %d, want 0", g)
+	if g := p.unadmitted(epochT, 5); g != 0 {
+		t.Fatalf("5 pending of a window of 2048: nothing due, got %d", g)
 	}
 	p.renew()
-	if g := p.raise(); g != 1024 {
-		t.Fatalf("raise after renew = %d, want 2048 − 1024 again", g)
-	}
-	if g := p.excess(); g != 1024 {
-		t.Fatalf("excess = %d, want the amount without the latch (the server's per-container raise)", g)
+	if got := p.pendingOf(epochT); got != 0 {
+		t.Fatalf("pending = %d after renew, want 0: the dead incarnation's credit has no one to go to", got)
 	}
 	if out, _ := p.snapshot(); out != 3 {
 		t.Fatalf("outstanding = %d after renew, want 3: the dead incarnation's frames still count until they drain", out)
+	}
+	// The new incarnation is credited from zero: the dropped 5 never ride
+	// along with its own returns.
+	if g := p.unadmitted(epochT+1, 1024); g != 1024 {
+		t.Fatalf("half the window returned by the new incarnation: grant = %d, want 1024", g)
 	}
 }
 
@@ -666,12 +686,28 @@ func TestAcquire2_NilConnIsPerStreamOnly(t *testing.T) {
 }
 
 // Limits: the floor at W_conn, for the same reason the rx buffer is floored
-// at W_init — a sender assumes it.
-// Pins §4.2.1 Assumption: "MaxPeerWindow (§15) is floored at W_conn, for the
-// same reason the rx buffer is floored at W_init".
+// at W_init — the client assumes it until the server's advertisement.
+// Pins §4.2.1 Initial window: "MaxPeerWindow (§15) is floored at W_conn, for
+// the same reason the rx buffer is floored at W_init".
 func TestLimits_MaxPeerWindowFlooredAtWConn(t *testing.T) {
 	for _, tc := range []struct{ in, want int }{
 		{0, int(wConn)}, {-1, int(wConn)}, {100, int(wConn)}, {1024, 1024}, {2048, 2048},
+	} {
+		if got := (Limits{MaxPeerWindow: tc.in}).withDefaults().MaxPeerWindow; got != tc.want {
+			t.Errorf("MaxPeerWindow %d → %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The advertisement (§5) and the ledger carry MaxPeerWindow as a uint32, and
+// int → uint32 truncates mod 2^32: uncapped, 2^32 would advertise 0 — absent,
+// "no connection flow control" — and 2^32 + 100 would advertise 100, below
+// the W_conn floor. The TS port clamps at the same cap.
+func TestLimits_MaxPeerWindowCappedAtUint32(t *testing.T) {
+	var wire uint64 = math.MaxUint32
+	max := int(wire)
+	for _, tc := range []struct{ in, want int }{
+		{max, max}, {max + 1, max}, {max + 100, max}, {max << 8, max},
 	} {
 		if got := (Limits{MaxPeerWindow: tc.in}).withDefaults().MaxPeerWindow; got != tc.want {
 			t.Errorf("MaxPeerWindow %d → %d, want %d", tc.in, got, tc.want)
@@ -855,19 +891,19 @@ func TestPeerFlowRx_CreditIsHeldPerIncarnation(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // Pins §9.4 / §15: "the ledger keeps the evicted container's connection
-// sender ... so that the incarnation's next OPEN continues it".
+// sender — its window and its credit ... so that the incarnation's next OPEN
+// continues it".
 func TestPeerFlowRx_StashHoldsAnEvictedSender(t *testing.T) {
 	p := &peerFlowRx{}
 	p.enable(4*wConn, 2)
 	var tx flowSender
-	tx.assume(wConn)
-	tx.confirm(32)
+	tx.observe(wConn) // the server's sender: created by the OPEN's advertisement
 	tx.grant(3 * wConn)
 	for range 5 {
 		tx.tryAcquire()
 	}
 	p.unadmitted(1, 10) // held back for incarnation 1
-	p.stash(1, tx.state(), true)
+	p.stash(1, tx.state())
 	p.creditEvicted(1, 7) // the client returns credit while it is evicted
 	// A RESET-drawn data frame it sent while evicted returns its credit to
 	// the held position; one from an incarnation held nowhere returns
@@ -879,63 +915,65 @@ func TestPeerFlowRx_StashHoldsAnEvictedSender(t *testing.T) {
 		t.Fatalf("unadmittedEvicted(5, 3) = %d, pending %d; want nothing: held nowhere", g, p.pendingOf(5))
 	}
 
-	st, raised, ok := p.unstash(1)
-	if !ok || !raised {
-		t.Fatalf("unstash(1) = ok %v, raised %v; want the held position, raised", ok, raised)
+	st, ok := p.unstash(1)
+	if !ok {
+		t.Fatal("unstash(1) must hand back the held position")
 	}
 	if !st.on || !st.observed || st.granted != int64(4*wConn+7) || st.sent != 5 {
-		t.Fatalf("state = %+v; want on, settled, granted 4096+7, sent 5", st)
+		t.Fatalf("state = %+v; want on, advertised, granted 4096+7, sent 5", st)
 	}
 	if got := p.pendingOf(1); got != 13 {
 		t.Fatalf("pending held for the evicted incarnation = %d, want 10 + 3 while evicted", got)
 	}
-	if _, _, ok := p.unstash(1); ok {
+	if _, ok := p.unstash(1); ok {
 		t.Fatal("unstash hands a position back once")
 	}
 
 	// Past the cap (2) the oldest goes, held-back credit included.
 	for epoch := uint32(2); epoch <= 4; epoch++ {
 		p.unadmitted(epoch, 1)
-		p.stash(epoch, tx.state(), false)
+		p.stash(epoch, tx.state())
 	}
-	if _, _, ok := p.unstash(2); ok {
+	if _, ok := p.unstash(2); ok {
 		t.Fatal("the oldest of three on a cap of two must be gone")
 	}
 	if got := p.pendingOf(2); got != 0 {
 		t.Fatalf("pending of the dropped incarnation = %d, want 0", got)
 	}
 	for epoch := uint32(3); epoch <= 4; epoch++ {
-		if _, _, ok := p.unstash(epoch); !ok {
+		if _, ok := p.unstash(epoch); !ok {
 			t.Fatalf("incarnation %d must still be held", epoch)
 		}
 	}
 
-	// A grant never enables: a stashed sender that is off stays off.
+	// A grant never enables: a stashed sender that is off — its OPEN
+	// advertised no connection window — stays off.
 	var off flowSender
-	p.stash(9, off.state(), false)
+	off.observe(0)
+	p.stash(9, off.state())
 	p.creditEvicted(9, 5)
-	if st, _, _ := p.unstash(9); st.on || st.granted != 0 {
+	if st, _ := p.unstash(9); st.on || st.granted != 0 {
 		t.Fatalf("state = %+v; want off with nothing granted", st)
 	}
 
 	// Enough RESET-drawn frames while evicted tip the batch: the grant is
 	// due, and it is the held incarnation's.
-	p.stash(10, tx.state(), false)
+	p.stash(10, tx.state())
 	if g := p.unadmittedEvicted(10, 2*wConn); g != 2*wConn {
 		t.Fatalf("unadmittedEvicted(10, half the window) = %d, want %d", g, 2*wConn)
 	}
 	if got := p.pendingOf(10); got != 0 {
 		t.Fatalf("pending of the granted incarnation = %d, want 0", got)
 	}
-	if _, _, ok := p.unstash(10); !ok {
+	if _, ok := p.unstash(10); !ok {
 		t.Fatal("the grant does not drop the position")
 	}
 
 	// A ledger with no cap (the client's) holds nothing.
 	c := newPeerFlowRx(wConn)
 	c.unadmitted(1, 3)
-	c.stash(1, tx.state(), false)
-	if _, _, ok := c.unstash(1); ok {
+	c.stash(1, tx.state())
+	if _, ok := c.unstash(1); ok {
 		t.Fatal("cap 0: nothing is held")
 	}
 	if got := c.pendingOf(1); got != 0 {

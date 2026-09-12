@@ -108,9 +108,10 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 	}
 	if v.mode.reliable {
 		// The connection window (§4.2.1): this side paces itself by W_conn
-		// from its first data frame — the server's first per-stream
-		// advertisement settles it, a sid-0 WINDOW adds to it — and bounds
-		// the server by MaxPeerWindow. Unreliable mode has neither: a full
+		// from its first data frame until the server's advertisement — the
+		// first H or T the Conn accepts from an incarnation — replaces it, a
+		// sid-0 WINDOW adds to it; and it bounds the server by MaxPeerWindow,
+		// advertised on every OPEN. Unreliable mode has neither: a full
 		// buffer there drops by policy (§4.2).
 		v.connTx.assume(wConn)
 		v.connRx.enable(uint32(v.limits.MaxPeerWindow), 0)
@@ -233,12 +234,12 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 	// A sequenced server frame for a call this side no longer has still
 	// names the incarnation that answered one of this Conn's OPENs — as
 	// validated as the RESET decision below — so the Conn locks to it here
-	// exactly as a live call's first accepted frame would (§4.2.1 Restart).
-	// The one raise the server sends rides right behind its first H, and a
-	// Conn whose first streaming call died before that H arrived would
-	// otherwise drop the raise as a stranger's and stay at W_conn against a
-	// larger window for its whole life: a forever-park (§4.2.1 Raise).
-	c.lockServerEpoch(ctx, f.GetEpoch())
+	// exactly as a live call's first accepted frame would, and applies the
+	// advertisement it carries if it is an H or a T (§4.2.1 Restart): a Conn
+	// whose first call died before its H arrived would otherwise stay on the
+	// assumption against that incarnation for its whole life.
+	c.lockServerEpoch(f.GetEpoch())
+	c.observeAdvertisement(f)
 
 	// Whatever happens to it below, a data frame for a call this side no
 	// longer has spent one connection credit at the server and is never
@@ -267,13 +268,15 @@ func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 // answers one of this Conn's calls — a live call's first accepted frame, or
 // one for a call already released (Handle's no-live-stream path, a done
 // stream): the Conn locks to the first incarnation it hears and starts its
-// connection sender over when it hears a new one (§4.2.1, §10.6). The dead
-// incarnation's calls die by RESET on their own; what must not survive it is
-// the sender's count, which the new server never saw. The new incarnation
-// has never seen this side's window either, so the raise is due again — its
-// container exists, it just answered a call. A reliable channel is ordered,
-// so a dead incarnation's frame never follows a live one's (§10.6).
-func (c *Conn) lockServerEpoch(ctx context.Context, epoch uint32) {
+// connection sender over when it hears a new one (§4.2.1, §10.6) — assumed
+// at W_conn again, the new incarnation's advertisement due (observe's latch
+// re-armed), nothing sent. The dead incarnation's calls die by RESET on
+// their own; what must not survive it is the sender's count, which the new
+// server never saw, nor the credit held back for it. A reliable channel is
+// ordered, so a dead incarnation's frame never follows a live one's (§10.6).
+// The caller applies the frame's advertisement after this, so that it lands
+// on the re-armed sender (observeAdvertisement).
+func (c *Conn) lockServerEpoch(epoch uint32) {
 	c.mu.Lock()
 	changed := c.srvEpochSet && c.srvEpoch != epoch
 	c.srvEpoch, c.srvEpochSet = epoch, true
@@ -283,7 +286,21 @@ func (c *Conn) lockServerEpoch(ctx context.Context, epoch uint32) {
 	}
 	c.connTx.reassume(wConn)
 	c.connRx.renew()
-	c.raise(ctx)
+}
+
+// observeAdvertisement applies the connection-window advertisement a server
+// frame carries, if it is a frame that carries one: every H and every T
+// (§4.2.1, §5) — the creation ack, a SendHeader flush, a unary or streaming
+// terminal, a rejection, all alike, on a live call or on one already
+// released. The first from a server incarnation counts (observe's latch);
+// 0 means the server does no connection flow control and turns the window
+// off. A data frame carries none and must never be fed to observe: its 0
+// would read as "off". Unreliable mode has no connection window.
+func (c *Conn) observeAdvertisement(f *Frame) {
+	if !c.mode.reliable || !(f.isHeaderFrame() || f.isTerminal()) {
+		return
+	}
+	c.connTx.observe(f.GetConnWindow())
 }
 
 // serverEpochIs reports whether epoch names the server incarnation the Conn
@@ -326,18 +343,6 @@ func (c *Conn) retirePeer(ctx context.Context, n uint32, epoch uint32) {
 		return
 	}
 	if g := c.connRx.retire(epoch, n, c.serverCurrent(epoch)); g > 0 {
-		c.grantPeer(ctx, g)
-	}
-}
-
-// raise lifts the server's assumed W_conn to this side's MaxPeerWindow, once
-// per server incarnation (§4.2.1): a sid-0 grant of the difference, right
-// behind the first OPEN — the server's container for this incarnation exists
-// from then on. It is a MUST, not an optimisation: this side's grant cadence
-// is computed against MaxPeerWindow, so a sender left at W_conn against a
-// larger window would park before any batched grant fired.
-func (c *Conn) raise(ctx context.Context) {
-	if g := c.connRx.raise(); g > 0 {
 		c.grantPeer(ctx, g)
 	}
 }

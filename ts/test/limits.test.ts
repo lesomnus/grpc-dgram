@@ -9,7 +9,7 @@ import { DropPolicy, resolveLimits } from '../src/limits'
 import { Server, type ServerOptions } from '../src/server'
 import { abortCause, Code, type StatusError } from '../src/status'
 import type { Timing } from '../src/timing'
-import { FlagClose, FlagOpen, FlagPing, FlagWindow, frame, isOpen, isReset, isTerminal, shapeOf, type Frame } from '../src/wire'
+import { FlagClose, FlagOpen, FlagPing, FlagWindow, frame, isHeaderFrame, isOpen, isReset, isTerminal, shapeOf, type Frame } from '../src/wire'
 import { Counters } from '../src/stats'
 import { W_CONN } from '../src/util'
 import { echo, jsonCodec, makeNet, registerEcho, tick, wireClone } from '../src/testing'
@@ -455,15 +455,15 @@ describe('codec is call-scoped (§12)', () => {
 void jsonCodec
 
 // Limits: the floor at W_CONN, for the same reason the rx buffer is floored
-// at W_INIT — a sender assumes it.
-// Pins §4.2.1 Assumption: "MaxPeerWindow (§15) is floored at W_conn, for the
-// same reason the rx buffer is floored at W_init".
+// at W_INIT — a client assumes it until the server's first H or T.
+// Pins §4.2.1 Initial window: "MaxPeerWindow (§15) is floored at W_conn, for
+// the same reason the rx buffer is floored at W_init".
 // ---------------------------------------------------------------------------
 // §4.2.1 / §15 connection-window scope: the receiver's bound is per TRANSPORT
 // PEER across client epochs — an epoch-spoofing peer pins no more — while the
 // sender's credit is per (peer, client-epoch) container: each incarnation's
-// first admitted OPEN settles its own sender and draws its own raise. A
-// different transport peer has its own bound.
+// sender is created from its own first OPEN, and every H and T the server
+// sends advertises the bound. A different transport peer has its own bound.
 // ---------------------------------------------------------------------------
 
 describe('MaxPeerWindow scope (§4.2.1, §15)', () => {
@@ -478,9 +478,9 @@ describe('MaxPeerWindow scope (§4.2.1, §15)', () => {
 
   // Pins §4.2.1 Scope: "the receiver's bound is per transport peer, across
   // client epochs on the server ... the sender's credit is per peer
-  // incarnation".
-  it('the bound is per transport peer across client epochs; the sender and its raise are per incarnation', async () => {
-    const window = 2048 // above the W_CONN floor, so the raise is observable
+  // incarnation", and Advertisement: "the server on every H and T".
+  it('the bound is per transport peer across client epochs; the sender is per incarnation, and every H and T advertises the bound', async () => {
+    const window = 2048 // above the W_CONN floor, so the advertisement is observable
     // Reliable (the connection window is reliable-only), per-stream buffers
     // of a whole window so only the connection window can trip, handlers
     // that never read so everything stays buffered.
@@ -497,19 +497,15 @@ describe('MaxPeerWindow scope (§4.2.1, §15)', () => {
     const epochC = 0x4c
     const since = (from: number) => inj.sent.slice(from)
 
-    // Two bidi calls under epoch A: the first H is followed by A's raise
-    // (window − W_CONN, naming A), the second draws none.
+    // Two bidi calls under epoch A: each creation ack advertises the bound,
+    // and nothing rides behind it.
     for (let sid = 1; sid <= 2; sid++) {
       const from = inj.sent.length
       await inj.server.handle(openLive(epochA, sid), { peer: peerA })
       const out = since(from)
-      expect(out[0] !== undefined && isAckH(out[0]), 'creation ack H (§8)').toBe(true)
-      if (sid === 1) {
-        expect(out[1] !== undefined && isPeerGrantFor(epochA)(out[1]), 'the raise rides behind the first H').toBe(true)
-        expect(out[1]!.window).toBe(window - W_CONN)
-      } else {
-        expect(out).toHaveLength(1)
-      }
+      expect(out).toHaveLength(1)
+      expect(isAckH(out[0]!), 'creation ack H (§8)').toBe(true)
+      expect(out[0]!.connWindow, 'the ack advertises the bound').toBe(window)
     }
     // Fill peerA's whole bound across the two calls: nothing is refused.
     let from = inj.sent.length
@@ -521,11 +517,12 @@ describe('MaxPeerWindow scope (§4.2.1, §15)', () => {
     expect(since(from), 'exactly the window fits').toHaveLength(0)
 
     // A call under a DIFFERENT client epoch of the SAME peer: its own sender
-    // (settled by its OPEN, raised behind its H, naming B)...
+    // (created from its OPEN), its own ack advertising the same bound...
     from = inj.sent.length
     await inj.server.handle(openLive(epochB, 1), { peer: peerA })
-    expect(since(from)[0] !== undefined && isAckH(since(from)[0]!), 'creation ack H for the new incarnation').toBe(true)
-    expect(since(from)[1] !== undefined && isPeerGrantFor(epochB)(since(from)[1]!), 'each incarnation is owed its own raise').toBe(true)
+    expect(since(from)).toHaveLength(1)
+    expect(isAckH(since(from)[0]!), 'creation ack H for the new incarnation').toBe(true)
+    expect(since(from)[0]!.connWindow, 'advertising the bound').toBe(window)
     // ...but the SAME receive bound: one more frame from this peer is one
     // too many, and it fails its own call INTERNAL, naming the window. The
     // refused frame's credit comes straight back beside the terminal: the
@@ -543,13 +540,15 @@ describe('MaxPeerWindow scope (§4.2.1, §15)', () => {
     expect(term!.code).toBe(Code.INTERNAL)
     expect(term!.peerEpoch).toBe(epochB)
     expect(term!.desc).toContain('connection flow-control window')
+    expect(term!.connWindow, 'the T advertises the bound too').toBe(window)
     expect(g !== undefined && isPeerGrantFor(epochB)(g) && g.window === 1, 'the refused frame’s credit, to B').toBe(true)
+    expect(g!.connWindow, 'a WINDOW never carries it').toBe(0)
 
     // A different transport peer is under ITS OWN bound: admitted, buffered.
     from = inj.sent.length
     await inj.server.handle(openLive(epochC, 1), { peer: peerB })
-    expect(since(from)[0] !== undefined && isAckH(since(from)[0]!), 'creation ack for the other peer').toBe(true)
-    expect(since(from)).toHaveLength(2) // and its raise
+    expect(since(from)).toHaveLength(1)
+    expect(isAckH(since(from)[0]!), 'creation ack for the other peer').toBe(true)
     from = inj.sent.length
     await inj.server.handle(dataFrame(epochC, 1, 2), { peer: peerB })
     await tick()
@@ -581,15 +580,13 @@ describe('MaxPeerWindow floor and cap (§4.2.1, §15, §7)', () => {
 
   // maxPeerWindow: Infinity — the natural JS spelling of "unlimited", and one
   // rxBuffer.size happens to accept — must be a working window, not a silent
-  // one. Unclamped, Infinity reached the ledger: the raise went out as
-  // `window: Infinity`, which the uint32 varint encoder put on the wire as a
-  // WINDOW of 0 (dropped: a grant never enables, §4.2.1), and the grant
-  // rule's thresholds compared against Infinity so no batched or starvation
-  // grant ever fired — the peer spent its assumed W_CONN and every later
-  // send failed UNAVAILABLE at T_stall. Go cannot express it (MaxPeerWindow
-  // is an int, cast to uint32 at the ledger), so the clamp is where TS meets
-  // the wire.
-  it('Infinity is as much as the wire carries: the raise lifts the peer, and W_CONN + 1 messages move each way', async () => {
+  // one. Unclamped, Infinity would reach the ledger, where the grant rule's
+  // thresholds compare against it so no batched or starvation grant ever
+  // fires, and the wire, whose uint32 varint cannot carry the advertisement
+  // — the peer would run on whatever it read there. Go cannot express it
+  // (MaxPeerWindow is an int, cast to uint32 at the ledger), so the clamp is
+  // where TS meets the wire.
+  it('Infinity is as much as the wire carries: the advertisement carries it, and W_CONN + 1 messages move each way', async () => {
     const stallMs = 50
     const limits = { maxPeerWindow: Infinity }
     const c = new Counters()
@@ -600,19 +597,20 @@ describe('MaxPeerWindow floor and cap (§4.2.1, §15, §7)', () => {
       serverOpts: { limits, timing: { stallMs }, protocolStats: [s.observe] },
     })
     const isPeerGrant = (f: Frame): boolean => shapeOf(f) === FlagWindow && f.sid === 0 && f.seq === 0 && f.payload === undefined
-    const raise = 0xffff_ffff - W_CONN
+    const advertised = 0xffff_ffff
 
     const stream = net.conn.newStream(echo.live, {})
     await stream.send({ text: 'm' })
     expect(await stream.recv()).toEqual({ text: 'echo:m' })
-    // The client's raise rides behind its OPEN, the server's behind its H:
-    // each lifts the other's assumed W_CONN to everything a uint32 holds.
-    expect(net.sentC2S.filter(isPeerGrant).map((f) => f.window), "the client's raise").toEqual([raise])
-    expect(net.sentS2C.filter(isPeerGrant).map((f) => f.window), "the server's raise").toEqual([raise])
+    // The client's OPEN and the server's H each advertise everything a
+    // uint32 holds, and the other side runs on it.
+    expect(net.sentC2S.filter(isOpen).map((f) => f.connWindow), "the client's advertisement").toEqual([advertised])
+    expect(net.sentS2C.filter(isHeaderFrame).map((f) => f.connWindow), "the server's advertisement").toEqual([advertised])
+    expect(net.conn.connTx.state(), 'adopted by the client').toMatchObject({ on: true, observed: true, granted: advertised })
 
     // W_CONN + 1 round trips: the last message in each direction is past the
-    // assumption and moves on the raised credit alone — no batched grant is
-    // ever due against a window this size.
+    // old assumption and moves on the advertised window alone — no batched
+    // grant is ever due against a window this size.
     for (let i = 1; i < W_CONN; i++) {
       await stream.send({ text: 'm' })
       expect(await stream.recv()).toEqual({ text: 'echo:m' })
@@ -625,6 +623,8 @@ describe('MaxPeerWindow floor and cap (§4.2.1, §15, §7)', () => {
     expect(await stream.recv()).toEqual({ text: 'echo:last' })
     expect(c.snapshot(), 'the client parked on nothing').toMatchObject({ peerFlowStall: 0, flowStall: 0 })
     expect(s.snapshot(), 'the server parked on nothing').toMatchObject({ peerFlowStall: 0, flowStall: 0 })
+    expect(net.sentC2S.filter(isPeerGrant), 'no sid-0 grant is ever due against a window this size').toHaveLength(0)
+    expect(net.sentS2C.filter(isPeerGrant)).toHaveLength(0)
 
     stream.closeSend()
     expect(await stream.recv()).toBeUndefined()

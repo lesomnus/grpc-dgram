@@ -20,11 +20,12 @@ package drpc_test
 //     assumption safe (§4.2.1, Appendix B);
 //   - the connection window beside the per-stream one (§4.2.1, §15), end to
 //     end and cross-cutting: sid 0 silent in unreliable mode and stateless in
-//     reliable mode, the raise, the single T_stall budget across both windows,
-//     no credit held while parked on the other window, and the leak test —
-//     one credit back for every data frame, over a long-lived Conn. The client
-//     and server halves against scripted peers are flow_peer_client_test.go
-//     and flow_peer_server_test.go.
+//     reliable mode, the advertisement on every OPEN, H and T and the window
+//     it buys, the single T_stall budget across both windows, no credit held
+//     while parked on the other window, and the leak test — one credit back
+//     for every data frame, over a long-lived Conn. The client and server
+//     halves against scripted peers are flow_peer_client_test.go and
+//     flow_peer_server_test.go.
 
 import (
 	"context"
@@ -190,7 +191,9 @@ func (p *flowPeer) Handle(ctx context.Context, f *drpc.Frame) error {
 	if !open {
 		return nil
 	}
-	// The creation ack carries this side's advertisement (§4.2.1, §8).
+	// The creation ack carries this side's per-stream advertisement (§4.2.1,
+	// §8) and no connection window: a server without connection flow
+	// control, so only the stream window can bind below.
 	h := p.frame(0)
 	h.SetSeq(1)
 	h.SetWindow(p.window)
@@ -598,7 +601,8 @@ func TestFlow_RefusedSendRefundsCredit(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // flowBuffOpen builds the eager, bare OPEN of a client-streaming call,
-// advertising the client's window (§8, §4.2.1).
+// advertising the client's window and, as every reliable-mode OPEN does, its
+// connection window — W_conn, the default (§8, §4.2.1).
 func flowBuffOpen(epoch, sid, window uint32) *drpc.Frame {
 	f := &drpc.Frame{}
 	f.SetEpoch(epoch)
@@ -607,6 +611,7 @@ func flowBuffOpen(epoch, sid, window uint32) *drpc.Frame {
 	f.SetFlags(drpc.FlagOpen)
 	f.SetMethod(echo.EchoService_Buff_FullMethodName)
 	f.SetWindow(window)
+	f.SetConnWindow(wConnTest)
 	return f
 }
 
@@ -692,8 +697,8 @@ func halfCloseFrame(epoch, sid, seq uint32) *drpc.Frame {
 	return f
 }
 
-// Pins §4.2.1 Unreliable mode: "no assumption, no ledger, no raise, and a
-// WINDOW sid = 0 is dropped like every other WINDOW there."
+// Pins §4.2.1 Unreliable mode: "no advertisement, no assumption, no ledger,
+// and a WINDOW sid = 0 is dropped like every other WINDOW there."
 func TestPeerWindow_SilentInUnreliableMode(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		// A sid-0 grant of one message forged in each direction, right behind
@@ -793,8 +798,9 @@ func TestPeerWindow_Sid0NeverEnablesOrCreatesState(t *testing.T) {
 
 	// ...and its 40-message Buff runs on per-stream grants alone — one per
 	// half window consumed, on the call's own sid, which this scripted client
-	// honours like a real one — with nothing on sid 0: at the default
-	// MaxPeerWindow there is no raise, and 40 consumed is far from a batch.
+	// honours like a real one — with nothing on sid 0: the connection window
+	// is advertised, never granted up front, and 40 consumed is far from a
+	// batch.
 	const n = 40
 	item, err := proto.Marshal(echo.EchoRequest_builder{Message: "m", Repeat: 1}.Build())
 	x.NoError(t, err)
@@ -834,16 +840,18 @@ func TestPeerWindow_Sid0NeverEnablesOrCreatesState(t *testing.T) {
 	}
 }
 
-// Pins §4.2.1 Raise: "A receiver whose MaxPeerWindow exceeds W_conn MUST lift
-// the sender's assumption once per peer incarnation with a sid = 0 grant of
-// MaxPeerWindow − W_conn" — the server right behind its first H, the client
-// right behind its first OPEN — and "A receiver at the floor sends none."
-func TestPeerWindow_Raise(t *testing.T) {
+// Pins §4.2.1 Advertisement: "A receiver advertises its connection window —
+// what it will buffer from this peer across all of its calls, MaxPeerWindow
+// (§15) — as Frame.conn_window ... the client on every OPEN; the server on
+// every H and T", and Initial window: "The advertisement is authoritative and
+// replaces the assumption" — end to end, both ways, and nothing on sid 0
+// behind any of them.
+func TestPeerWindow_Advertised(t *testing.T) {
 	const window = 2 * wConnTest
 	limits := drpc.WithLimits(drpc.Limits{MaxPeerWindow: window})
 	isOpen := func(f *drpc.Frame) bool { return f.GetFlags()&drpc.FlagOpen != 0 }
 
-	t.Run("server: behind the first H, naming the client incarnation", func(t *testing.T) {
+	t.Run("server: on every H and T", func(t *testing.T) {
 		bubble(t, func(t *testing.T) {
 			client, stop := PipeOption{
 				ConnOpts:   []drpc.ConnOption{drpc.WithReliable(true)},
@@ -857,25 +865,34 @@ func TestPeerWindow_Raise(t *testing.T) {
 			x.NoError(t, err)
 			synctest.Wait()
 
-			// Exactly: the first call's ack, the raise, the second call's ack.
+			// Exactly the two creation acks, each advertising the window;
+			// the client's OPENs carry its own default.
 			rx := client.rxFrames()
-			x.Equal(t, 3, len(rx), "got ", rx)
-			x.True(t, isAckH(rx[0]) && rx[0].GetSid() == 1, "the first H, got ", rx[0])
-			raise := rx[1]
-			x.True(t, isPeerGrant(raise), "the raise rides right behind the first H, got ", raise)
-			x.Equal(t, uint32(window-wConnTest), raise.GetWindow())
-			x.Equal(t, rx[0].GetEpoch(), raise.GetEpoch(), "the server's own epoch")
-			x.Equal(t, firstMatch(client.txFrames(), isOpen).GetEpoch(), raise.GetPeerEpoch(),
-				"names the client incarnation it lifts (§6.1)")
-			x.True(t, isAckH(rx[2]) && rx[2].GetSid() == 2, "the second H draws no raise, got ", rx[2])
+			x.Equal(t, 2, len(rx), "got ", rx)
+			for i, f := range rx {
+				x.True(t, isAckH(f) && f.GetSid() == uint32(i+1), "the H of call ", i+1, ", got ", f)
+				x.Equal(t, uint32(window), f.GetConnWindow(), "every H advertises MaxPeerWindow")
+			}
+			for _, f := range client.txFrames() {
+				x.True(t, isOpen(f), "got ", f)
+				x.Equal(t, uint32(wConnTest), f.GetConnWindow(), "the client's default, floored at W_conn")
+			}
 
 			for _, s := range []echo.EchoService_BuffClient{a, b} {
 				_, err := s.CloseAndRecv()
 				x.NoError(t, err)
 			}
+			terms := 0
+			for _, f := range client.rxFrames() {
+				if isTerminal(f) {
+					terms++
+					x.Equal(t, uint32(window), f.GetConnWindow(), "every T advertises MaxPeerWindow")
+				}
+			}
+			x.Equal(t, 2, terms)
 		})
 	})
-	t.Run("client: behind the first OPEN", func(t *testing.T) {
+	t.Run("client: on every OPEN", func(t *testing.T) {
 		bubble(t, func(t *testing.T) {
 			client, stop := PipeOption{
 				ConnOpts:   []drpc.ConnOption{drpc.WithReliable(true), limits},
@@ -887,17 +904,24 @@ func TestPeerWindow_Raise(t *testing.T) {
 			x.NoError(t, err)
 			b, err := client.Buff(t.Context())
 			x.NoError(t, err)
+			sendN(t, a, 3)
 			synctest.Wait()
 
-			// Exactly: the first OPEN, the raise, the second OPEN.
 			tx := client.txFrames()
-			x.Equal(t, 3, len(tx), "got ", tx)
-			x.True(t, isOpen(tx[0]) && tx[0].GetSid() == 1, "the first OPEN, got ", tx[0])
-			raise := tx[1]
-			x.True(t, isPeerGrant(raise), "the raise rides right behind the first OPEN, got ", raise)
-			x.Equal(t, uint32(window-wConnTest), raise.GetWindow())
-			x.Equal(t, tx[0].GetEpoch(), raise.GetEpoch(), "the client's own epoch")
-			x.True(t, isOpen(tx[2]) && tx[2].GetSid() == 2, "the second OPEN draws no raise, got ", tx[2])
+			x.Equal(t, 2, countMatch(tx, isOpen), "got ", tx)
+			x.Equal(t, 3, countMatch(tx, isDataFrame))
+			x.Equal(t, 5, len(tx), "OPENs and data alone: nothing on sid 0, got ", tx)
+			for _, f := range tx {
+				if isOpen(f) {
+					x.Equal(t, uint32(window), f.GetConnWindow(), "every OPEN advertises MaxPeerWindow")
+				} else {
+					x.Equal(t, uint32(0), f.GetConnWindow(), "a data frame carries none")
+				}
+			}
+			for _, f := range client.rxFrames() {
+				x.True(t, isAckH(f), "got ", f)
+				x.Equal(t, uint32(wConnTest), f.GetConnWindow(), "the server's default, floored at W_conn")
+			}
 
 			for _, s := range []echo.EchoService_BuffClient{a, b} {
 				_, err := s.CloseAndRecv()
@@ -905,7 +929,7 @@ func TestPeerWindow_Raise(t *testing.T) {
 			}
 		})
 	})
-	t.Run("honoured: exactly MaxPeerWindow frames go out unparked", func(t *testing.T) {
+	t.Run("honoured: exactly the advertised window goes out unparked", func(t *testing.T) {
 		bubble(t, func(t *testing.T) {
 			events := &flowEvents{}
 			client, stop := PipeOption{
@@ -923,26 +947,83 @@ func TestPeerWindow_Raise(t *testing.T) {
 			defer cancel()
 			stream, err := client.Buff(ctx)
 			x.NoError(t, err)
-			synctest.Wait() // the ack and the raise have landed
+			synctest.Wait() // the ack, and the advertisement on it, has landed
 			sendN(t, stream, window)
-			x.Equal(t, 0, events.count(drpc.EventPeerFlowStall), "W_conn + the raise go out unparked")
+			x.Equal(t, 0, events.count(drpc.EventPeerFlowStall), "the advertised 2048 go out unparked: the assumption was replaced")
 			x.Equal(t, 0, events.count(drpc.EventFlowStall))
 
 			done := make(chan error, 1)
 			go func() { done <- stream.Send(echo.EchoRequest_builder{Message: "m"}.Build()) }()
 			defer func() { <-done }()
 			synctest.Wait()
-			x.Equal(t, 1, events.count(drpc.EventPeerFlowStall), "the next one parks: the lifted window is exact")
+			x.Equal(t, 1, events.count(drpc.EventPeerFlowStall), "the 2049th parks: the advertised window is exact")
 			x.Equal(t, 0, events.count(drpc.EventFlowStall))
 			x.Equal(t, window, countMatch(client.txFrames(), isDataFrame))
 			cancel() // releases the parked send
 		})
 	})
-	t.Run("at the floor: none, and W_conn still fits", func(t *testing.T) {
+	t.Run("assumed until the first H, then lifted, counted against what was sent", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			events := &flowEvents{}
+			gate := make(chan struct{})
+			// hold delays every server frame until the gate opens, in order:
+			// no ack, so no advertisement of either window, reaches the
+			// client until then.
+			hold := func(next drpc.FrameHandler) drpc.FrameHandler {
+				return drpc.FrameHandlerFunc(func(ctx context.Context, f *drpc.Frame) error {
+					<-gate
+					return next.Handle(ctx, f)
+				})
+			}
+			client, stop := PipeOption{
+				ConnOpts: []drpc.ConnOption{drpc.WithReliable(true), drpc.WithProtocolStats(events)},
+				ServerOpts: []drpc.ServerOption{
+					drpc.WithReliable(true), limits, drpc.WithRxBuffer(2*window, drpc.DropNewest), blockStreams(),
+				},
+				S2C: hold,
+			}.Use(t)
+			defer stop()
+
+			// Before any H: W_init per call and W_conn across them, on the
+			// assumptions alone — 32 calls of 32 fill the connection window
+			// with no stream window ever full, and the 1025th parks on it.
+			spendWConn(t, client)
+			x.Equal(t, 0, events.count(drpc.EventPeerFlowStall), "W_conn go out on the assumption")
+			x.Equal(t, 0, events.count(drpc.EventFlowStall))
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			extra, err := client.Buff(ctx)
+			x.NoError(t, err)
+			done := make(chan error, 1)
+			go func() { done <- extra.Send(echo.EchoRequest_builder{Message: "m"}.Build()) }()
+			synctest.Wait()
+			x.Equal(t, 1, events.count(drpc.EventPeerFlowStall), "the 1025th parks on the assumed connection window")
+			x.Equal(t, 0, events.count(drpc.EventFlowStall))
+
+			// The acks land, the first advertising 2048: the park ends, and
+			// exactly 2048 − 1025 more go out before the next — the
+			// advertisement is counted against what was already sent.
+			close(gate)
+			x.NoError(t, <-done)
+			synctest.Wait() // every held ack has landed: the stream windows are advertised too
+			x.Equal(t, 1, events.count(drpc.EventPeerFlowResume))
+			sendN(t, extra, window-wConnTest-1)
+			x.Equal(t, 1, events.count(drpc.EventPeerFlowStall), "no second park short of the advertised window")
+			go func() { done <- extra.Send(echo.EchoRequest_builder{Message: "m"}.Build()) }()
+			defer func() { <-done }()
+			synctest.Wait()
+			x.Equal(t, 2, events.count(drpc.EventPeerFlowStall), "the 2049th parks: lifted, not restarted")
+			x.Equal(t, 0, events.count(drpc.EventFlowStall))
+			x.Equal(t, window, countMatch(client.txFrames(), isDataFrame))
+			cancel() // releases the parked send
+		})
+	})
+	t.Run("at the floor: W_conn is advertised, and W_conn still fits", func(t *testing.T) {
 		bubble(t, func(t *testing.T) {
 			// MaxPeerWindow below W_conn on both sides is raised to it: a
-			// receiver holding less than a sender assumes would be overrun
-			// by a conforming sender (§4.2.1 Assumption).
+			// receiver holding less than a client assumes before the
+			// advertisement would be overrun by a conforming client (§4.2.1
+			// Initial window).
 			floored := drpc.WithLimits(drpc.Limits{MaxPeerWindow: 100})
 			events := &flowEvents{}
 			gate := make(chan struct{})
@@ -954,7 +1035,9 @@ func TestPeerWindow_Raise(t *testing.T) {
 
 			streams := spendWConn(t, client) // W_conn messages buffered across 32 calls
 			synctest.Wait()
-			x.Equal(t, 0, countMatch(client.txFrames(), isPeerGrant), "nothing to raise by")
+			x.Equal(t, uint32(wConnTest), firstMatch(client.txFrames(), isOpen).GetConnWindow(), "advertised at the floor")
+			x.Equal(t, uint32(wConnTest), firstMatch(client.rxFrames(), isAckH).GetConnWindow())
+			x.Equal(t, 0, countMatch(client.txFrames(), isPeerGrant), "nothing consumed, nothing granted")
 			x.Equal(t, 0, countMatch(client.rxFrames(), isPeerGrant))
 			x.Equal(t, 0, countMatch(client.rxFrames(), isTerminal), "W_conn unread messages fit: no INTERNAL")
 			x.Equal(t, 0, events.count(drpc.EventPeerFlowStall))
@@ -969,9 +1052,10 @@ func TestPeerWindow_Raise(t *testing.T) {
 	})
 }
 
-// Pins §4.2.1 Raise: the client raises "right behind its first OPEN (the OPEN
-// creates the container the grant addresses, admitted or rejected — §9.4)".
-func TestPeerWindow_RaiseLandsAfterARejectedFirstOpen(t *testing.T) {
+// Pins §9.4 Container on rejection: the rejected OPEN "was validated (§9.1)
+// and carries the client's advertisement, from which the container's sender
+// is created" — and the rejection T carries the server's, like any T.
+func TestPeerWindow_RejectedFirstOpenAdvertises(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		const window = 2 * wConnTest
 		events := &flowEvents{}
@@ -987,7 +1071,8 @@ func TestPeerWindow_RaiseLandsAfterARejectedFirstOpen(t *testing.T) {
 
 		// The Conn's first OPEN names a streaming method the server does not
 		// have: T{UNIMPLEMENTED}, no call — and, since the OPEN was validated,
-		// a container for this incarnation (§9.4).
+		// a container for this incarnation whose sender is created from the
+		// 2048 the OPEN advertises (§9.4).
 		nope, err := client.conn.NewStream(t.Context(),
 			&grpc.StreamDesc{StreamName: "Nope", ServerStreams: true}, "/echo.EchoService/Nope")
 		x.NoError(t, err)
@@ -996,13 +1081,17 @@ func TestPeerWindow_RaiseLandsAfterARejectedFirstOpen(t *testing.T) {
 		x.Equal(t, codes.Unimplemented, status.Code(err))
 		synctest.Wait() // the pump has delivered everything the client sent
 		tx := client.txFrames()
-		x.True(t, len(tx) >= 2 && tx[0].GetFlags()&drpc.FlagOpen != 0 && isPeerGrant(tx[1]),
-			"the raise rides right behind the rejected OPEN, got ", tx)
+		x.Equal(t, 1, len(tx), "the OPEN alone: nothing rides behind it on sid 0, got ", tx)
+		x.True(t, tx[0].GetFlags()&drpc.FlagOpen != 0, "got ", tx[0])
+		x.Equal(t, uint32(window), tx[0].GetConnWindow(), "the rejected OPEN advertises the client's window")
+		rej := firstMatch(client.rxFrames(), isTerminal)
+		x.True(t, rej != nil && codes.Code(rej.GetCode()) == codes.Unimplemented, "got ", rej)
+		x.Equal(t, uint32(wConnTest), rej.GetConnWindow(), "the rejection T advertises the server's window like any T")
 
-		// 1500 unread responses: past W_conn, within the lifted window. The
-		// server's sender toward this incarnation runs on the raise the
-		// rejection gave a home to — a server that had dropped it would park
-		// at 1024.
+		// 1500 unread responses: past W_conn, within the advertised window.
+		// The server's sender toward this incarnation runs on the window the
+		// rejected OPEN advertised — a server that had assumed instead would
+		// park at 1024.
 		const burst = wConnTest + 476
 		many, err := client.Many(t.Context(), echo.EchoRequest_builder{Message: "m", Repeat: burst}.Build())
 		x.NoError(t, err)
@@ -1311,13 +1400,15 @@ func TestPeerWindow_CancelledCallsLeakNoCredit(t *testing.T) {
 }
 
 // Pins §4.2.1 Restart: the Conn "locks ... on the first sequenced frame it
-// hears from it, for a live call or for one it has already released" — so
-// the raise that rides behind the creation ack of a call the client cancelled
-// in the meantime still lands, end to end.
-func TestPeerWindow_RaiseSurvivesACancelledFirstCall(t *testing.T) {
+// hears from it, for a live call or for one it has already released ... and
+// if it is an H or T, carries its advertisement, which the Conn applies as it
+// locks" — so the advertisement on the creation ack of a call the client
+// cancelled in the meantime still lands, end to end.
+func TestPeerWindow_AdvertisementLandsOnAReleasedCallEndToEnd(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		// Above 2 × W_conn: a lost raise would be a forever-park, not a slow
-		// one (no cadence of a 4096 receiver reaches a sender stuck at 1024).
+		// Above 2 × W_conn: had the H been dropped as a stranger's, no cadence
+		// of a 4096 receiver would reach a sender stuck at 1024 — a
+		// forever-park, not a slow one.
 		const window = 4 * wConnTest
 		events := &flowEvents{}
 		gate := make(chan struct{})
@@ -1338,27 +1429,27 @@ func TestPeerWindow_RaiseSurvivesACancelledFirstCall(t *testing.T) {
 		defer stop()
 
 		// The Conn's first streaming call is cancelled before the server's
-		// creation ack — and the raise right behind it — reaches the client.
+		// creation ack — and the advertisement on it — reaches the client.
 		ctx, cancel := context.WithCancel(t.Context())
 		_, err := client.Buff(ctx)
 		x.NoError(t, err)
-		synctest.Wait() // the server answered: H(1) and the raise wait at the gate
+		synctest.Wait() // the server answered: H(1) waits at the gate
 		cancel()
 		synctest.Wait()
 		close(gate)
 		synctest.Wait()
 		rx := client.rxFrames()
-		x.True(t, len(rx) >= 2 && isAckH(rx[0]) && rx[0].GetSid() == 1 && isPeerGrant(rx[1]),
-			"the H, then the raise, got ", rx)
-		x.Equal(t, uint32(window-wConnTest), rx[1].GetWindow())
+		x.True(t, len(rx) >= 1 && isAckH(rx[0]) && rx[0].GetSid() == 1, "the H, got ", rx)
+		x.Equal(t, uint32(window), rx[0].GetConnWindow(), "carrying the advertisement")
 		x.True(t, countMatch(client.txFrames(), isResetFrame) >= 1, "the H found no call: a RESET")
+		x.Equal(t, 0, countMatch(client.rxFrames(), isPeerGrant), "nothing consumed: nothing granted")
 
-		// Past W_conn on the next call, nothing parks: the raise was honoured
-		// although the H it followed landed on no call.
+		// Past W_conn on the next call, nothing parks: the advertisement was
+		// applied although the H it rode landed on no call.
 		s, err := client.Buff(t.Context())
 		x.NoError(t, err)
 		sendN(t, s, int(wConnTest+500))
-		x.Equal(t, 0, events.count(drpc.EventPeerFlowStall), "the raise landed")
+		x.Equal(t, 0, events.count(drpc.EventPeerFlowStall), "the advertisement landed")
 		_, err = s.CloseAndRecv()
 		x.NoError(t, err)
 	})

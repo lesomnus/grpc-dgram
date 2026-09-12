@@ -3,14 +3,19 @@
 // against a scripted server on the far end of the Conn's tx, so every rule can
 // be observed without a TS server that grants on sid 0 yet:
 //
-//   - a sender assumes W_CONN per Conn and parks — on the connection window,
-//     not the stream window — once it has spent it, bounded by T_stall;
+//   - a sender assumes W_CONN per Conn until the server's first H or T
+//     advertises its connection window, and parks — on the connection
+//     window, not the stream window — once it has spent it, bounded by
+//     T_stall;
 //   - only a sid-0 WINDOW from the server incarnation the Conn is locked to
 //     credits it; a foreign one is dropped in silence, never RESET;
-//   - only a streaming call's creation-ack H settles the window: a unary T
-//     never does, and an H with window 0 turns it off;
-//   - a new server incarnation starts the sender over (§10.6);
-//   - the raise rides right behind the first OPEN, once per incarnation;
+//   - the first H or T heard from a server incarnation advertises the window
+//     (a unary T included), the first one wins, an absent one turns it off,
+//     and a grant never enables;
+//   - a new server incarnation starts the sender over (§10.6) and its own
+//     advertisement is adopted;
+//   - every OPEN — eager or piggybacked — carries this side's connection
+//     window, maxPeerWindow, and no other client frame does;
 //   - an overrun fails the offending call INTERNAL and nothing else;
 //   - every data frame received returns exactly one credit on sid 0:
 //     consumed, discarded with its call, or never buffered;
@@ -30,7 +35,7 @@ import { Conn, type ClientStream, type ConnOptions } from '../src/conn'
 import type { FrameHandler } from '../src/seam'
 import { Counters, type ProtocolEvent, type ProtocolEventKind, type ProtocolStats } from '../src/stats'
 import { Code, MessageTooLargeError, type StatusError } from '../src/status'
-import { W_CONN } from '../src/util'
+import { W_CONN, W_INIT } from '../src/util'
 import { FlagClose, FlagWindow, frame, isData, isOpen, isReset, isTerminal, shapeOf, type Frame } from '../src/wire'
 import { echo, tick, wireClone, type TestReq, type TestRes } from '../src/testing'
 
@@ -47,13 +52,6 @@ const isPeerGrant = (f: Frame): boolean => shapeOf(f) === FlagWindow && f.sid ==
 function peerGrants(frames: readonly Frame[]): { n: number; total: number } {
   const gs = frames.filter(isPeerGrant)
   return { n: gs.length, total: gs.reduce((a, f) => a + f.window, 0) }
-}
-
-// afterFirstOpen returns the frame the client sent right behind its first
-// OPEN, if any.
-function afterFirstOpen(frames: readonly Frame[]): Frame | undefined {
-  const i = frames.findIndex(isOpen)
-  return i < 0 ? undefined : frames[i + 1]
 }
 
 class EventLog {
@@ -73,15 +71,19 @@ class EventLog {
 
 // PeerSrv is a scripted server on the far end of a Conn's tx. It records
 // everything the client sends, answers every OPEN synchronously — a
-// creation-ack H carrying its advertisement for a streaming call, a T for a
-// unary one — and lets a test inject sequenced data frames or sid-0 grants
-// under whichever server incarnation it currently is.
+// creation-ack H carrying its per-stream advertisement for a streaming call,
+// a T for a unary one, both carrying its connection-window advertisement as
+// every server H and T does (§4.2.1) — and lets a test inject sequenced data
+// frames or sid-0 grants under whichever server incarnation it currently is.
 class PeerSrv implements FrameHandler {
   conn!: Conn
   epoch: number // the incarnation answering now; restart changes it
   clientEpoch = 0 // learned from the first OPEN
   muted = false // answer no OPEN: the test injects the ack itself
   refuseOver: number | undefined // payload bytes past which the adapter refuses (§4.4)
+  // The connection window advertised on every H and T (conn_window); 0
+  // leaves the field absent, as a server without one would.
+  connWindow = W_CONN
   readonly tx: Frame[] = []
   private readonly seq = new Map<number, number>() // last server seq per sid
 
@@ -100,15 +102,18 @@ class PeerSrv implements FrameHandler {
     if (open) this.clientEpoch = g.epoch
     if (!open || this.muted) return
     if (g.method === echo.once.path) {
-      // A unary call ends in its T: no H, no window (§8).
+      // A unary call ends in its T: no H, no per-stream window (§8) — but
+      // the connection window, like every T (§4.2.1).
       const t = this.frame(g.sid, FlagClose)
       t.code = Code.OK
       t.payload = enc({ text: 'ok' })
+      t.connWindow = this.connWindow
       await this.conn.handle(t, {})
       return
     }
     const h = this.frame(g.sid, 0)
     h.window = this.window
+    h.connWindow = this.connWindow
     await this.conn.handle(h, {})
   }
 
@@ -146,9 +151,12 @@ class PeerSrv implements FrameHandler {
 
 // clientFixture wires a Conn to a PeerSrv. srvWindow is the per-stream window
 // the fake advertises on its H — large, so that the STREAM window never binds
-// and every park below is the connection window's.
-function clientFixture(srvEpoch: number, srvWindow: number, opts: ConnOptions = {}) {
+// and every park below is the connection window's; connWindow is the
+// connection window it advertises on every H and T (W_CONN unless said
+// otherwise, so the sender's advertised window equals its assumption).
+function clientFixture(srvEpoch: number, srvWindow: number, opts: ConnOptions = {}, connWindow = W_CONN) {
   const srv = new PeerSrv(srvEpoch, srvWindow)
+  srv.connWindow = connWindow
   const counters = new Counters()
   const log = new EventLog()
   const conn = new Conn(srv, { reliable: true, timing: { stallMs: STALL_MS }, protocolStats: [counters.observe, log.observe], ...opts })
@@ -185,15 +193,56 @@ afterEach(() => {
 })
 
 // ---------------------------------------------------------------------------
-// §4.2.1 sending: W_CONN is spent across the Conn, then the sender parks on
+// §4.2.1 sending: the client assumes W_CONN until the server's first H or T
+// advertises its connection window, spends it across the Conn, then parks on
 // the CONNECTION window — its stream window still has credit — and fails
 // UNAVAILABLE at T_stall naming that window. One budget, not two.
 // ---------------------------------------------------------------------------
 
-describe('the sender assumes W_CONN per Conn (§4.2.1 Assumption)', () => {
-  // Pins "Every sender assumes W_conn = 1024 messages (§10.1, Appendix B)
-  // toward each peer incarnation from the moment it holds state for it".
-  it('parks on the connection window after W_CONN messages and fails UNAVAILABLE exactly at T_stall, naming it', async () => {
+describe('the sender assumes W_CONN until the advertisement (§4.2.1 Initial window, Sending)', () => {
+  // Pins "Until the advertisement arrives a sender paces itself by W_conn =
+  // 1024 messages ... The advertisement is authoritative and replaces the
+  // assumption, counted against what the sender has already sent". Before
+  // the first H every stream is paced by W_init too, so the assumption is
+  // spent across W_CONN / W_INIT calls of exactly a stream window each.
+  it('paces itself by W_CONN before the first H, then continues on the advertised window counted against what was sent', async () => {
+    const { srv, conn, counters } = clientFixture(SRV_A, 4096, {}, 4096)
+    srv.muted = true // no ack yet: the sender is on its assumptions
+    for (let i = 0; i < W_CONN / W_INIT; i++) {
+      const s = conn.newStream(echo.count, {})
+      await sendN(s, W_INIT)
+    }
+    expect(counters.snapshot(), 'W_CONN messages go out unparked').toMatchObject({ peerFlowStall: 0, flowStall: 0 })
+    const stream = conn.newStream(echo.count, {})
+    const p = park(stream)
+    await tick()
+    expect(counters.snapshot(), 'the W_CONN + 1st parks on the connection window').toMatchObject({ peerFlowStall: 1, flowStall: 0 })
+    expect(conn.connTx.state()).toMatchObject({ on: true, observed: false, granted: W_CONN, sent: W_CONN })
+
+    // The creation ack arrives, advertising 4096 on both windows: the park
+    // ends, and the sender has 4096 − W_CONN − 1 more before the advertised
+    // window binds.
+    const h = srv.frame(stream.sid, 0)
+    h.window = 4096
+    h.connWindow = 4096
+    await conn.handle(h, {})
+    await p.done
+    expect(p.err).toBeUndefined()
+    expect(counters.snapshot().peerFlowResume).toBe(1)
+    expect(conn.connTx.state()).toMatchObject({ on: true, observed: true, granted: 4096, sent: W_CONN + 1 })
+    await sendN(stream, 4096 - W_CONN - 1)
+    expect(counters.snapshot().peerFlowStall, 'exactly the advertised window').toBe(1)
+    const q = park(stream)
+    await tick()
+    expect(counters.snapshot().peerFlowStall).toBe(2)
+    conn.close()
+    await q.done
+  })
+
+  // Pins "A sender with no credit parks — bounded ... by T_stall (§10.1),
+  // after which the call fails UNAVAILABLE", naming the window; the fake
+  // advertises W_CONN, so the advertised window is the assumed one.
+  it('parks on the connection window after the advertised W_CONN and fails UNAVAILABLE exactly at T_stall, naming it', async () => {
     const { conn, counters } = clientFixture(SRV_A, 4096)
     const stream = conn.newStream(echo.count, {})
     await sendN(stream, W_CONN)
@@ -324,50 +373,101 @@ describe('sid-0 grants (§4.2.1 Grants)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// §4.2.1 settle: only a streaming call's creation-ack H settles the
-// connection window. A unary T carries no window and must not switch it off
-// while the server enforces; an H that advertises 0 does switch it off.
+// §4.2.1 advertisement: every server H and T carries the server's connection
+// window, and the Conn adopts the first one it hears from an incarnation —
+// from a unary T as much as from a creation ack. An absent advertisement
+// turns the window off; a later one is ignored; a grant never enables.
 // ---------------------------------------------------------------------------
 
-describe('settle (§4.2.1 Settle)', () => {
-  // Pins "A unary T and a SendHeader-flushed H carry no window (§7, §8) and
-  // MUST NOT settle; a unary-first Conn stays assumed until its first
-  // streaming ack".
-  it('a unary T never settles: the window is still on afterwards', async () => {
-    const { conn, counters } = clientFixture(SRV_A, 4096)
-    // The Conn's first server frame is a unary T (window 0).
+describe('the advertisement (§4.2.1 Advertisement)', () => {
+  // Pins "the client from the first H or T the Conn accepts from a server
+  // incarnation ... not a streaming call from a unary one": a unary T
+  // advertises like any H, and a unary-first Conn adopts its window.
+  it("a unary T advertises: a unary-first Conn adopts the server's window from it", async () => {
+    const { conn, counters } = clientFixture(SRV_A, 4096, {}, 2048)
+    // The Conn's first server frame is a unary T, conn_window 2048.
     expect(await conn.invoke(echo.once, { text: 'x' })).toEqual({ text: 'ok' })
+    expect(conn.connTx.state(), 'adopted from the T').toMatchObject({ on: true, observed: true, granted: 2048, sent: 0 })
 
     const stream = conn.newStream(echo.count, {})
-    await sendN(stream, W_CONN)
+    await sendN(stream, 2048)
+    expect(counters.snapshot().peerFlowStall, "2048 go out unparked: the T's advertisement, not the assumed W_CONN").toBe(0)
     const p = park(stream)
     await tick()
-    expect(counters.snapshot().peerFlowStall, 'the window is still on: the T settled nothing').toBe(1)
+    expect(counters.snapshot().peerFlowStall, 'the 2049th parks').toBe(1)
     conn.close()
     await p.done
   })
 
-  // Pins "window = 0 turns the connection window off toward that peer, as it
-  // turns the stream's off".
-  it('a streaming ack with window 0 turns it off: the peer does no flow control', async () => {
-    const { conn, counters } = clientFixture(SRV_A, 0)
+  // Pins "honours the advertisement from then on" (Appendix A, entry 11):
+  // the sender runs on the advertised 2048, and only a sid-0 grant moves it
+  // past it.
+  it("the sender honours the server's advertised 2048: 2048 unparked, the 2049th parks until a sid-0 grant", async () => {
+    const { srv, conn, counters } = clientFixture(SRV_A, 4096, {}, 2048)
     const stream = conn.newStream(echo.count, {})
-    await sendN(stream, 2 * W_CONN)
-    expect(counters.snapshot()).toMatchObject({ peerFlowStall: 0, flowStall: 0 })
+    await tick() // the H: window 4096, conn_window 2048
+    expect(conn.connTx.state()).toMatchObject({ on: true, observed: true, granted: 2048, sent: 0 })
+    await sendN(stream, 2048)
+    expect(counters.snapshot().peerFlowStall, '2048 go out unparked').toBe(0)
+    const p = park(stream)
+    await tick()
+    expect(counters.snapshot(), 'the 2049th parks on the connection window').toMatchObject({ peerFlowStall: 1, flowStall: 0 })
+    await srv.grant(SRV_A, srv.clientEpoch, 1)
+    await p.done
+    expect(p.err).toBeUndefined()
+    expect(counters.snapshot().peerFlowResume).toBe(1)
     conn.close()
   })
 
-  // Pins "A grant never enables flow control by itself" and "A grant toward
-  // a window that is off is dropped the same way".
-  it('a grant never enables a window the peer turned off', async () => {
-    const { srv, conn, counters } = clientFixture(SRV_A, 0)
+  // Pins "A conn_window of 0 (absent) on one of those frames means 'this
+  // peer does no connection flow control': the sender's connection window
+  // is then off toward that incarnation, whatever the per-stream window
+  // said", and Grants: "A grant toward a window that is off is dropped".
+  it('an H with conn_window absent turns the window off, and a later sid-0 grant never re-enables it', async () => {
+    const { srv, conn, counters } = clientFixture(SRV_A, 4096, {}, 0)
     const stream = conn.newStream(echo.count, {})
     await sendN(stream, 2 * W_CONN)
+    expect(counters.snapshot()).toMatchObject({ peerFlowStall: 0, flowStall: 0 })
+    expect(conn.connTx.state()).toMatchObject({ on: false, observed: true })
     await srv.grant(SRV_A, srv.clientEpoch, 1) // dropped: never enables
     await sendN(stream, 2 * W_CONN)
     expect(counters.snapshot(), 'still no window binds').toMatchObject({ peerFlowStall: 0, flowStall: 0 })
     expect(conn.connTx.state().on).toBe(false)
     conn.close()
+  })
+
+  // Pins the partial implementation of Appendix A, entry 11: a server that
+  // paces streams but advertises no connection window leaves the client's
+  // connection window off while its per-stream window still paces.
+  it('absent on the first H: the connection window is off while the per-stream window (32) still paces', async () => {
+    const { conn, counters } = clientFixture(SRV_A, 32, {}, 0)
+    const stream = conn.newStream(echo.count, {})
+    await tick()
+    await sendN(stream, 32)
+    const p = park(stream)
+    await tick()
+    expect(counters.snapshot(), 'the stream window binds, the connection window does not').toMatchObject({ flowStall: 1, peerFlowStall: 0 })
+    expect(conn.connTx.state().on).toBe(false)
+    conn.close()
+    await p.done
+  })
+
+  // Pins "A peer applies the first advertisement it hears from a peer
+  // incarnation and ignores the rest".
+  it('the first advertisement wins: a later H with a different value is ignored', async () => {
+    const { srv, conn, counters } = clientFixture(SRV_A, 4096, {}, 2048)
+    const a = conn.newStream(echo.count, {})
+    await tick() // A's H advertises 2048
+    srv.connWindow = 8192
+    const b = conn.newStream(echo.count, {})
+    await tick() // B's H advertises 8192: ignored
+    expect(conn.connTx.state().granted).toBe(2048)
+    await sendN(b, 2048)
+    const p = park(a)
+    await tick()
+    expect(counters.snapshot().peerFlowStall, 'still the first window').toBe(1)
+    conn.close()
+    await p.done
   })
 })
 
@@ -375,12 +475,37 @@ describe('settle (§4.2.1 Settle)', () => {
 // §4.2.1 / §10.6 restart: a new server incarnation counts from zero, so the
 // Conn starts its sender over when a call first accepts a frame from it — a
 // cumulative count would park the honest new server's client forever. Grants
-// of the dead incarnation are dropped from then on.
+// of the dead incarnation are dropped from then on, and the new incarnation's
+// own advertisement is adopted.
 // ---------------------------------------------------------------------------
 
 describe('restart on a surviving channel (§4.2.1 Restart)', () => {
+  // Pins "the Conn MUST start its sender over — assumed at W_conn,
+  // unadvertised, nothing sent": the new incarnation's first H is adopted as
+  // the old one's was.
+  it("a new server incarnation is assumed at W_CONN again, then its own advertisement is adopted", async () => {
+    const { srv, conn, counters } = clientFixture(SRV_A, 4096, {}, W_CONN)
+    const old = conn.newStream(echo.count, {})
+    await tick() // A's H: 1024
+    await sendN(old, 1000)
+    expect(conn.connTx.state()).toMatchObject({ on: true, observed: true, granted: W_CONN, sent: 1000 })
+
+    srv.restart(SRV_B)
+    srv.connWindow = 2048
+    const fresh = conn.newStream(echo.count, {})
+    await tick() // B's H: the sender started over by the lock, then adopted B's 2048
+    expect(conn.connTx.state(), "B's window, nothing of A's count").toMatchObject({ on: true, observed: true, granted: 2048, sent: 0 })
+    await sendN(fresh, 2048)
+    expect(counters.snapshot().peerFlowStall, "B's 2048 go out unparked").toBe(0)
+    const p = park(fresh)
+    await tick()
+    expect(counters.snapshot().peerFlowStall, 'the 2049th parks').toBe(1)
+    conn.close()
+    await p.done
+  })
+
   // Pins "When it first hears a different server epoch ... the Conn MUST
-  // start its sender over — assumed at W_conn, unsettled, nothing sent — ...
+  // start its sender over — assumed at W_conn, unadvertised, nothing sent — ...
   // [and] drop grants naming the old epoch".
   it('a new server incarnation starts the sender over, and the dead one can no longer credit it', async () => {
     const { srv, conn, counters } = clientFixture(SRV_A, 4096)
@@ -407,79 +532,83 @@ describe('restart on a surviving channel (§4.2.1 Restart)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// §4.2.1 raise: a receiver whose maxPeerWindow exceeds W_CONN lifts the
-// server's assumption once, with a sid-0 grant of the difference right behind
-// its first OPEN — the eager one or the piggybacked one — and again for a new
-// server incarnation. At the floor there is nothing to raise by.
+// §4.2.1 advertisement, the client's half: every OPEN — the eager one of a
+// client-streaming or bidi call, the piggybacked one of a unary or
+// server-streaming call — carries this side's connection window,
+// maxPeerWindow, floored at W_CONN; no other client frame does, and nothing
+// rides behind the OPEN.
 // ---------------------------------------------------------------------------
 
-describe('the raise (§4.2.1 Raise)', () => {
-  const limits = { limits: { maxPeerWindow: 2048 } }
+describe('every OPEN advertises the connection window (§4.2.1 Advertisement)', () => {
+  const opens = (srv: PeerSrv): Frame[] => srv.tx.filter(isOpen)
 
-  // Pins "the client right behind its first OPEN ... and, when it hears a new
-  // server incarnation, at once"; "A receiver at the floor sends none".
-  it('rides right behind the first eager OPEN, once per Conn', async () => {
-    const { srv, conn } = clientFixture(SRV_A, 4096, limits)
-    conn.newStream(echo.count, {})
+  // Pins "the client on every OPEN" and Appendix B: MaxPeerWindow defaults
+  // to W_conn.
+  it('the eager and the piggybacked OPEN carry conn_window = maxPeerWindow: 1024 by default', async () => {
+    const { srv, conn } = clientFixture(SRV_A, 4096)
+    conn.newStream(echo.count, {}) // eager (client-streaming)
     await tick()
-    conn.newStream(echo.count, {})
-    await tick()
-
-    const raise = afterFirstOpen(srv.tx)
-    expect(raise !== undefined && isPeerGrant(raise), 'the raise rides right behind the first OPEN').toBe(true)
-    expect(raise!.window).toBe(2048 - W_CONN)
-    expect(raise!.epoch).toBe(srv.clientEpoch)
-    expect(srv.tx.filter(isPeerGrant), 'once per Conn').toHaveLength(1)
+    await conn.invoke(echo.once, { text: 'x' }) // piggybacked (unary)
+    const s = conn.newStream(echo.many, {}) // piggybacked (server-streaming)
+    await s.send({ text: 'x' })
+    expect(opens(srv)).toHaveLength(3)
+    for (const o of opens(srv)) expect(o.connWindow, `the OPEN of sid ${o.sid}`).toBe(W_CONN)
+    expect(srv.tx.filter(isPeerGrant), 'nothing rides behind an OPEN: the advertisement is the whole of it').toHaveLength(0)
     conn.close()
   })
 
-  it('rides right behind the first piggybacked OPEN too', async () => {
-    const { srv, conn } = clientFixture(SRV_A, 4096, limits)
+  it('a configured 2048 rides every OPEN', async () => {
+    const { srv, conn } = clientFixture(SRV_A, 4096, { limits: { maxPeerWindow: 2048 } })
+    conn.newStream(echo.count, {})
+    await tick()
     await conn.invoke(echo.once, { text: 'x' })
+    conn.newStream(echo.count, {})
     await tick()
-    const raise = afterFirstOpen(srv.tx)
-    expect(raise !== undefined && isPeerGrant(raise)).toBe(true)
-    expect(raise!.window).toBe(2048 - W_CONN)
+    expect(opens(srv).map((o) => o.connWindow)).toEqual([2048, 2048, 2048])
     conn.close()
   })
 
-  it('at the floor there is nothing to raise by', async () => {
+  // Pins "MaxPeerWindow (§15) is floored at W_conn".
+  it('below the floor the OPEN advertises W_CONN', async () => {
     const { srv, conn } = clientFixture(SRV_A, 4096, { limits: { maxPeerWindow: 100 } })
     conn.newStream(echo.count, {})
     await tick()
-    expect(srv.tx.filter(isPeerGrant), 'maxPeerWindow is floored at W_CONN').toHaveLength(0)
+    expect(opens(srv)[0]!.connWindow, 'maxPeerWindow is floored at W_CONN').toBe(W_CONN)
     conn.close()
   })
 
-  it('is due again for a new server incarnation', async () => {
-    const { srv, conn } = clientFixture(SRV_A, 4096, limits)
-    conn.newStream(echo.count, {})
+  // Pins "Data frames, WINDOW, PING, RESET never carry it": the client's
+  // data frames, half-close, per-stream grants and sid-0 grants leave the
+  // field absent.
+  it('no other client frame carries it', async () => {
+    const { srv, conn } = clientFixture(SRV_A, 4096, { rxBuffer: { size: W_CONN } })
+    const s = conn.newStream(echo.many, {})
+    await s.send({ text: 'x' })
+    const sid = srv.lastOpen()
+    for (let i = 0; i < W_CONN / 2; i++) await srv.data(sid)
+    for (let i = 0; i < W_CONN / 2; i++) await s.recv() // a per-stream grant and a sid-0 grant
+    const c = conn.newStream(echo.count, {})
     await tick()
-    srv.restart(SRV_B)
-    conn.newStream(echo.count, {})
+    await sendN(c, 3) // data frames
+    c.closeSend() // the half-close
     await tick()
-    const { n, total } = peerGrants(srv.tx)
-    expect(n, "the new incarnation's sender starts at W_CONN too").toBe(2)
-    expect(total).toBe(2 * (2048 - W_CONN))
+    expect(srv.tx.filter(isPeerGrant), 'the sweep below includes a sid-0 grant').toHaveLength(1)
+    expect(srv.tx.filter(isData)).toHaveLength(3)
+    for (const f of srv.tx) {
+      if (!isOpen(f)) expect(f.connWindow, `flags 0x${f.flags.toString(16)} sid ${f.sid}`).toBe(0)
+    }
     conn.close()
   })
 
-  // Pins "the client right behind its first OPEN": the raise belongs to the
-  // OPEN, not to the call's life — the server's container for this
-  // incarnation exists from that OPEN on, cancelled call or not, and a
-  // second call is owed none.
-  it("survives the first call's cancellation: it rode the OPEN, once", async () => {
-    const { srv, conn } = clientFixture(SRV_A, 4096, limits)
-    const ac = new AbortController()
-    conn.newStream(echo.count, { signal: ac.signal })
-    ac.abort() // before the OPEN's transmit has even resolved
+  // Pins "Unreliable mode has no connection window: no advertisement".
+  it('unreliable mode advertises nothing', async () => {
+    const srv = new PeerSrv(SRV_A, 0)
+    const conn = new Conn(srv, { reliable: false, timing: { callMs: 300, livenessMs: 450, retransmitMs: 50, tombstoneMs: 1000, holdMs: 50 } })
+    srv.conn = conn
+    const s = conn.newStream(echo.count, {})
     await tick()
-    expect(srv.tx.filter(isOpen)).toHaveLength(1)
-    expect(peerGrants(srv.tx), 'the raise went out with the OPEN').toEqual({ n: 1, total: 2048 - W_CONN })
-
-    conn.newStream(echo.count, {})
-    await tick()
-    expect(srv.tx.filter(isPeerGrant), 'once per Conn: the second call draws none').toHaveLength(1)
+    expect(opens(srv)[0]).toMatchObject({ window: 0, connWindow: 0 })
+    s.closeSend()
     conn.close()
   })
 })
@@ -711,30 +840,28 @@ describe('close (§4.2.1 Sending, §4.5)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// §4.2.1 restart / raise: the Conn locks to a server incarnation on the first
-// sequenced frame it hears from it — on a live call or not. The server's one
-// raise rides right behind its first H; when that H lands on a call the
-// client already released it draws a RESET, and a Conn that had not locked
-// from it would drop the raise as a stranger's and stay at W_CONN against a
-// larger window for its whole life.
+// §4.2.1 restart / advertisement: the Conn locks to a server incarnation on
+// the first sequenced frame it hears from it — on a live call or not — and if
+// that frame is an H or a T, applies the advertisement it carries as it
+// locks. When the server's first H lands on a call the client already
+// released it draws a RESET, and a Conn that had not adopted it would stay at
+// W_CONN against a larger — or an absent — window until its next H or T.
 // ---------------------------------------------------------------------------
 
-describe('the Conn locks to the server from a frame for a released call (§4.2.1 Restart)', () => {
-  // Above 2 × W_CONN: with the raise lost, no cadence of a 4096 receiver
-  // reaches a sender stuck at 1024 (pending ≥ 2048, or outstanding + pending
-  // ≥ 4096) — a forever-park, not a slow one.
+describe("the released call's H or T advertises, applied as the Conn locks (§4.2.1 Restart)", () => {
+  // Above 2 × W_CONN, so that a sender left at 1024 is observable as a park
+  // no cadence of a 4096 receiver would break early.
   const window = 4 * W_CONN
-  const raise = window - W_CONN
 
-  // lifted sends maxPeerWindow messages unparked, then parks on the next:
-  // the raise landed, and it was exactly the raise.
+  // lifted sends `window` messages unparked, then parks on the next: the
+  // advertisement landed, and it was exactly the advertisement.
   async function lifted(conn: Conn, counters: Counters): Promise<void> {
     const s = conn.newStream(echo.count, {})
     await sendN(s, window)
-    expect(counters.snapshot().peerFlowStall, 'the raise landed').toBe(0)
+    expect(counters.snapshot().peerFlowStall, 'the advertisement landed').toBe(0)
     const p = park(s)
     await tick()
-    expect(counters.snapshot().peerFlowStall, 'exactly the lifted window').toBe(1)
+    expect(counters.snapshot().peerFlowStall, 'exactly the advertised window').toBe(1)
     conn.close() // releases the parked send
     await p.done
   }
@@ -752,39 +879,75 @@ describe('the Conn locks to the server from a frame for a released call (§4.2.1
   }
 
   // Pins: the Conn "locks ... on the first sequenced frame it hears from it,
-  // for a live call or for one it has already released".
-  it("the Conn's first streaming call", async () => {
-    const { srv, conn, counters } = clientFixture(SRV_A, window)
+  // for a live call or for one it has already released ... and if it is an H
+  // or T, carries its advertisement, which the Conn applies as it locks".
+  it("the Conn's first streaming call, released before its ack: the H's advertisement is applied", async () => {
+    const { srv, conn, counters } = clientFixture(SRV_A, window, {}, window)
     // Released before its ack: the H then lands on no call — a RESET — and
-    // the raise rides right behind it.
+    // carries the advertisement all the same.
     const sid = await released(srv, conn)
     const h = srv.frame(sid, 0)
     h.window = window
+    h.connWindow = window
     await conn.handle(h, {})
     expect(srv.tx.filter(isReset), 'the H found no call').toHaveLength(1)
-    await srv.grant(SRV_A, srv.clientEpoch, raise)
+    expect(conn.connTx.state(), 'adopted as the Conn locked').toMatchObject({ on: true, observed: true, granted: window, sent: 0 })
     srv.muted = false
 
     await lifted(conn, counters)
   })
 
-  it('the first streaming call to a new incarnation', async () => {
-    const { srv, conn, counters } = clientFixture(SRV_A, window)
-    // Locked to A by a call it answered, lifted by A, some sent.
+  it("the Conn's first unary call, released before its T: the T's advertisement is applied", async () => {
+    const { srv, conn, counters } = clientFixture(SRV_A, window, {}, window)
+    srv.muted = true
+    const ac = new AbortController()
+    const call = conn.invoke(echo.once, { text: 'x' }, { signal: ac.signal }).catch((e: unknown) => e)
+    await tick()
+    ac.abort()
+    expect(await call, 'the call is gone').toBeInstanceOf(Error)
+    const sid = srv.lastOpen()
+    const t = srv.frame(sid, FlagClose)
+    t.code = Code.OK
+    t.payload = enc({ text: 'ok' })
+    t.connWindow = window
+    await conn.handle(t, {})
+    expect(srv.tx.filter(isReset), 'the T found no call').toHaveLength(1)
+    expect(conn.connTx.state(), 'adopted from the T').toMatchObject({ on: true, observed: true, granted: window, sent: 0 })
+    srv.muted = false
+
+    await lifted(conn, counters)
+  })
+
+  // Pins the guard: "A data frame carries no advertisement" — it locks the
+  // Conn and returns its credit, and the assumption stands.
+  it("a released call's data frame locks the Conn but advertises nothing: the assumption stands until an H or T", async () => {
+    const { srv, conn } = clientFixture(SRV_A, window, {}, window)
+    const sid = await released(srv, conn)
+    await srv.data(sid) // RESET-drawn, credit returned, no advertisement
+    expect(srv.tx.filter(isReset)).toHaveLength(1)
+    expect((conn as unknown as { srvEpochSet: boolean }).srvEpochSet, 'locked').toBe(true)
+    expect(conn.connTx.state(), 'still assumed: a data frame is never fed to observe').toMatchObject({ on: true, observed: false, granted: W_CONN })
+    conn.close()
+  })
+
+  it('the first streaming call to a new incarnation, released before its ack', async () => {
+    const { srv, conn, counters } = clientFixture(SRV_A, window, {}, window)
+    // Locked to A by a call it answered and advertised by A, some sent.
     const warm = conn.newStream(echo.count, {})
     await tick()
-    await srv.grant(SRV_A, srv.clientEpoch, raise)
     await sendN(warm, 10)
+    expect(conn.connTx.state()).toMatchObject({ observed: true, granted: window, sent: 10 })
 
     // The server restarts; the Conn's first call to B is released before
     // B's ack, which lands on no call. The Conn re-locks to B from it all
-    // the same — sender started over — and B's raise right behind it lands.
+    // the same — sender started over — and adopts B's advertisement.
     srv.restart(SRV_B)
     const sid = await released(srv, conn)
     const h = srv.frame(sid, 0)
     h.window = window
+    h.connWindow = window
     await conn.handle(h, {})
-    await srv.grant(SRV_B, srv.clientEpoch, raise)
+    expect(conn.connTx.state(), "B's window, nothing of A's count").toMatchObject({ on: true, observed: true, granted: window, sent: 0 })
     srv.muted = false
 
     await lifted(conn, counters)

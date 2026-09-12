@@ -62,8 +62,8 @@ type Server struct {
 	// its calls AND client epochs — keyed like livePeer and for the same
 	// reason, since only a key the peer cannot mint bounds anything. Created
 	// by the peer's first validated reliable-mode OPEN, admitted or rejected,
-	// so the peer's raise and every credit return have a home; deleted with
-	// the peer's containers in DisconnectPeer, never swept.
+	// so every credit return has a home; deleted with the peer's containers
+	// in DisconnectPeer, never swept.
 	peerFlow    map[any]*peerFlowRx
 	replyBudget map[any]*replyBudget
 	drain       bool
@@ -556,7 +556,9 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	st.cancelTimeout = cancelTimeout
 	st.comp = comp
 	// The OPEN advertises the client's receive window (§4.2); it precedes
-	// every server frame, so the server never needs the assumed window.
+	// every server frame, so the server never needs the assumed window. The
+	// connection window it advertises beside it is applied where the
+	// incarnation's container is created (ensurePeerLocked, §4.2.1).
 	if rel {
 		st.flowTx.observe(f.GetWindow())
 	}
@@ -592,7 +594,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		return nil
 	}
 	now := time.Now()
-	ps := s.ensurePeerLocked(epochKey{peer: key.peer, epoch: key.epoch}, now, rel)
+	ps := s.ensurePeerLocked(epochKey{peer: key.peer, epoch: key.epoch}, now, rel, f)
 	if _, tombed := ps.tombs[key.sid]; tombed || key.sid <= ps.tombFloor ||
 		key.sid <= ps.hwmAgedLocked(now, s.mode.timing.Tombstone, ps.reliable) {
 		// Re-check under the registration lock: a concurrent duplicate OPEN
@@ -622,13 +624,9 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 	st.ps = ps
 	if rel {
 		// The peer's connection window (§4.2.1): its ledger, per transport
-		// peer, and — on the container's first admitted OPEN — the settle of
-		// this side's sender toward that incarnation by the advertisement the
-		// OPEN carries: > 0 confirms the assumed W_conn, 0 means the client
-		// does no flow control and turns it off. confirm is once-only, so
-		// every later OPEN is a no-op here.
+		// peer. This side's sender toward the incarnation was created from
+		// the OPEN's advertisement with its container (ensurePeerLocked).
 		st.pf = s.ensurePeerFlowLocked(key.peer)
-		ps.connTx.confirm(f.GetWindow())
 	}
 	// The OPEN arrived after all: cancel any RESET scheduled for its sid.
 	delete(s.pendingResets, key)
@@ -652,7 +650,6 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		// Creation ack (§8): without it, a slow producer would leave the
 		// client's OPEN|CLOSE — full request payload — retransmitting.
 		st.sendH()
-		st.raisePeer()
 		go s.runStream(st)
 	} else {
 		// CS/bidi OPENs are eager and bare: payload or CLOSE here is
@@ -662,7 +659,6 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 		}
 		// Creation ack (PROTOCOL.md §8).
 		st.sendH()
-		st.raisePeer()
 		go s.runStream(st)
 	}
 	return nil
@@ -672,6 +668,7 @@ func (s *Server) open(ctx context.Context, key callKey, f *Frame) error {
 // tombstone-stored so duplicates elicit a rate-limited replay instead of a
 // fresh answer each (PROTOCOL.md §9.4).
 func (s *Server) rejectOpen(ctx context.Context, f *Frame, code codes.Code, msg string, args ...any) error {
+	rel := s.rxReliable(ctx)
 	t := &Frame{}
 	t.SetEpoch(s.epoch)
 	t.SetSid(f.GetSid())
@@ -680,19 +677,22 @@ func (s *Server) rejectOpen(ctx context.Context, f *Frame, code codes.Code, msg 
 	t.SetCode(uint32(code))
 	t.SetDesc(fmt.Sprintf(msg, args...))
 	t.SetPeerEpoch(f.GetEpoch()) // name the client incarnation (§6.1)
+	s.advertise(t, rel)          // a T like any other (§4.2.1)
 
 	peer, _ := PeerFromContext(ctx)
 	now := time.Now()
 	s.mu.Lock()
-	rel := s.rxReliable(ctx)
-	ps := s.ensurePeerLocked(epochKey{peer: peer, epoch: f.GetEpoch()}, now, rel)
+	ps := s.ensurePeerLocked(epochKey{peer: peer, epoch: f.GetEpoch()}, now, rel, f)
 	ps.lastRx.Store(now.UnixNano())
 	if rel {
 		// No tombstone and no watermark bump in reliable mode — nothing
 		// retransmits, so nothing needs deduping (§9.2) — but the container
 		// and the peer's connection-window ledger DO exist from here on
-		// (§9.4): the OPEN was validated, and the client's raise rides right
-		// behind it (§4.2.1). Bounded by MaxDeadPeers like any container.
+		// (§9.4): the OPEN was validated and carries the client's
+		// advertisement, from which the container's sender was just created,
+		// and the credit of frames the client pipelines behind the rejected
+		// call must have an incarnation to go back to (§4.2.1). Bounded by
+		// MaxDeadPeers like any container.
 		s.ensurePeerFlowLocked(peer)
 	} else {
 		if ps.hwm < f.GetSid() {
@@ -703,6 +703,20 @@ func (s *Server) rejectOpen(ctx context.Context, f *Frame, code codes.Code, msg 
 	s.mu.Unlock()
 	s.kickSweep()
 	return s.tx.Handle(ctx, t)
+}
+
+// advertise stamps this side's connection window — MaxPeerWindow, what this
+// server will buffer from the peer across all of its calls — on a frame that
+// carries the advertisement: every H and every T it sends (§4.2.1, §5), the
+// creation ack, a SendHeader flush, a unary or streaming terminal, a
+// rejection, Stop's UNAVAILABLE alike. Every header-frame and terminal
+// builder calls it, so none can forget; the value is fixed for the server's
+// life, so whichever the client hears first is right. Reliable mode only —
+// data frames, WINDOW, PING and RESET never carry it.
+func (s *Server) advertise(f *Frame, reliable bool) {
+	if reliable {
+		f.SetConnWindow(uint32(s.limits.MaxPeerWindow))
+	}
 }
 
 // ensurePeerFlowLocked returns the connection-window ledger for a transport

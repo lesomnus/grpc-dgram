@@ -192,7 +192,7 @@ The port stops short of the Go side in two places — one deliberate, one a gap
 
 That is the whole of it. The **connection window** (`WINDOW sid=0`, §4.2.1)
 that this section once listed as sequenced rather than deliberate is in the
-port: `W_CONN`, `FlowSender.confirm`, `acquireBoth`, `PeerFlowRx`,
+port: `W_CONN`, `FlowSender.observe`, `acquireBoth`, `PeerFlowRx`,
 `maxPeerWindow` and the two `peer-flow-*` event kinds mirror `flow.go`, and
 both cross-language suites move more than `W_conn` messages each way across
 three streams with the `sid = 0` grants asserted in both directions — so the

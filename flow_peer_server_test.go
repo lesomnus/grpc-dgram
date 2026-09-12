@@ -4,14 +4,17 @@ package drpc_test
 // (PROTOCOL.md §4.2.1, reliable mode only) against a scripted client driving
 // Server.Handle directly, and then the whole Go↔Go path end to end:
 //
-//   - the server paces itself by W_conn per client incarnation and parks —
-//     on the connection window, not the stream window — bounded by T_stall;
+//   - the server paces itself per client incarnation by the window that
+//     incarnation's OPEN advertised and parks — on the connection window, not
+//     the stream window — bounded by T_stall;
 //   - a sid-0 WINDOW credits only an existing (peer, client-epoch) container
 //     and only in reliable mode; anything else is dropped in silence and
 //     creates no state;
-//   - the container's first admitted OPEN settles the window: 0 turns it off;
-//   - the raise rides right behind the first H sent to an incarnation, once
-//     per incarnation, and a rejected first OPEN still gives it a home;
+//   - the OPEN that creates the container — admitted or rejected — creates
+//     its sender from the advertisement it carries: absent turns it off, and
+//     a later OPEN's value is ignored;
+//   - every H and T the server sends carries its MaxPeerWindow as
+//     conn_window; nothing rides behind the first H on sid 0;
 //   - an overrun fails the offending call INTERNAL and nothing else;
 //   - every reliable-mode data frame received returns exactly one credit on
 //     sid 0 — consumed, discarded with its call, or never buffered — except
@@ -102,7 +105,9 @@ func blockUnlessMarked(key string) drpc.ServerOption {
 }
 
 // streamOpen builds the eager, bare OPEN of a client-streaming or bidi call,
-// advertising the client's window (§8, §4.2.1).
+// advertising the client's stream window and, as every reliable-mode OPEN
+// does, its connection window — W_conn unless a test overrides it (§8,
+// §4.2.1).
 func streamOpen(epoch, sid, window uint32, method string) *drpc.Frame {
 	f := &drpc.Frame{}
 	f.SetEpoch(epoch)
@@ -111,11 +116,14 @@ func streamOpen(epoch, sid, window uint32, method string) *drpc.Frame {
 	f.SetFlags(drpc.FlagOpen)
 	f.SetMethod(method)
 	f.SetWindow(window)
+	f.SetConnWindow(wConnTest)
 	return f
 }
 
 // manyOpen builds a server-streaming OPEN|CLOSE asking for repeat responses,
-// advertising the client's window (§8, §4.2.1).
+// advertising the client's stream window and, as every reliable-mode OPEN
+// does, its connection window — W_conn unless a test overrides it (§8,
+// §4.2.1).
 func manyOpen(epoch, sid, window, repeat uint32) *drpc.Frame {
 	f := &drpc.Frame{}
 	f.SetEpoch(epoch)
@@ -124,6 +132,7 @@ func manyOpen(epoch, sid, window, repeat uint32) *drpc.Frame {
 	f.SetFlags(drpc.FlagOpen | drpc.FlagClose)
 	f.SetMethod(echo.EchoService_Many_FullMethodName)
 	f.SetWindow(window)
+	f.SetConnWindow(wConnTest)
 	data, _ := proto.Marshal(echo.EchoRequest_builder{Message: "m", Repeat: repeat}.Build())
 	f.SetPayload(data)
 	return f
@@ -151,10 +160,10 @@ func terminalOn(sid uint32) func(*drpc.Frame) bool {
 const clientEpochA, clientEpochB = uint32(0xC1A), uint32(0xC1B)
 
 // ---------------------------------------------------------------------------
-// §4.2.1 sending: W_conn is spent across every call to one client
-// incarnation, then the handler parks on the CONNECTION window — its stream
-// window still has credit — resumes on a sid-0 grant, and fails UNAVAILABLE
-// at T_stall naming that window.
+// §4.2.1 sending: the W_conn the client's OPENs advertise is spent across
+// every call to one client incarnation, then the handler parks on the
+// CONNECTION window — its stream window still has credit — resumes on a
+// sid-0 grant, and fails UNAVAILABLE at T_stall naming that window.
 // ---------------------------------------------------------------------------
 
 // Pins §4.2.1 Scope: "the sender's credit is per peer incarnation: on the
@@ -233,7 +242,7 @@ func TestPeerWindow_ServerSid0GrantGate(t *testing.T) {
 			synctest.Wait()
 			frames := sf.frames()
 			x.True(t, firstMatch(frames, isAckH) != nil, "the OPEN is admitted")
-			x.Equal(t, wConnTest, countMatch(frames, isDataFrame), "the sender starts at W_conn: the early grant credited nothing")
+			x.Equal(t, wConnTest, countMatch(frames, isDataFrame), "the sender is created at the OPEN's W_conn: the early grant credited nothing")
 		})
 	})
 	t.Run("a foreign client epoch: silent", func(t *testing.T) {
@@ -257,121 +266,258 @@ func TestPeerWindow_ServerSid0GrantGate(t *testing.T) {
 		is.handle(windowFrame(clientEpochA, 0, 0, 100))
 		x.True(t, is.recv(t) == nil, "unreliable mode has no connection window")
 	})
-	t.Run("after the peer advertised 0: off, and a grant never enables", func(t *testing.T) {
+	t.Run("after an OPEN with no advertisement: off, and a grant never enables", func(t *testing.T) {
 		bubble(t, func(t *testing.T) {
 			events := &flowEvents{}
 			sf := newSrvFixture(t, drpc.WithProtocolStats(events))
-			// Window 0 on the container's first admitted OPEN: the client
-			// does no flow control, on either window.
-			sf.handle(manyOpen(clientEpochA, 1, 0, 2*wConnTest))
+			// Neither advertisement on the OPEN that creates the container:
+			// the client does no flow control, on either window.
+			open := manyOpen(clientEpochA, 1, 0, 2*wConnTest)
+			open.SetConnWindow(0)
+			sf.handle(open)
 			synctest.Wait()
 			x.Equal(t, 2*wConnTest, countMatch(sf.frames(), isDataFrame), "no window binds")
 			x.Equal(t, 0, events.count(drpc.EventPeerFlowStall))
 			x.Equal(t, 0, events.count(drpc.EventFlowStall))
 
 			sf.handle(windowFrame(clientEpochA, 0, 0, 1)) // dropped: never enables
+			// Nor does a later OPEN that advertises one: the first counted
+			// (§4.2.1).
 			sf.handle(manyOpen(clientEpochA, 2, 0, 2*wConnTest))
 			synctest.Wait()
 			x.Equal(t, 4*wConnTest, countMatch(sf.frames(), isDataFrame))
 			x.Equal(t, 0, events.count(drpc.EventPeerFlowStall))
 		})
 	})
+	t.Run("after an OPEN with a stream window but no connection window: streams pace, the peer does not", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			events := &flowEvents{}
+			sf := newSrvFixture(t, drpc.WithProtocolStats(events))
+			// window = 32, conn_window absent: the two windows are advertised
+			// independently, and the connection one is off whatever the
+			// per-stream one said (§4.2.1).
+			open := manyOpen(clientEpochA, 1, 32, 2*wConnTest)
+			open.SetConnWindow(0)
+			sf.handle(open)
+			synctest.Wait()
+			x.Equal(t, 32, countMatch(sf.frames(), isDataFrame), "the stream window binds at 32")
+			x.Equal(t, 1, events.count(drpc.EventFlowStall))
+			x.Equal(t, 0, events.count(drpc.EventPeerFlowStall))
+
+			sf.handle(windowFrame(clientEpochA, 0, 0, 1))           // sid 0: dropped, never enables
+			sf.handle(windowFrame(clientEpochA, 0, 1, 2*wConnTest)) // the stream's own grant
+			synctest.Wait()
+			x.Equal(t, 2*wConnTest, countMatch(sf.frames(), isDataFrame), "past W_conn with no connection window to park on")
+			x.Equal(t, 0, events.count(drpc.EventPeerFlowStall))
+		})
+	})
 }
 
 // ---------------------------------------------------------------------------
-// §4.2.1 raise: a server whose MaxPeerWindow exceeds W_conn lifts the
-// client's assumption once per client incarnation, with a sid-0 grant of the
-// difference right behind the first H it sends to that incarnation, naming it
-// in peer_epoch. At the floor there is nothing to raise by.
+// §4.2.1 advertisement, the server's half: every H and every T it sends in
+// reliable mode carries its MaxPeerWindow as conn_window — the creation ack,
+// a SendHeader-flushed H, a unary T, a streaming T, a rejection T, Stop's
+// UNAVAILABLE — and nothing rides behind the first H on sid 0. Data frames
+// and grants carry none.
 // ---------------------------------------------------------------------------
 
-// Pins §4.2.1 Raise: "the server right behind the first creation-ack H it
-// sends to a (peer, client-epoch) container — a unary-only incarnation is owed
-// nothing until its first streaming call".
-func TestPeerWindow_ServerRaiseBehindFirstH(t *testing.T) {
-	afterFirstH := func(frames []*drpc.Frame) *drpc.Frame {
-		for i, f := range frames {
-			if isAckH(f) {
-				if i+1 < len(frames) {
-					return frames[i+1]
-				}
-				return nil
+// Pins §4.2.1 Advertisement: "the server on every H and T (§7). Every frame
+// of those kinds carries it, and the value is fixed for the advertiser's
+// lifetime".
+func TestPeerWindow_ServerAdvertisesOnEveryHAndT(t *testing.T) {
+	const window = 2048
+	limits := drpc.WithLimits(drpc.Limits{MaxPeerWindow: window})
+	// advertised checks every frame: an H or T carries want, anything else
+	// carries nothing.
+	advertised := func(t *testing.T, frames []*drpc.Frame, want uint32) {
+		t.Helper()
+		for _, f := range frames {
+			if isAckH(f) || isTerminal(f) {
+				x.Equal(t, want, f.GetConnWindow(), "an H or T without the advertisement: ", f)
+			} else {
+				x.Equal(t, uint32(0), f.GetConnWindow(), "a frame that must not carry it: ", f)
 			}
 		}
-		return nil
 	}
-	limits := drpc.WithLimits(drpc.Limits{MaxPeerWindow: 2048})
 
-	t.Run("behind the first H, once per incarnation", func(t *testing.T) {
+	t.Run("creation ack H, every one, nothing on sid 0", func(t *testing.T) {
 		sf := newSrvFixture(t, limits, blockStreams())
 		sf.handle(streamOpen(clientEpochA, 1, 32, echo.EchoService_Buff_FullMethodName))
 		sf.handle(streamOpen(clientEpochA, 2, 32, echo.EchoService_Buff_FullMethodName))
-		frames := sf.frames()
-		raise := afterFirstH(frames)
-		x.True(t, raise != nil && isPeerGrant(raise), "the raise rides right behind the first H, got ", raise)
-		x.Equal(t, uint32(2048-wConnTest), raise.GetWindow())
-		x.Equal(t, clientEpochA, raise.GetPeerEpoch(), "names the incarnation it lifts (§6.1)")
-		x.Equal(t, 1, countMatch(frames, isPeerGrant), "once per incarnation")
-
-		// A second incarnation of the same transport peer: its own sender
-		// starts at W_conn too, so it is owed its own raise.
 		sf.handle(streamOpen(clientEpochB, 1, 32, echo.EchoService_Buff_FullMethodName))
-		frames = sf.frames()
-		x.Equal(t, 2, countMatch(frames, isPeerGrant))
-		x.Equal(t, clientEpochB, frames[len(frames)-1].GetPeerEpoch())
-	})
-	t.Run("a unary-first incarnation is raised behind its first streaming H", func(t *testing.T) {
-		sf := newSrvFixture(t, limits, blockStreams())
-		sf.handle(openFrame(clientEpochA, 1, 1, echo.EchoService_Once_FullMethodName))
-		for range 3 {
-			if countMatch(sf.frames(), isTerminal) == 1 {
-				break
-			}
-			time.Sleep(50 * time.Millisecond)
+		frames := sf.frames()
+		x.Equal(t, 3, len(frames), "the three acks and nothing else, got ", frames)
+		for _, f := range frames {
+			x.True(t, isAckH(f), "got ", f)
 		}
-		x.Equal(t, 0, countMatch(sf.frames(), isPeerGrant), "a unary T carries no advertisement and draws no raise")
-
-		sf.handle(streamOpen(clientEpochA, 2, 32, echo.EchoService_Live_FullMethodName))
-		raise := afterFirstH(sf.frames())
-		x.True(t, raise != nil && isPeerGrant(raise), "got ", raise)
-		x.Equal(t, uint32(2048-wConnTest), raise.GetWindow())
+		advertised(t, frames, window)
+		x.Equal(t, 0, countMatch(frames, isPeerGrant), "nothing rides behind an H on sid 0")
 	})
-	t.Run("at the floor", func(t *testing.T) {
+	t.Run("a unary T, and a SendHeader-flushed H before it", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			sf := newSrvFixture(t, limits)
+			sf.handle(openFrame(clientEpochA, 1, 1, echo.EchoService_Once_FullMethodName))
+			synctest.Wait()
+			frames := sf.frames()
+			x.Equal(t, 1, len(frames), "a plain unary call: its T alone, got ", frames)
+			x.True(t, isTerminal(frames[0]), "got ", frames[0])
+			advertised(t, frames, window)
+
+			// Request metadata makes the echo handler flush a header: an H
+			// before the T, both advertising.
+			open := openFrame(clientEpochA, 2, 1, echo.EchoService_Once_FullMethodName)
+			open.SetHeader(wireMd(metadata.Pairs("k", "v")))
+			sf.handle(open)
+			synctest.Wait()
+			frames = sf.frames()[1:]
+			x.Equal(t, 2, len(frames), "the flushed H, then the T, got ", frames)
+			x.True(t, isAckH(frames[0]) && isTerminal(frames[1]), "got ", frames)
+			advertised(t, frames, window)
+		})
+	})
+	t.Run("rejection Ts: unknown method, live-call cap", func(t *testing.T) {
+		sf := newSrvFixture(t, drpc.WithLimits(drpc.Limits{MaxPeerWindow: window, MaxLiveCalls: 1}), blockStreams())
+		sf.handle(streamOpen(clientEpochA, 1, 32, "/echo.EchoService/Nope"))
+		sf.handle(streamOpen(clientEpochA, 2, 32, echo.EchoService_Live_FullMethodName)) // admitted: the cap is 1
+		sf.handle(streamOpen(clientEpochA, 3, 32, echo.EchoService_Live_FullMethodName)) // refused
+		frames := sf.frames()
+		x.Equal(t, 3, len(frames), "got ", frames)
+		x.True(t, isTerminal(frames[0]) && codes.Code(frames[0].GetCode()) == codes.Unimplemented, "got ", frames[0])
+		x.True(t, isAckH(frames[1]), "got ", frames[1])
+		x.True(t, isTerminal(frames[2]) && codes.Code(frames[2].GetCode()) == codes.ResourceExhausted, "got ", frames[2])
+		advertised(t, frames, window)
+	})
+	t.Run("a streaming T, and Stop's UNAVAILABLE", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			sf := newSrvFixture(t, limits, blockStreams())
+			sf.handle(streamOpen(clientEpochA, 1, 32, echo.EchoService_Live_FullMethodName))
+			sf.handle(streamOpen(clientEpochA, 2, 32, echo.EchoService_Live_FullMethodName))
+			synctest.Wait()
+			sf.handle(abortFrame(clientEpochA, 1, 2)) // the handler unwinds into its T
+			synctest.Wait()
+			sf.srv.Stop() // and the other into T{UNAVAILABLE}
+			synctest.Wait()
+			frames := sf.frames()
+			x.Equal(t, 2, countMatch(frames, isTerminal), "got ", frames)
+			x.Equal(t, codes.Canceled, codes.Code(firstMatch(frames, terminalOn(1)).GetCode()))
+			x.Equal(t, codes.Unavailable, codes.Code(firstMatch(frames, terminalOn(2)).GetCode()))
+			advertised(t, frames, window)
+		})
+	})
+	t.Run("data frames and grants carry none", func(t *testing.T) {
+		bubble(t, func(t *testing.T) {
+			sf := newSrvFixture(t, limits, drpc.WithRxBuffer(wConnTest, drpc.DropNewest))
+			sf.handle(manyOpen(clientEpochA, 1, 4096, 5))
+			synctest.Wait()
+			// Half a window consumed by a Buff handler: a per-stream grant
+			// and a sid-0 grant.
+			sf.handle(streamOpen(clientEpochA, 2, 32, echo.EchoService_Buff_FullMethodName))
+			for i := range uint32(window / 2) {
+				sf.handle(lcData(clientEpochA, 2, 2+i, nil))
+			}
+			synctest.Wait()
+			frames := sf.frames()
+			x.Equal(t, 5, countMatch(frames, isDataFrame))
+			x.True(t, countMatch(frames, isPeerGrant) >= 1, "a sid-0 grant, got ", frames)
+			x.True(t, countMatch(frames, isWindowFrame) > countMatch(frames, isPeerGrant), "and a per-stream one, got ", frames)
+			advertised(t, frames, window)
+		})
+	})
+	t.Run("at the floor and by default: W_conn", func(t *testing.T) {
 		sf := newSrvFixture(t, drpc.WithLimits(drpc.Limits{MaxPeerWindow: 100}), blockStreams())
 		sf.handle(streamOpen(clientEpochA, 1, 32, echo.EchoService_Buff_FullMethodName))
-		x.Equal(t, 0, countMatch(sf.frames(), isPeerGrant), "MaxPeerWindow is floored at W_conn: nothing to raise by")
+		advertised(t, sf.frames(), wConnTest)
+		x.Equal(t, 1, len(sf.frames()))
+
+		def := newSrvFixture(t, blockStreams())
+		def.handle(streamOpen(clientEpochA, 1, 32, echo.EchoService_Buff_FullMethodName))
+		advertised(t, def.frames(), wConnTest)
+		x.Equal(t, 1, len(def.frames()))
 	})
 }
 
 // ---------------------------------------------------------------------------
-// §9.4 (amended) container-on-reject: a reliable-mode rejected OPEN creates
-// the (peer, client-epoch) container, so the client's raise right behind it
-// has a home — the server's sender toward that incarnation runs on the lifted
-// window from the first admitted call on.
+// §9.4 container-on-reject: a reliable-mode rejected OPEN creates the (peer,
+// client-epoch) container, and its sender from the advertisement the OPEN
+// carries — the server's sender toward that incarnation runs on that window
+// from the first admitted call on, whatever later OPENs say.
 // ---------------------------------------------------------------------------
 
-// Pins §4.2.1 Settle / §9.4: "A rejected OPEN creates the container (§9.4) but
-// settles nothing" — so the raise behind it has a home.
-func TestPeerWindow_ServerRaiseLandsAfterARejectedFirstOpen(t *testing.T) {
+// Pins §9.4 Container on rejection: "the OPEN was validated (§9.1) and
+// carries the client's advertisement, from which the container's sender is
+// created", and §4.2.1 Advertisement: "A peer applies the first advertisement
+// it hears from a peer incarnation and ignores the rest".
+func TestPeerWindow_RejectedFirstOpenCreatesTheSender(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		events := &flowEvents{}
 		sf := newSrvFixture(t, drpc.WithProtocolStats(events))
 
-		// The incarnation's first OPEN names a method that does not exist.
-		sf.handle(streamOpen(clientEpochA, 1, 32, "/echo.EchoService/Nope"))
+		// The incarnation's first OPEN names a method that does not exist,
+		// and advertises 2048.
+		open := streamOpen(clientEpochA, 1, 32, "/echo.EchoService/Nope")
+		open.SetConnWindow(2048)
+		sf.handle(open)
 		rej := firstMatch(sf.frames(), isTerminal)
 		x.True(t, rej != nil && codes.Code(rej.GetCode()) == codes.Unimplemented, "rejected, got ", rej)
 		x.Equal(t, clientEpochA, rej.GetPeerEpoch())
+		x.Equal(t, uint32(wConnTest), rej.GetConnWindow(), "the rejection advertises this side's window like any T")
 
-		// The client's raise (its MaxPeerWindow is 2048) follows at once.
-		sf.handle(windowFrame(clientEpochA, 0, 0, wConnTest))
-
-		// 1500 unread responses: past W_conn, within the lifted window.
-		sf.handle(manyOpen(clientEpochA, 2, 4096, 1500))
+		// 2049 responses asked for on a call whose OPEN says 4096: exactly
+		// 2048 go out — the window the rejected OPEN advertised; the later
+		// value is ignored.
+		open = manyOpen(clientEpochA, 2, 4096, 2048+1)
+		open.SetConnWindow(4096)
+		sf.handle(open)
 		synctest.Wait()
-		x.Equal(t, 1500, countMatch(sf.frames(), isDataFrame), "the raise landed on the container the rejection created")
+		x.Equal(t, 2048, countMatch(sf.frames(), isDataFrame), "the sender was created at 2048 by the rejected OPEN")
+		x.Equal(t, 0, countMatch(sf.frames(), terminalOn(2)), "and parks on the 2049th")
+		x.Equal(t, 1, events.count(drpc.EventPeerFlowStall))
+
+		sf.handle(windowFrame(clientEpochA, 0, 0, 1))
+		synctest.Wait()
+		x.Equal(t, 2049, countMatch(sf.frames(), isDataFrame))
 		x.Equal(t, 1, countMatch(sf.frames(), terminalOn(2)))
-		x.Equal(t, 0, events.count(drpc.EventPeerFlowStall), "no park at W_conn")
+	})
+}
+
+// Pins §4.2.1 Advertisement, the server as sender: "the server from the OPEN
+// that creates the (peer, client-epoch) container", the first one counting
+// and each incarnation its own.
+func TestPeerWindow_ServerHonoursTheOpenAdvertisement(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		events := &flowEvents{}
+		sf := newSrvFixture(t, drpc.WithProtocolStats(events))
+
+		open := manyOpen(clientEpochA, 1, 4096, 2048+1)
+		open.SetConnWindow(2048)
+		sf.handle(open)
+		synctest.Wait()
+		x.Equal(t, 2048, countMatch(sf.frames(), isDataFrame), "exactly the advertised 2048 reach the wire")
+		x.Equal(t, 1, events.count(drpc.EventPeerFlowStall), "the 2049th parks")
+
+		// A second OPEN of the same incarnation advertising more changes
+		// nothing: the sender is the incarnation's, created once.
+		open = manyOpen(clientEpochA, 2, 4096, 1)
+		open.SetConnWindow(8192)
+		sf.handle(open)
+		synctest.Wait()
+		x.Equal(t, 2048, countMatch(sf.frames(), isDataFrame), "the later advertisement is ignored")
+		x.Equal(t, 2, events.count(drpc.EventPeerFlowStall), "its call parks like the first")
+
+		// Another incarnation of the same peer is its own sender, created
+		// from its own OPEN.
+		open = manyOpen(clientEpochB, 1, 4096, 1500+1)
+		open.SetConnWindow(1500)
+		sf.handle(open)
+		synctest.Wait()
+		x.Equal(t, 2048+1500, countMatch(sf.frames(), isDataFrame))
+		x.Equal(t, 3, events.count(drpc.EventPeerFlowStall))
+
+		// A grant to A releases A's two parked sends and nothing of B's.
+		sf.handle(windowFrame(clientEpochA, 0, 0, 2))
+		synctest.Wait()
+		x.Equal(t, 2048+1500+2, countMatch(sf.frames(), isDataFrame))
+		x.Equal(t, 2, events.count(drpc.EventPeerFlowResume))
 	})
 }
 

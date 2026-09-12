@@ -47,10 +47,10 @@ import {
   sizeOr,
   Sweeper,
   tryAcquireBoth,
+  U32_MAX,
   unrefTimer,
-  W_CONN,
   type Compressor,
-  type EvictedSender,
+  type SenderState,
   type WirePayload,
 } from './util'
 import {
@@ -155,6 +155,16 @@ const errText = (e: unknown): string => (e instanceof Error ? e.message : String
 function windowOf(f: Frame): number {
   const w = f.window
   return typeof w === 'number' && Number.isFinite(w) && w > 0 ? Math.floor(w) : 0
+}
+
+// connWindowOf reads an OPEN's connection-window advertisement (§4.2.1) the
+// same way: absent, NaN or negative reads as 0 — "this peer does no
+// connection flow control" — a fraction is floored (a message count is
+// whole), and the value is capped at the wire's uint32, all a decoded frame
+// can carry (§5).
+function connWindowOf(f: Frame): number {
+  const w = f.connWindow
+  return typeof w === 'number' && Number.isFinite(w) && w > 0 ? Math.min(Math.floor(w), U32_MAX) : 0
 }
 
 // ---------------------------------------------------------------------------
@@ -262,16 +272,15 @@ class PeerState {
   liveCalls = 0
 
   // connTx is the connection window toward this client incarnation
-  // (PROTOCOL.md §4.2.1): assumed at W_CONN when the container is created
-  // on a reliable channel, settled by its first admitted OPEN, credited by
-  // sid-0 WINDOWs routed on (peer, epoch). Per incarnation, not per
-  // transport peer: a restarted client at the same key counts from zero,
-  // and a sender that kept counting the dead incarnation's frames would
-  // park every call to the new one forever. raised latches the one sid-0
-  // raise this incarnation is owed (§4.2.1) — the receiver's ledger is per
-  // transport peer, so the latch cannot live there.
+  // (PROTOCOL.md §4.2.1): created off and adopted from the advertisement the
+  // OPEN that creates the container carries — admitted or rejected, the
+  // first one wins — or continued from the position the peer's ledger kept
+  // when the container cap evicted it (§9.4); credited by sid-0 WINDOWs
+  // routed on (peer, epoch). It never assumes: no server frame precedes the
+  // OPEN. Per incarnation, not per transport peer: a restarted client at the
+  // same key counts from zero, and a sender that kept counting the dead
+  // incarnation's frames would park every call to the new one forever.
   readonly connTx = new FlowSender()
-  raised = false
 
   lastRx: number
   lastTx: number
@@ -389,8 +398,8 @@ class PeerSlot {
   // calls AND client epochs — on the slot like liveCalls and for the same
   // reason, since only a key the peer cannot mint bounds anything. Created
   // by the peer's first validated reliable-mode OPEN, admitted or rejected,
-  // so the peer's raise and every credit return have a home; deleted with
-  // the peer's containers in disconnectPeer, never swept.
+  // so every credit return has a home; deleted with the peer's containers in
+  // disconnectPeer, never swept.
   flow: PeerFlowRx | undefined
 
   constructor(readonly peer: unknown) {}
@@ -693,6 +702,7 @@ export class Server {
     const now = nowMs()
     const slot = this.ensureSlot(ctx.peer)
     const ps = this.ensurePeer(slot, f.epoch, now, rel)
+    if (rel) this.observeAdvertisement(ps, f)
     // No re-check of tombs/watermark here: unlike the Go original, nothing
     // can interleave between handle()'s checks and this point (no await).
     if (slot.liveCalls >= this.limits.maxLiveCalls) {
@@ -742,14 +752,9 @@ export class Server {
     ps.dead = false // the peer is evidently back
     ps.lastRx = now
     if (rel) {
-      // The peer's connection window (§4.2.1): its ledger, per transport
-      // peer, and — on the container's first admitted OPEN — the settle of
-      // this side's sender toward that incarnation by the advertisement the
-      // OPEN carries: > 0 confirms the assumed W_CONN, 0 means the client
-      // does no flow control and turns it off. confirm is once-only, so
-      // every later OPEN is a no-op here.
+      // The peer's connection-window ledger, per transport peer (§4.2.1):
+      // what this call's data frames are admitted against and credited to.
       st.pf = this.ensurePeerFlow(slot)
-      ps.connTx.confirm(windowOf(f))
     }
     // The OPEN arrived after all: cancel any RESET scheduled for its sid.
     if (slot.pendingResets.delete(eksid(f.epoch, f.sid))) this.pendingResetTotal--
@@ -768,7 +773,6 @@ export class Server {
       // Creation ack (§8): without it, a slow producer would leave the
       // client's OPEN|CLOSE — full request payload — retransmitting.
       st.sendH()
-      st.raisePeer()
       void this.runStream(st)
     } else {
       // CS/bidi OPENs are eager and bare: payload or CLOSE here is
@@ -776,7 +780,6 @@ export class Server {
       if (f.payload !== undefined || isClose(f)) st.rxDropped++
       // Creation ack (PROTOCOL.md §8).
       st.sendH()
-      st.raisePeer()
       void this.runStream(st)
     }
   }
@@ -785,6 +788,7 @@ export class Server {
   // frame, tombstone-stored so duplicates elicit a rate-limited replay
   // instead of a fresh answer each (PROTOCOL.md §9.4).
   private async rejectOpen(ctx: FrameContext, f: Frame, code: Code, msg: string): Promise<void> {
+    const rel = this.rxReliable(ctx)
     const t = frame({
       epoch: this.epoch,
       sid: f.sid,
@@ -794,9 +798,9 @@ export class Server {
       peerEpoch: f.epoch, // name the client incarnation (§6.1)
     })
     t.code = code
+    this.advertise(t, rel)
 
     const now = nowMs()
-    const rel = this.rxReliable(ctx)
     const slot = this.ensureSlot(ctx.peer)
     const ps = this.ensurePeer(slot, f.epoch, now, rel)
     ps.lastRx = now
@@ -804,8 +808,12 @@ export class Server {
       // No tombstone and no watermark bump in reliable mode — nothing
       // retransmits, so nothing needs deduping (§9.2) — but the container
       // and the peer's connection-window ledger DO exist from here on
-      // (§9.4): the OPEN was validated, and the client's raise rides right
-      // behind it (§4.2.1). Bounded by maxDeadPeers like any container.
+      // (§9.4): the OPEN was validated and carries the client's
+      // advertisement, from which the container's sender is created, and
+      // the credit for data frames the peer pipelines after a rejected call
+      // has an incarnation to go back to (§4.2.1). Bounded by maxDeadPeers
+      // like any container.
+      this.observeAdvertisement(ps, f)
       this.ensurePeerFlow(slot)
     } else {
       if (ps.hwm < f.sid) ps.hwm = f.sid
@@ -1139,7 +1147,7 @@ export class Server {
     // incarnations on the key, where §16 says only more than that does.
     // Taken out first, the ledger goes N → N−1 → N and the trim never runs
     // on the one coming back.
-    let held: EvictedSender | undefined
+    let held: SenderState | undefined
     if (reliable) held = slot.flow?.unstash(epoch)
 
     // Cap dead containers of this transport peer.
@@ -1154,32 +1162,57 @@ export class Server {
       }
       if (oldest.reliable) {
         // The incarnation may only be idle: its connection sender's
-        // position — credit, settle, the raise it already got — is kept in
-        // the peer's ledger, so that its next OPEN continues it rather than
-        // starting over at W_CONN against a client that raised it (§4.2.1,
-        // §15). Bounded there like the containers are here.
-        this.ensurePeerFlow(slot).stash(oldest.epoch, oldest.connTx.state(), oldest.raised)
+        // position — its window and its credit — is kept in the peer's
+        // ledger, so that its next OPEN continues it rather than starting
+        // over with a full window against a client whose buffers may still
+        // hold its frames (§4.2.1, §9.4, §15). Bounded there like the
+        // containers are here.
+        this.ensurePeerFlow(slot).stash(oldest.epoch, oldest.connTx.state())
       }
       slot.epochs.delete(oldest.epoch)
     }
 
     ps = new PeerState(slot.peer, epoch, reliable, now, this.limits.maxTombstones, this.limits.maxTombstoneBytes)
-    if (reliable) {
-      // This side paces itself toward the new incarnation by W_CONN from
-      // its first data frame (§4.2.1) — unless the incarnation was here
-      // before and the cap evicted its container: then it continues from
-      // the position the ledger held for it (taken out above). Unreliable
-      // mode has no connection window, as it has no per-stream one.
-      if (held !== undefined) {
-        ps.connTx.restore(held.state)
-        ps.raised = held.raised
-      } else {
-        ps.connTx.assume(W_CONN)
-      }
-    }
+    // A reliable container's sender starts off and unadvertised: the OPEN
+    // that creates the container carries the client's connection window,
+    // which the caller adopts next (observeAdvertisement) — unless the
+    // incarnation was here before and the cap evicted its container: then it
+    // continues from the position the ledger held for it (taken out above),
+    // latch included, so the OPEN's advertisement is a no-op on it. Unreliable
+    // mode has no connection window, as it has no per-stream one.
+    if (held !== undefined) ps.connTx.restore(held)
     slot.epochs.set(epoch, ps)
     if (!reliable) this.sawUnreliable = true
     return ps
+  }
+
+  // observeAdvertisement adopts, for a container's sender, the connection
+  // window the OPEN that reached the container carries (§4.2.1, §9.4). It
+  // runs for every reliable-mode OPEN — admitted or rejected — right after
+  // ensurePeer, so a fresh container's sender, created off, adopts the
+  // advertisement of the OPEN that created it. observe latches: every later
+  // OPEN of the incarnation is a no-op here, and so is the OPEN of an
+  // incarnation coming back to a position the ledger held for it (restored
+  // latch and all). Absent reads as "this peer does no connection flow
+  // control": the sender stays off toward that incarnation, whatever the
+  // per-stream `window` beside it said.
+  private observeAdvertisement(ps: PeerState, f: Frame): void {
+    ps.connTx.observe(connWindowOf(f))
+  }
+
+  // advertise stamps a server frame with this side's connection window,
+  // maxPeerWindow (§15), as Frame.connWindow — on EVERY H and T this server
+  // sends in reliable mode (§4.2.1 Advertisement): the creation ack, a
+  // sendHeader flush, a unary or streaming T, a rejection
+  // terminal, stop's UNAVAILABLE. The value is fixed for the server's life,
+  // so whichever frame the client hears first is right; every builder of a
+  // header frame or a terminal calls this, so none can forget it. Data
+  // frames, WINDOW, PING and RESET never carry it — the field means nothing
+  // there. reliable is the mode of the channel the frame goes out on (§4.3):
+  // unreliable mode has no connection window and leaves the field absent.
+  /** @internal */
+  advertise(f: Frame, reliable: boolean): void {
+    if (reliable) f.connWindow = this.limits.maxPeerWindow
   }
 
   // ensurePeerFlow returns the connection-window ledger for a transport
@@ -1748,22 +1781,6 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
     if (g > 0) this.server.grantPeer(this.ps, g)
   }
 
-  // raisePeer lifts the client's assumed W_CONN to this side's
-  // maxPeerWindow, once per client incarnation (§4.2.1): a sid-0 grant of
-  // the difference, right behind the first H sent to that incarnation, so on
-  // an ordered channel the client's settle precedes it. It is a MUST, not an
-  // optimisation: this side's grant cadence is computed against
-  // maxPeerWindow, so a sender left at W_CONN against a larger window would
-  // park before any batched grant fired. Best-effort against a draining
-  // peer, like the H it follows.
-  /** @internal */
-  raisePeer(): void {
-    if (!this.reliable || this.pf === undefined || this.ps === undefined || this.ps.raised) return
-    this.ps.raised = true
-    const g = this.pf.excess()
-    if (g > 0) this.server.grantPeer(this.ps, g)
-  }
-
   async *[Symbol.asyncIterator](): AsyncIterator<Req> {
     for (;;) {
       const m = await this.recv()
@@ -1813,11 +1830,13 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
   // sendH emits the creation-ack header frame (PROTOCOL.md §8). The header
   // field is present only if the handler already set one — the core's own ack
   // is not a flush (§11). The first H is stored for byte-identical replay,
-  // and in reliable mode it advertises this side's receive window (§4.2.1).
+  // and in reliable mode it advertises this side's receive window and, like
+  // every H and T, the server's connection window (§4.2.1).
   /** @internal */
   sendH(): void {
     const f = this.nextFrame()
     if (this.reliable) f.window = this.rxCfg.size
+    this.server.advertise(f, this.reliable)
     this.attachHeader(f, false)
     if (this.hdrFrame === undefined) this.hdrFrame = f
     void this.transmit(f).catch(noop)
@@ -1848,6 +1867,7 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
     if (f === undefined) {
       f = this.nextFrame()
       if (this.reliable) f.window = this.rxCfg.size
+      this.server.advertise(f, this.reliable)
       this.attachHeader(f, false)
     }
     void this.transmit(f).catch(noop)
@@ -1890,6 +1910,7 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
     this.hdrFlushed = true
     if (md !== undefined) this.txHeader = metadataJoin(this.txHeader, md)
     const f = this.nextFrame()
+    this.server.advertise(f, this.reliable) // an H like any other (§4.2.1)
     this.attachHeader(f, true)
     if (this.hdrFrame === undefined) {
       // Keep it for byte-identical replay: on a unary call this H is the only
@@ -2066,6 +2087,10 @@ class ServerStream<Req, Res> implements ServerReader<Req>, ServerWriter<Res> {
 
     const f = this.nextFrame()
     f.flags = FlagClose
+    // Every T advertises the connection window (§4.2.1) — this one whatever
+    // its status, stop's UNAVAILABLE included; transmitTerminal sheds
+    // payload and details, never this.
+    this.server.advertise(f, this.reliable)
     if (this.txHeader !== undefined) {
       f.header = this.txHeader
       this.hdrSent = true

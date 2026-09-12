@@ -63,16 +63,14 @@ type peerState struct {
 	maxTombBytes int
 
 	// connTx is the connection window toward this client incarnation
-	// (PROTOCOL.md §4.2.1): assumed at wConn when the container is created
-	// on a reliable channel, settled by its first admitted OPEN, credited
-	// by sid-0 WINDOWs routed on (peer, epoch). Per incarnation, not per
-	// transport peer: a restarted client at the same key counts from zero,
-	// and a sender that kept counting the dead incarnation's frames would
-	// park every call to the new one forever. raised latches the one sid-0
-	// raise this incarnation is owed (§4.2.1) — the receiver's ledger is per
-	// transport peer, so the latch cannot live there. Self-synchronised.
+	// (PROTOCOL.md §4.2.1): created from the advertisement of the OPEN that
+	// created the container on a reliable channel — never assumed, the OPEN
+	// precedes every frame this side sends — and credited by sid-0 WINDOWs
+	// routed on (peer, epoch). Per incarnation, not per transport peer: a
+	// restarted client at the same key counts from zero, and a sender that
+	// kept counting the dead incarnation's frames would park every call to
+	// the new one forever. Self-synchronised.
 	connTx flowSender
-	raised atomic.Bool
 
 	lastRx   atomic.Int64 // validated frames only (§9.1)
 	lastTx   atomic.Int64
@@ -184,10 +182,12 @@ type pendingReset struct {
 
 // ensurePeerLocked returns the container for ek, creating it and enforcing
 // the per-peer container cap (never evicting containers with live calls,
-// PROTOCOL.md §15). Server.mu held. reliable applies on creation only: the
-// mode is a property of the peer's channel and cannot change (§4.3) — an
-// existing container keeps its first-captured value.
-func (s *Server) ensurePeerLocked(ek epochKey, now time.Time, reliable bool) *peerState {
+// PROTOCOL.md §15). Server.mu held. open is the OPEN being processed —
+// admitted or rejected, either creates the container (§9.4). reliable and
+// open apply on creation only: the mode is a property of the peer's channel
+// and cannot change (§4.3), and the connection window is the first
+// advertisement's (§4.2.1) — an existing container keeps both.
+func (s *Server) ensurePeerLocked(ek epochKey, now time.Time, reliable bool, open *Frame) *peerState {
 	ps := s.peers[ek]
 	if ps != nil {
 		return ps
@@ -203,10 +203,10 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time, reliable bool) *pe
 	// Taken out first, the ledger goes N → N−1 → N and the trim never runs
 	// on the one coming back.
 	var held senderState
-	var heldRaised, restored bool
+	var restored bool
 	if reliable {
 		if pf := s.peerFlow[ek.peer]; pf != nil {
-			held, heldRaised, restored = pf.unstash(ek.epoch)
+			held, restored = pf.unstash(ek.epoch)
 		}
 	}
 
@@ -226,12 +226,13 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time, reliable bool) *pe
 		}
 		if oldest.reliable {
 			// The incarnation may only be idle: its connection sender's
-			// position — credit, settle, the raise it already got — is kept
-			// in the peer's ledger, so that its next OPEN continues it rather
-			// than starting over at wConn against a client that raised it
-			// (§4.2.1, §15). Bounded there like the containers are here.
+			// position — its window and its credit — is kept in the peer's
+			// ledger, so that its next OPEN continues it rather than starting
+			// over with a full window against a client whose buffers may
+			// still hold this one's frames (§4.2.1 Overrun, §9.4, §15).
+			// Bounded there like the containers are here.
 			pf := s.ensurePeerFlowLocked(oldest.peer)
-			pf.stash(oldest.epoch, oldest.connTx.state(), oldest.raised.Load())
+			pf.stash(oldest.epoch, oldest.connTx.state())
 		}
 		delete(s.peers, epochKey{peer: oldest.peer, epoch: oldest.epoch})
 	}
@@ -249,17 +250,19 @@ func (s *Server) ensurePeerLocked(ek epochKey, now time.Time, reliable bool) *pe
 	ps.lastRx.Store(now.UnixNano())
 	ps.lastTx.Store(now.UnixNano())
 	if reliable {
-		// This side paces itself toward the new incarnation by W_conn from
-		// its first data frame (§4.2.1) — unless the incarnation was here
-		// before and the cap evicted its container: then it continues from
-		// the position the ledger held for it (taken out above). Unreliable
-		// mode has no connection window, as it has no per-stream one.
+		// This side's sender toward the new incarnation is created from the
+		// advertisement its OPEN carries (§4.2.1, §9.4) — never assumed: the
+		// OPEN precedes every frame this side sends to it, and absent means
+		// the client does no connection flow control. Unless the incarnation
+		// was here before and the cap evicted its container: then it
+		// continues from the position the ledger held for it (taken out
+		// above), and observe's latch, set with that position, ignores the
+		// OPEN. Unreliable mode has no connection window, as it has no
+		// per-stream one.
 		if restored {
 			ps.connTx.restore(held)
-			ps.raised.Store(heldRaised)
-		} else {
-			ps.connTx.assume(wConn)
 		}
+		ps.connTx.observe(open.GetConnWindow())
 	}
 	s.peers[ek] = ps
 	if !reliable {

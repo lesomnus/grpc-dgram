@@ -40,19 +40,24 @@ import (
 // The connection window (§4.2.1, §15) bounds what one peer can pin across all
 // of its calls, as RFC 9113 §6.9.1's connection window does: a data frame
 // needs one credit from its stream window AND one from the peer's connection
-// window. It is never advertised — every sender assumes wConn per peer and
-// the peer's first per-stream advertisement settles it (confirm): > 0 keeps
-// the assumption, 0 turns it off. WINDOW sid=0 adds credit; a receiver
-// returns one credit for every data frame it received once that frame stops
-// occupying a buffer (peerFlowRx).
+// window. It is advertised like the per-stream one, as conn_window — by the
+// client on every OPEN, by the server on every H and T — and a sender applies
+// the first advertisement it hears from a peer incarnation (observe, once):
+// > 0 is the window, absent means the peer does no connection flow control
+// and turns it off. Only the client ever assumes: it may stream before the
+// server's first H or T, so it paces itself by wConn until then; the server's
+// sender is created from the OPEN, which carries the advertisement. WINDOW
+// sid=0 adds credit; a receiver returns one credit for every data frame it
+// received once that frame stops occupying a buffer (peerFlowRx).
 
 // wInit is the initial per-stream window a sender assumes before the peer's
 // advertisement arrives (PROTOCOL.md §4.2, Appendix B) — the same value as the
 // default rx buffer, so the assumption is exact for a default receiver.
 const wInit uint32 = defaultRxBuffer
 
-// wConn is the connection window a sender assumes per peer before any sid-0
-// grant (PROTOCOL.md §4.2.1, §10.1, Appendix B), and the floor of
+// wConn is the connection window the client assumes toward a server
+// incarnation until that incarnation's advertisement arrives — its first H or
+// T (PROTOCOL.md §4.2.1, §10.1, Appendix B) — and the floor of
 // Limits.MaxPeerWindow for the same reason wInit floors the rx buffer: a
 // receiver holding less than a sender assumes is overrun by a conforming
 // sender. A fixed protocol constant, 32 × wInit.
@@ -84,8 +89,13 @@ func (f *flowSender) assume(window uint32) {
 	f.granted = int64(window)
 }
 
-// observe adopts the peer's advertised window. It is authoritative and
-// replaces any assumption; 0 means the peer does no flow control.
+// observe adopts the peer's advertised window — the per-stream one from its
+// OPEN or creation-ack H, the connection one from its OPEN or its first H or T
+// (§4.2.1). It is authoritative and replaces any assumption; 0 (absent) means
+// the peer does no flow control and turns the window off. Once only: later
+// advertisements are ignored, until reassume re-arms the latch for a new peer
+// incarnation. A sender that assumed nothing — the server's connection
+// sender, created by the OPEN that carries the advertisement — starts here.
 func (f *flowSender) observe(window uint32) {
 	f.mu.Lock()
 	if f.observed {
@@ -107,34 +117,9 @@ func (f *flowSender) observe(window uint32) {
 	}
 }
 
-// confirm settles a connection window by the peer's first per-stream
-// advertisement (§4.2.1): 0 means the peer does no flow control and turns it
-// OFF; anything else confirms the assumption as it stands. Unlike observe it
-// keeps the credit already granted — a sid-0 grant that raced ahead of the
-// settle (the peer's raise rides right behind its advertisement) must not be
-// clobbered by a replace. Once only, like observe. A sender that was never
-// assumed stays off: an advertisement is not a grant, and nothing was
-// assumed that could be confirmed.
-func (f *flowSender) confirm(window uint32) {
-	f.mu.Lock()
-	if f.observed {
-		f.mu.Unlock()
-		return
-	}
-	f.observed = true
-	if window == 0 {
-		f.on = false
-	}
-	w := f.waiters
-	f.waiters = nil
-	f.mu.Unlock()
-	if w != nil {
-		close(w)
-	}
-}
-
 // reassume restarts a connection window from scratch for a new peer
-// incarnation (§4.2.1, §10.6): assumed at window, unsettled, nothing sent.
+// incarnation (§4.2.1, §10.6): assumed at window, unadvertised — the new
+// incarnation's first H or T is due to be observed — nothing sent.
 // A server that restarted on a surviving channel counts from zero, so the
 // cumulative sent count and any credit of the dead incarnation would never
 // line up with its grants again — a forever-park. Anyone parked is woken to
@@ -373,9 +358,9 @@ func (f *flowSender) release() {
 	}
 }
 
-// senderState is a connection sender's position — on, settled, granted and
-// sent — carried across its container's eviction (peerFlowRx.stash, §9.4,
-// §15) so a recreated container continues where it left off.
+// senderState is a connection sender's position — on, advertised, granted
+// and sent — carried across its container's eviction (peerFlowRx.stash,
+// §9.4, §15) so a recreated container continues where it left off.
 type senderState struct {
 	on, observed  bool
 	granted, sent int64
@@ -474,31 +459,22 @@ type peerFlowRx struct {
 	window      uint32            // MaxPeerWindow; 0 = off (unreliable mode)
 	outstanding uint32            // admitted − retired: the peer's frames in our buffers
 	pending     map[uint32]uint32 // retired − granted, per incarnation (epoch)
-	raised      bool              // the once-per-incarnation raise above wConn was sent
 
 	// The sending half of the containers the MaxDeadPeers cap evicted (§9.4,
 	// §15), by client epoch, in eviction order, at most evictCap of them.
 	// An evicted incarnation may be idle rather than dead — a client holding
-	// several Conns on one socket — and a recreated container that started
-	// over at wConn would be under-credited against a client ledger that
-	// already raised it, with no grant cadence able to reach it (§4.2.1
-	// Raise: a forever-park), while repeating the raise would over-credit
-	// the client. So the position is kept, bounded like the containers are,
-	// and a grant addressed to an evicted incarnation still lands on it, as
-	// does the credit of a RESET-drawn data frame it sent. Past the cap the
-	// oldest is dropped, credit held back for it included, and that
-	// incarnation starts over at wConn as a new one would — raised again,
-	// which over-credits the client (§16).
-	evicted      map[uint32]*evictedSender
+	// several Conns on one socket — and a container recreated with a full
+	// window against a client whose buffers still hold the evicted one's
+	// frames could overrun it (§4.2.1 Overrun). So the position is kept,
+	// bounded like the containers are, and a grant addressed to an evicted
+	// incarnation still lands on it, as does the credit of a RESET-drawn data
+	// frame it sent. Past the cap the oldest is dropped, credit held back for
+	// it included, and that incarnation starts over as a new one would — at
+	// the window its next OPEN advertises with nothing sent, over-credited by
+	// whatever the dropped position had spent (§16).
+	evicted      map[uint32]*senderState
 	evictedOrder []uint32
 	evictCap     int
-}
-
-// evictedSender is one held sender position: its credit and whether this
-// side's raise already went to it.
-type evictedSender struct {
-	sender senderState
-	raised bool
 }
 
 // enable sizes the ledger. evictCap is how many evicted senders it keeps
@@ -610,56 +586,21 @@ func (p *peerFlowRx) dueLocked(epoch uint32) uint32 {
 	return pending
 }
 
-// raise returns the once-per-peer-incarnation sid-0 grant that lifts the
-// sender's assumed wConn to this receiver's window (§4.2.1): window − wConn,
-// exactly once; 0 when there is nothing to raise by, and 0 ever after. It is
-// a MUST, not an optimisation: this side's grant cadence is computed against
-// its own window, so a sender left at wConn against a larger receiver would
-// park before any batched grant fired.
-func (p *peerFlowRx) raise() uint32 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.raised {
-		return 0
-	}
-	p.raised = true
-	return p.excessLocked()
-}
-
-// excess is what a raise lifts the sender by — window − wConn when positive
-// — without the once-only latch: on the server the ledger is per transport
-// peer while the raise is per client incarnation (§4.2.1, §15), so the
-// container keeps the latch and asks the ledger only for the amount.
-func (p *peerFlowRx) excess() uint32 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.excessLocked()
-}
-
-func (p *peerFlowRx) excessLocked() uint32 {
-	if p.window <= wConn {
-		return 0
-	}
-	return p.window - wConn
-}
-
-// renew makes the raise due again: the peer is a new incarnation, whose
-// sender starts over at wConn and has never seen this receiver's window
-// (§4.2.1). The ledger itself carries over — outstanding still counts the
-// dead incarnation's frames until they drain, uncredited — but whatever was
-// held back for the old incarnation has no one left to go to. Client only:
-// a Conn faces one server incarnation at a time.
+// renew drops the credit held back for a peer incarnation this side has
+// moved past (§4.2.1 Restart): the ledger itself carries over — outstanding
+// still counts the dead incarnation's frames until they drain, uncredited —
+// but whatever was held back for it has no one left to go to. Client only: a
+// Conn faces one server incarnation at a time.
 func (p *peerFlowRx) renew() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.raised = false
 	p.pending = nil
 }
 
 // stash keeps the sender position of a container the MaxDeadPeers cap is
 // evicting (see the field comment). Whatever the ledger holds back for that
 // incarnation stays with it.
-func (p *peerFlowRx) stash(epoch uint32, st senderState, raised bool) {
+func (p *peerFlowRx) stash(epoch uint32, st senderState) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.evictCap <= 0 {
@@ -667,12 +608,12 @@ func (p *peerFlowRx) stash(epoch uint32, st senderState, raised bool) {
 		return
 	}
 	if p.evicted == nil {
-		p.evicted = map[uint32]*evictedSender{}
+		p.evicted = map[uint32]*senderState{}
 	}
 	if _, held := p.evicted[epoch]; !held {
 		p.evictedOrder = append(p.evictedOrder, epoch)
 	}
-	p.evicted[epoch] = &evictedSender{sender: st, raised: raised}
+	p.evicted[epoch] = &st
 	for len(p.evictedOrder) > p.evictCap {
 		oldest := p.evictedOrder[0]
 		p.evictedOrder = p.evictedOrder[1:]
@@ -683,12 +624,12 @@ func (p *peerFlowRx) stash(epoch uint32, st senderState, raised bool) {
 
 // unstash hands back the held position of an incarnation whose container is
 // being recreated, if it is still held.
-func (p *peerFlowRx) unstash(epoch uint32) (st senderState, raised, ok bool) {
+func (p *peerFlowRx) unstash(epoch uint32) (st senderState, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e := p.evicted[epoch]
 	if e == nil {
-		return senderState{}, false, false
+		return senderState{}, false
 	}
 	delete(p.evicted, epoch)
 	for i, k := range p.evictedOrder {
@@ -697,7 +638,7 @@ func (p *peerFlowRx) unstash(epoch uint32) (st senderState, raised, ok bool) {
 			break
 		}
 	}
-	return e.sender, e.raised, true
+	return *e, true
 }
 
 // creditEvicted applies a sid-0 grant addressed to an evicted incarnation to
@@ -710,7 +651,7 @@ func (p *peerFlowRx) creditEvicted(epoch, n uint32) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e := p.evicted[epoch]; e != nil && e.sender.on {
-		e.sender.granted = saturateAdd(e.sender.granted, int64(n))
+	if e := p.evicted[epoch]; e != nil && e.on {
+		e.granted = saturateAdd(e.granted, int64(n))
 	}
 }

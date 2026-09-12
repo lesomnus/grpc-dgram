@@ -228,6 +228,20 @@ func TestWireShape_GoldenBytes(t *testing.T) {
 		x.False(t, g.HasTrailer())
 		x.Equal(t, 0x0A0B0C0D, g.GetPeerEpoch())
 	})
+	t.Run("conn_window", func(t *testing.T) {
+		// Frame{epoch: 1, conn_window: 2048}: 0d 01000000 | 90 01 (field 18,
+		// varint — a two-byte tag on purpose, §5) | 80 10. Pinned in the TS
+		// suite byte for byte (wire.test.ts).
+		f := &drpc.Frame{}
+		f.SetEpoch(1)
+		f.SetConnWindow(2048)
+		a, err := proto.Marshal(f)
+		x.NoError(t, err)
+		x.Equal(t, "0d0100000090018010", hex.EncodeToString(a))
+		g := &drpc.Frame{}
+		x.NoError(t, proto.Unmarshal(a, g))
+		x.Equal(t, 2048, g.GetConnWindow())
+	})
 	t.Run("Envelope", func(t *testing.T) {
 		open := &drpc.Frame{}
 		open.SetEpoch(1)

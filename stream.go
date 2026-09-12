@@ -458,10 +458,11 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 	case <-s.done:
 		// The call ended under it (done, not yet retired): never buffered.
 		// The frame still answers one of this Conn's calls, so the Conn
-		// locks to its incarnation as Handle's no-live-stream path does —
-		// the server's raise may ride right behind it — and the server
+		// locks to its incarnation as Handle's no-live-stream path does and
+		// applies the advertisement an H or T carries — and the server
 		// spent a connection credit on it if it is data (§4.2.1).
-		s.conn.lockServerEpoch(ctx, f.GetEpoch())
+		s.conn.lockServerEpoch(f.GetEpoch())
+		s.conn.observeAdvertisement(f)
 		s.conn.creditUnbuffered(ctx, f)
 		return
 	default:
@@ -510,8 +511,9 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 	if first {
 		// A stream locks to one incarnation, so the Conn can only hear a
 		// new one here: this is where the connection sender starts over
-		// after a server restart (§4.2.1, §10.6) — before the confirm below.
-		s.conn.lockServerEpoch(ctx, f.GetEpoch())
+		// after a server restart (§4.2.1, §10.6) — before the advertisement
+		// below lands on it.
+		s.conn.lockServerEpoch(f.GetEpoch())
 	}
 	if v != rxAccept {
 		// Never buffered, whatever the verdict (§4.2.1).
@@ -551,13 +553,11 @@ func (s *clientStream) handleRx(ctx context.Context, f *Frame) {
 		// advertises the server's receive window and replaces the assumed one
 		// (§4.2). Absent means the peer does no flow control.
 		s.flowTx.observe(f.GetWindow())
-		if first && f.isHeaderFrame() && (s.clientStreams || s.serverStreams) {
-			// The same advertisement settles the connection window, once
-			// per Conn (§4.2.1) — and ONLY a streaming call's creation ack
-			// does: a unary T or a SendHeader-flushed H carries no window,
-			// and would switch it off while the server enforces.
-			s.conn.connTx.confirm(f.GetWindow())
-		}
+		// Every H and T carries the server's connection window beside it
+		// (§4.2.1): the first the Conn hears from this incarnation replaces
+		// the assumed W_conn, once; a data frame carries none and is not
+		// consulted.
+		s.conn.observeAdvertisement(f)
 	}
 
 	switch {
@@ -659,7 +659,11 @@ func (s *clientStream) openFrame() *Frame {
 		f.SetCompressor(s.ci.compressor)
 	}
 	if s.conn.mode.reliable {
+		// Both advertisements ride every OPEN (§4.2.1): this call's rx
+		// buffer as its window, and the Conn's connection window — what the
+		// server may have buffered here across all of its calls.
 		f.SetWindow(uint32(s.rxCfg.size))
+		f.SetConnWindow(uint32(s.conn.limits.MaxPeerWindow))
 	}
 	if s.openHdr != nil {
 		f.SetHeader(newMd(s.openHdr))
@@ -695,13 +699,7 @@ func (s *clientStream) sendOpen() error {
 	}
 	f := s.openFrame()
 	s.txMu.Unlock()
-	if err := s.transmit(s.ctx, f); err != nil {
-		return err
-	}
-	// The raise rides right behind the first OPEN (§4.2.1): from here on the
-	// server has a container for this incarnation to credit.
-	s.conn.raise(context.WithoutCancel(s.ctx))
-	return nil
+	return s.transmit(s.ctx, f)
 }
 
 // send marshals and transmits one message, returning any error. The public
@@ -828,11 +826,6 @@ func (s *clientStream) send(m any) error {
 	if err := s.transmit(s.ctx, f); err != nil {
 		s.undoRefused(f, err)
 		return err
-	}
-	if opening {
-		// The piggybacked OPEN of a unary / server-streaming call is the
-		// Conn's first OPEN as often as the eager one is (§4.2.1).
-		s.conn.raise(context.WithoutCancel(s.ctx))
 	}
 	grpcStats(s.conn.stats).payloadOut(s.statsCtx, true, m, payload, len(wire))
 	return nil
@@ -1407,14 +1400,17 @@ func (s *serverStream) transmit(ctx context.Context, f *Frame) error {
 }
 
 // sendH emits the creation-ack header frame (PROTOCOL.md §8). The header
-// field is present only if the handler already set one. The first H is
-// stored for byte-identical replay.
+// field is present only if the handler already set one. In reliable mode it
+// carries both advertisements: this call's window and, like every H and T,
+// the connection window (§4.2.1). The first H is stored for byte-identical
+// replay.
 func (s *serverStream) sendH() {
 	s.txMu.Lock()
 	f := s.nextFrameLocked()
 	if s.reliable {
 		f.SetWindow(uint32(s.rxCfg.size))
 	}
+	s.server.advertise(f, s.reliable)
 	s.attachHeaderLocked(f, false)
 	if s.hdrFrame == nil {
 		s.hdrFrame = f
@@ -1450,6 +1446,7 @@ func (s *serverStream) replayH() {
 	f := s.hdrFrame
 	if f == nil {
 		f = s.nextFrameLocked()
+		s.server.advertise(f, s.reliable)
 		s.attachHeaderLocked(f, false)
 	}
 	s.txMu.Unlock()
@@ -1544,6 +1541,7 @@ func (s *serverStream) SendHeader(md metadata.MD) error {
 	s.txHeader = metadata.Join(s.txHeader, md)
 	sent := s.txHeader
 	f := s.nextFrameLocked()
+	s.server.advertise(f, s.reliable)
 	s.attachHeaderLocked(f, true)
 	if s.hdrFrame == nil {
 		// Keep it for byte-identical replay: on a unary call this H is the
@@ -1870,22 +1868,6 @@ func (s *serverStream) retirePeer(n uint32) {
 	}
 }
 
-// raisePeer lifts the client's assumed W_conn to this side's MaxPeerWindow,
-// once per client incarnation (§4.2.1): a sid-0 grant of the difference,
-// right behind the first H sent to that incarnation, so on an ordered channel
-// the client's settle precedes it. It is a MUST, not an optimisation: this
-// side's grant cadence is computed against MaxPeerWindow, so a sender left at
-// W_conn against a larger window would park before any batched grant fired.
-// Best-effort against a draining peer, like the H it follows.
-func (s *serverStream) raisePeer() {
-	if !s.reliable || s.pf == nil || !s.ps.raised.CompareAndSwap(false, true) {
-		return
-	}
-	if g := s.pf.excess(); g > 0 {
-		s.server.grantPeer(s.ps, g)
-	}
-}
-
 // grantWindow sends flow-control credit for consumed messages.
 func (s *serverStream) grantWindow(n uint32) {
 	if s.ctx.Err() != nil {
@@ -1958,14 +1940,18 @@ func (s *serverStream) protoEvent(ev ProtocolEvent) {
 	statsSink(s.server.pstats).emit(ev)
 }
 
-// terminalFrame builds T after the handler returned (PROTOCOL.md §8).
-// T re-carries the header MD once set so it survives first-frame loss.
+// terminalFrame builds T after the handler returned (PROTOCOL.md §8) — the
+// call's result, a handler error, a deadline, a client abort, Stop's
+// UNAVAILABLE alike. T re-carries the header MD once set so it survives
+// first-frame loss, and in reliable mode the connection window like every H
+// and T (§4.2.1).
 func (s *serverStream) terminalFrame(err error) *Frame {
 	s.txMu.Lock()
 	defer s.txMu.Unlock()
 
 	f := s.nextFrameLocked()
 	f.SetFlags(f.GetFlags() | FlagClose)
+	s.server.advertise(f, s.reliable)
 	if s.txHeader != nil {
 		f.SetHeader(newMd(s.txHeader))
 		s.hdrSent = true

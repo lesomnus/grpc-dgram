@@ -222,11 +222,16 @@ export class Sweeper {
 // Beside the per-stream windows sits the connection window (§4.2.1, §15),
 // one per peer, bounding what that peer can pin across ALL of its calls as
 // RFC 9113 §6.9.1's does: a data frame needs one credit from its stream
-// window AND one from the peer's connection window. It is never advertised —
-// every sender assumes W_CONN per peer and the peer's first per-stream
-// advertisement settles it (confirm): > 0 keeps the assumption, 0 turns it
-// off. WINDOW sid=0 adds credit; a receiver returns one credit for every data
-// frame it received once that frame stops occupying a buffer (PeerFlowRx).
+// window AND one from the peer's connection window. A receiver advertises
+// it as Frame.connWindow — the client on every OPEN, the server on every H
+// and T — and a sender adopts the first advertisement it hears from a peer
+// incarnation (observe, once): absent means the peer does no connection flow
+// control and the window is off. Only the client ever assumes: W_CONN from
+// the Conn's construction to the server's first H or T; the server's sender
+// is created by an OPEN that already carries the advertisement. WINDOW sid=0
+// adds credit and never enables; a receiver returns one credit for every
+// data frame it received once that frame stops occupying a buffer
+// (PeerFlowRx).
 
 // W_INIT is the initial per-stream window a sender assumes before the peer's
 // advertisement arrives — the same value as the default rx buffer, so the
@@ -235,11 +240,13 @@ export class Sweeper {
 // advertisement landed.
 export const W_INIT = 32
 
-// W_CONN is the connection window a sender assumes per peer before any sid-0
-// grant (§4.2.1, §10.1, Appendix B), and the floor of Limits.maxPeerWindow
-// for the same reason W_INIT floors the rx buffer: a receiver holding less
-// than a sender assumes is overrun by a conforming sender. A fixed protocol
-// constant, 32 × W_INIT.
+// W_CONN is the connection window the client assumes toward a server
+// incarnation until that incarnation's advertisement arrives — its first H
+// or T (§4.2.1, §10.1, Appendix B) — and the floor of Limits.maxPeerWindow
+// for the same reason W_INIT floors the rx buffer: a client streams on the
+// assumption before the server's first H or T, and a receiver holding less
+// would be overrun by a conforming sender. A fixed protocol constant,
+// 32 × W_INIT.
 export const W_CONN = 1024
 
 // DEFAULT_STALL_MS is T_stall (§10.1): how long a send may park for credit
@@ -272,9 +279,10 @@ export type FlowAcquire =
 // 'peer-stalled' the peer's connection window (§4.2.1, §14).
 export type FlowAcquireBoth = FlowAcquire | 'peer-stalled'
 
-// SenderState is a connection sender's position — on, settled, granted and
-// sent — carried across its container's eviction (PeerFlowRx.stash, §9.4,
-// §15) so a recreated container continues where it left off.
+// SenderState is a connection sender's position — on, observed (the
+// once-only advertisement latch), granted and sent — carried across its
+// container's eviction (PeerFlowRx.stash, §9.4, §15) so a recreated container
+// continues where it left off.
 export interface SenderState {
   on: boolean
   observed: boolean
@@ -293,17 +301,26 @@ export class FlowSender {
 
   // assume starts flow control on the protocol's initial window, before the
   // peer has said anything (§4.2.1). Without it a client-streaming burst
-  // could empty itself onto the wire before the ack it would be paced by.
+  // could empty itself onto the wire before the ack it would be paced by. It
+  // is the client's: a server's sender, per stream and per connection alike,
+  // is created by an OPEN that already carries the advertisement. Refused
+  // once the peer has advertised (observe) or the window is already on.
   assume(window: number): void {
     if (window <= 0 || this.observed || this.on) return
     this.on = true
     this.granted = window
   }
 
-  // observe adopts the peer's advertised window: authoritative, replacing any
+  // observe adopts the peer's advertised window — the per-stream one from
+  // its OPEN or creation-ack H, the connection one from any OPEN (server
+  // side) or any H or T (client side), §4.2.1: authoritative, replacing any
   // assumption and counted against what was already sent (a smaller window
-  // simply parks the sender until the receiver drains). 0 means the peer does
-  // no flow control.
+  // simply parks the sender until the receiver drains). 0 — the field absent
+  // — means the peer does no flow control on that window: off, whatever a
+  // grant says afterwards. Once only: the first advertisement heard from a
+  // peer incarnation wins and the rest are ignored; reassume re-arms the
+  // latch for a new incarnation. Anyone parked is woken to re-race on the
+  // advertised credit.
   observe(window: number): void {
     if (this.observed) return
     this.observed = true
@@ -316,23 +333,9 @@ export class FlowSender {
     wake(this.waiters)
   }
 
-  // confirm settles a connection window by the peer's first per-stream
-  // advertisement (§4.2.1): 0 means the peer does no flow control and turns
-  // it OFF; anything else confirms the assumption as it stands. Unlike
-  // observe it keeps the credit already granted — a sid-0 grant that raced
-  // ahead of the settle (the peer's raise rides right behind its
-  // advertisement) must not be clobbered by a replace. Once only, like
-  // observe. A sender that was never assumed stays off: an advertisement is
-  // not a grant, and nothing was assumed that could be confirmed.
-  confirm(window: number): void {
-    if (this.observed) return
-    this.observed = true
-    if (window <= 0) this.on = false
-    wake(this.waiters)
-  }
-
   // reassume restarts a connection window from scratch for a new peer
-  // incarnation (§4.2.1, §10.6): assumed at window, unsettled, nothing sent.
+  // incarnation (§4.2.1, §10.6): assumed at window, unadvertised — the latch
+  // re-armed for the new incarnation's first H or T — nothing sent.
   // A server that restarted on a surviving channel counts from zero, so the
   // cumulative sent count and any credit of the dead incarnation would never
   // line up with its grants again — a forever-park. Anyone parked is woken to
@@ -459,8 +462,9 @@ export class FlowSender {
     }
   }
 
-  // parked resolves on the next grant, undo, settle or release — the channel
-  // Go's tryAcquire hands back; callers re-check with tryAcquire and loop.
+  // parked resolves on the next grant, undo, advertisement or release — the
+  // channel Go's tryAcquire hands back; callers re-check with tryAcquire and
+  // loop.
   parked(): Promise<void> {
     return new Promise((res) => this.waiters.push(res))
   }
@@ -602,16 +606,10 @@ export class FlowReceiver {
   }
 }
 
-// U32_MAX bounds the ledger's counters: they are uint32 on the wire (§7), and
-// a hostile peer's returns must saturate, never wrap.
-const U32_MAX = 0xffff_ffff
-
-// EvictedSender is one held sender position: its credit and whether this
-// side's raise already went to it (PeerFlowRx.stash / unstash).
-export interface EvictedSender {
-  state: SenderState
-  raised: boolean
-}
+// U32_MAX bounds the ledger's counters and the advertisement a peer's frame
+// carries: both are uint32 on the wire (§5, §7), and a hostile peer's returns
+// must saturate, never wrap.
+export const U32_MAX = 0xffff_ffff
 
 // PeerFlowRx is the receiving half of the connection window (§4.2.1, §15):
 // one per transport peer on the server, one per Conn on the client. It is a
@@ -646,30 +644,29 @@ export class PeerFlowRx {
   private window = 0 // maxPeerWindow; 0 = off (unreliable mode)
   private outstanding = 0 // admitted − retired: the peer's frames in our buffers
   private readonly pending = new Map<number, number>() // retired − granted, per incarnation (epoch)
-  private raised = false // the once-per-incarnation raise above W_CONN was sent
 
   // The sending half of the containers the maxDeadPeers cap evicted (§9.4,
   // §15), by client epoch, in eviction order (a Map iterates in insertion
   // order), at most evictCap of them. An evicted incarnation may be idle
   // rather than dead — a client holding several Conns on one socket — and a
-  // recreated container that started over at W_CONN would be under-credited
-  // against a client ledger that already raised it, with no grant cadence
-  // able to reach it (§4.2.1 Raise: a forever-park), while repeating the
-  // raise would over-credit the client. So the position is kept, bounded
-  // like the containers are, and a grant addressed to an evicted incarnation
-  // still lands on it, as does the credit of a RESET-drawn data frame it
-  // sent. Past the cap the oldest is dropped, credit held back for it
-  // included, and that incarnation starts over at W_CONN as a new one would
-  // — raised again, which over-credits the client (§16).
-  private readonly evicted = new Map<number, EvictedSender>()
+  // sender recreated with a full window from its next OPEN's advertisement,
+  // against a client whose buffers still hold the evicted one's frames,
+  // could overrun it (§4.2.1 Overrun). So the position — its window and its
+  // credit — is kept, bounded like the containers are, and a grant addressed
+  // to an evicted incarnation still lands on it, as does the credit of a
+  // RESET-drawn data frame it sent. Past the cap the oldest is dropped,
+  // credit held back for it included, and that incarnation starts over as a
+  // new one would: at the window its OPEN advertises with nothing sent,
+  // over-credited by whatever the dropped position had spent (§16).
+  private readonly evicted = new Map<number, SenderState>()
   private evictCap = 0
 
   // enable sizes the ledger. evictCap is how many evicted senders it keeps
   // (server: maxDeadPeers; the client evicts nothing). The window saturates
-  // at U32_MAX, what Go's uint32 parameter can hold: it is what the raise
-  // puts on the wire (§7) and what the grant rule measures against, and an
-  // unbounded one would do neither (limits.ts clamps first; this keeps the
-  // ledger honest on its own).
+  // at U32_MAX, what Go's uint32 parameter can hold: it is what the
+  // advertisement puts on the wire (§5, §7) and what the grant rule measures
+  // against, and an unbounded one would do neither (limits.ts clamps first;
+  // this keeps the ledger honest on its own).
   enable(window: number, evictCap: number): void {
     this.window = Math.min(window, U32_MAX)
     this.evictCap = evictCap
@@ -747,48 +744,26 @@ export class PeerFlowRx {
     return pending
   }
 
-  // raise returns the once-per-peer-incarnation sid-0 grant that lifts the
-  // sender's assumed W_CONN to this receiver's window (§4.2.1): window −
-  // W_CONN, exactly once; 0 when there is nothing to raise by, and 0 ever
-  // after. It is a MUST, not an optimisation: this side's grant cadence is
-  // computed against its own window, so a sender left at W_CONN against a
-  // larger receiver would park before any batched grant fired.
-  raise(): number {
-    if (this.raised) return 0
-    this.raised = true
-    return this.excess()
-  }
-
-  // excess is what a raise lifts the sender by — window − W_CONN when
-  // positive — without the once-only latch: on the server the ledger is per
-  // transport peer while the raise is per client incarnation (§4.2.1, §15),
-  // so the container keeps the latch and asks the ledger only for the
-  // amount.
-  excess(): number {
-    return this.window <= W_CONN ? 0 : this.window - W_CONN
-  }
-
-  // renew makes the raise due again: the peer is a new incarnation, whose
-  // sender starts over at W_CONN and has never seen this receiver's window
-  // (§4.2.1). The ledger itself carries over — outstanding still counts the
-  // dead incarnation's frames until they drain, uncredited — but whatever
-  // was held back for the old incarnation has no one left to go to. Client
-  // only: a Conn faces one server incarnation at a time.
+  // renew moves the ledger past a dead peer incarnation (§4.2.1 Restart):
+  // whatever was held back for it has no one left to go to and is dropped,
+  // while the ledger itself carries over — outstanding still counts the dead
+  // incarnation's frames until they drain, uncredited. Client only: a Conn
+  // faces one server incarnation at a time, and the new one advertises its
+  // own window on its first H or T.
   renew(): void {
-    this.raised = false
     this.pending.clear()
   }
 
   // stash keeps the sender position of a container the maxDeadPeers cap is
   // evicting (see the field comment). Whatever the ledger holds back for
   // that incarnation stays with it.
-  stash(epoch: number, state: SenderState, raised: boolean): void {
+  stash(epoch: number, state: SenderState): void {
     if (this.evictCap <= 0) {
       this.pending.delete(epoch)
       return
     }
     // A re-stash keeps its place in the eviction order, as a Map does.
-    this.evicted.set(epoch, { state: { ...state }, raised })
+    this.evicted.set(epoch, { ...state })
     while (this.evicted.size > this.evictCap) {
       const oldest = this.evicted.keys().next().value!
       this.evicted.delete(oldest)
@@ -798,7 +773,7 @@ export class PeerFlowRx {
 
   // unstash hands back the held position of an incarnation whose container
   // is being recreated, if it is still held — once.
-  unstash(epoch: number): EvictedSender | undefined {
+  unstash(epoch: number): SenderState | undefined {
     const e = this.evicted.get(epoch)
     if (e === undefined) return undefined
     this.evicted.delete(epoch)
@@ -813,8 +788,8 @@ export class PeerFlowRx {
   creditEvicted(epoch: number, n: number): void {
     if (n <= 0) return
     const e = this.evicted.get(epoch)
-    if (e === undefined || !e.state.on) return
-    e.state.granted = Math.min(e.state.granted + n, Number.MAX_SAFE_INTEGER)
+    if (e === undefined || !e.on) return
+    e.granted = Math.min(e.granted + n, Number.MAX_SAFE_INTEGER)
   }
 }
 

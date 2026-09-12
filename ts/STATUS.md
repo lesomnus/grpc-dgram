@@ -28,22 +28,29 @@ server compiled to `js/wasm` serve the page it runs in
 empty message is the goodbye) and a second cross-language proof,
 `test/wasm.test.ts`, this one on a channel that is *actually* reliable.
 
-**Connection-window round (2026-09-11)** — the mirror of Go's `flow.go` for
-the per-peer **connection window** (§4.2.1, PR #12's Go core and spec; issue
-#4 part 2): a reliable-mode data frame needs one credit from its stream window
-*and* one from the peer's, every sender assumes `W_CONN` = 1024 toward each
-peer, the peer's first per-stream advertisement settles it (`FlowSender.confirm`),
-credit rides `WINDOW` on `sid = 0` and never enables, the receiver's ledger
-(`PeerFlowRx`) is per transport peer with pending held per client incarnation
-and a stash for senders the container cap evicted, a receiver above the floor
-raises the sender once behind its first OPEN / creation ack, and one `T_stall`
-covers both windows (`acquireBoth`). `Limits.maxPeerWindow` (floored at
-`W_CONN`) and the `peer-flow-stall` / `peer-flow-resume` event pair came with
-it. Where the Go code and the design memo differed, the Go code won; the few
-places TS cannot take Go's shape are stated in the code (the pre-check before
-taking credit instead of take-then-refund, since there is no yield between
-them; `tryAcquireBoth` as the synchronous fast path; the client's raise after
-the OPEN's transmit resolves). Both cross-language suites now move more than
+**Connection-window round (2026-09-11; advertised since 2026-09-12)** — the
+mirror of Go's `flow.go` for the per-peer **connection window** (§4.2.1, PR
+#12's Go core and spec; issue #4 part 2, issue #20 for the advertisement): a
+reliable-mode data frame needs one credit from its stream window *and* one
+from the peer's. The window is **advertised** as `Frame.connWindow` — a `Conn`
+on every OPEN, a `Server` on every H and T — and a sender adopts the first
+advertisement it hears from a peer incarnation (`FlowSender.observe`, once;
+absent = off, a later one ignored). Only the client assumes anything: `W_CONN`
+= 1024 until the server's first H or T; a server's sender is created from the
+OPEN that creates its container, admitted or rejected. Credit rides `WINDOW`
+on `sid = 0` and never enables, the receiver's ledger (`PeerFlowRx`) is per
+transport peer with pending held per client incarnation and a stash for
+senders the container cap evicted, and one `T_stall` covers both windows
+(`acquireBoth`). `Limits.maxPeerWindow` (floored at `W_CONN`, capped at the
+wire's uint32) and the `peer-flow-stall` / `peer-flow-resume` event pair came
+with it. The advertisement replaced an earlier draft that inferred the window
+— a settle from the per-stream advertisement plus a one-off "raise" grant —
+which parked a streaming sender for good against a peer that paces streams
+but never grants on `sid = 0` (Appendix A, entry 11). Where the Go code and
+the design memo differed, the Go code won; the few places TS cannot take Go's
+shape are stated in the code (the pre-check before taking credit instead of
+take-then-refund, since there is no yield between them; `tryAcquireBoth` as
+the synchronous fast path). Both cross-language suites move more than
 `W_conn` messages each way across three streams, so a TS endpoint and a Go
 endpoint pace each other on sid 0 exactly as two Go endpoints do.
 
@@ -72,12 +79,12 @@ mirroring Go's `transport/{udp,pion,gorilla,webtransport,jsport}/` layout (dir
 |---|---|---|
 | `wire.ts` | zero-dep protobuf codec for `Frame`/`Envelope`/`Metadata` | `*.pb.go`, `frame.go` |
 | `seq.ts` | tx seq + rx window (dedup, beyond-window fail-loud, strict mode) | `seq.go` |
-| `timing.ts` / `limits.ts` | timer + resource-cap resolution (`maxPeerWindow` floored at `W_CONN`) | `timing.go`, `limits.go` |
+| `timing.ts` / `limits.ts` | timer + resource-cap resolution (`maxPeerWindow`, the advertised connection window: floored at `W_CONN`, capped at the wire's uint32) | `timing.go`, `limits.go` |
 | `status.ts` / `metadata.ts` | `StatusError`/`Code`, `Metadata` | `status`, `metadata.go` |
 | `seam.ts` / `desc.ts` | `FrameHandler`/`TransportInfo`/`ConnAttacher`, method descriptors + codecs | `frame.go`, grpc codegen |
-| `util.ts` | `Latch`, `FrameQueue` (drop-policy + reliable blocking put), `Sweeper`; the §4.2.1 flow-control primitives both endpoints share — `FlowSender` / `FlowReceiver` (per stream), `PeerFlowRx` (the per-peer ledger: admit/retire/unadmitted, per-incarnation pending, the raise, the evicted-sender stash), `acquireBoth` / `tryAcquireBoth` (one park, one `T_stall` across both windows), `W_INIT` / `W_CONN`; compression + size caps | Go channels/goroutines; `flow.go`, `frame.go`/`callinfo.go` |
-| `conn.ts` | `Conn` + `ClientStream`, client unreliable-mode machinery, the client half of the connection window (`connTx`/`connRx`, the server-epoch lock, the sid-0 WINDOW arm, credit for every non-buffered frame) | `conn.go`, `stream.go`, `unreliable.go`, `flow.go` |
-| `server.ts` | `Server` + server stream, per-peer state, sweep, caps, the server half of the connection window (the per-transport-peer ledger, container-on-reject, the raise behind the first H, unstash-before-evict, release on `disconnectPeer`) | `server.go`, `stream.go`, `unreliable_server.go`, `flow.go` |
+| `util.ts` | `Latch`, `FrameQueue` (drop-policy + reliable blocking put), `Sweeper`; the §4.2.1 flow-control primitives both endpoints share — `FlowSender` (per stream and per connection: `assume` / `observe` / `reassume`) / `FlowReceiver`, `PeerFlowRx` (the per-peer ledger: admit/retire/unadmitted, per-incarnation pending, the evicted-sender stash), `acquireBoth` / `tryAcquireBoth` (one park, one `T_stall` across both windows), `W_INIT` / `W_CONN`; compression + size caps | Go channels/goroutines; `flow.go`, `frame.go`/`callinfo.go` |
+| `conn.ts` | `Conn` + `ClientStream`, client unreliable-mode machinery, the client half of the connection window (`connTx`/`connRx`, `connWindow` on every OPEN, the advertisement adopted from the first H or T of a server incarnation — live call or released — the server-epoch lock, the sid-0 WINDOW arm, credit for every non-buffered frame) | `conn.go`, `stream.go`, `unreliable.go`, `flow.go` |
+| `server.ts` | `Server` + server stream, per-peer state, sweep, caps, the server half of the connection window (the per-transport-peer ledger, the container's sender created from the OPEN's advertisement — admitted or rejected — `advertise` on every H and T, unstash-before-evict, release on `disconnectPeer`) | `server.go`, `stream.go`, `unreliable_server.go`, `flow.go` |
 | `stats.ts` | `ProtocolStats` observer type, `ProtocolEvent`, `Counters` — the §14 gap counter, the other datagram-only events, and the stream / peer flow-stall pairs | `stats.go` (the `ProtocolStats` half; the `stats.Handler` half has no TS twin) |
 | `interceptor.ts` | Unary/stream, client/server interceptor types in a `(…, next)` shape, and the chain fold — element 0 outermost, the last element gets the real invoker/handler | the interceptor chains of `conn.go` / `server.go` (grpc-go's order; TS-native signatures, arrays instead of single-vs-chain options) |
 | `transport/webrtc/` | `DataChannelTransport` (client) + `DataChannelGateway` (server, mixed-mode) | `transport/pion/*.go` |
@@ -90,7 +97,7 @@ mirroring Go's `transport/{udp,pion,gorilla,webtransport,jsport}/` layout (dir
 
 Verified at this commit:
 
-- `pnpm test` → **549 passing** (27 files). Unit and per-adapter tests are
+- `pnpm test` → **569 passing** (27 files). Unit and per-adapter tests are
   co-located next to their source (`src/wire.test.ts`,
   `src/transport/connect/index.test.ts`, …); cross-cutting integration tests
   (e2e, timeout, restart, limits, flow, flow_peer_client, flow_peer_server,
@@ -111,12 +118,14 @@ Verified at this commit:
   transport peer), `flow.test.ts` (the §4.2.1 stream window end to end),
   `flow_peer_client.test.ts` / `flow_peer_server.test.ts` (the twins of
   `flow_peer_client_test.go` / `flow_peer_server_test.go` and the peer-window
-  halves of `server_internal_test.go`: the `W_conn` assumption, settle and
-  off, the sid-0 gate, the raise — including behind a rejected or cancelled
-  first call — overrun failing only the offender, credit for every
-  non-buffered frame, the starvation clause, one stall budget, no credit held
-  while parked, credit granted to the incarnation that spent it, the evicted
-  sender's stash, TS↔TS past `W_conn` both ways),
+  halves of `server_internal_test.go`: the `W_conn` assumption until the
+  advertisement, the advertisement on every OPEN / H / T and its once-only
+  adoption — a unary T, a rejected first OPEN, a released call's H or T,
+  absent = off, a later one ignored — the sid-0 gate, overrun failing only
+  the offender, credit for every non-buffered frame, the starvation clause,
+  one stall budget, no credit held while parked, credit granted to the
+  incarnation that spent it, the evicted sender's stash, TS↔TS past `W_conn`
+  both ways),
   `src/transport/webrtc/index.test.ts` (adapter against a mock RTCDataChannel
   pair, incl. the reliable-datachannel echo — the project's final-goal demo
   shape), `src/transport/{websocket,port}/index.test.ts` (their adapters
@@ -237,11 +246,13 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
    reliable instead of being annotated as such per frame, which is all loopback
    UDP could offer. That buys the part of v1.1 that exists in reliable mode
    only: mode discovered from the transport with zero options on either side,
-   the §4.2.1 window advertised on the OPEN, credit granted in both
-   directions as each side's handler consumes — per stream and, since the
-   connection-window round, on `sid = 0` once the aggregate passes
-   `W_conn/2` (the same case runs on the reliable-annotated UDP endpoint in
-   `conformance.test.ts`, one message in flight so loopback never queues). It
+   the §4.2.1 windows advertised — the stream window on the OPEN and the
+   creation ack, the connection window on the OPEN and on every H and T —
+   credit granted in both directions as each side's handler consumes — per
+   stream and, since the connection-window round, on `sid = 0` once the
+   aggregate passes `W_conn/2` (the same case runs on the reliable-annotated
+   UDP endpoint in `conformance.test.ts`, one message in flight so loopback
+   never queues). It
    also pins both teardown
    paths, which are what §4.5 costs on a channel with no death to detect —
    `drpcStop()` (the Go gateway's goodbye → the TS calls fail `UNAVAILABLE`)
@@ -292,7 +303,7 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
 ```
 cd ts
 pnpm install
-pnpm test     # vitest, 549 tests (the two cross-language suites need `go` on PATH)
+pnpm test     # vitest, 569 tests (the two cross-language suites need `go` on PATH)
 pnpm check    # tsc --noEmit (strict)
 pnpm build    # tsdown → dist/
 ```

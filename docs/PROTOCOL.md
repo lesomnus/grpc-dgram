@@ -30,13 +30,15 @@
 > sharing its channel. Appendix A lists the deltas.
 >
 > **v1.1 (2026-09-05)** adds a **per-peer connection window** beside the
-> per-stream one (§4.2.1). No wire change — same fields, same flags — but a
-> new obligation: a `WINDOW` frame with `sid = 0`, which the previous text
-> dropped in silence, credits the peer's aggregate window; a reliable-mode
-> receiver bounds what one peer may have buffered across all of its calls
-> (`Limits.MaxPeerWindow`, §15); and a sender assumes `W_conn` (§10.1) toward
-> every peer. A peer on the previous text parks a streaming sender at `W_conn`,
-> which is why this lands before the wire freeze (Appendix A, entry 11).
+> per-stream one (§4.2.1): a reliable-mode receiver bounds what one peer may
+> have buffered across all of its calls (`Limits.MaxPeerWindow`, §15),
+> advertises that bound as `Frame.conn_window` — the client on every `OPEN`,
+> the server on every `H` and `T` — and a `WINDOW` frame with `sid = 0`,
+> which the previous text dropped in silence, credits it. A sender assumes
+> `W_conn` (§10.1) toward a peer only until that peer's advertisement
+> arrives; a peer that never advertises is read as doing no connection flow
+> control, so a partial implementation cannot park a sender for good
+> (Appendix A, entry 11).
 >
 > **What this document pins down:** the on-wire encoding and the normative
 > behaviors that two independent implementations must agree on. **What may
@@ -303,31 +305,44 @@ frames are uncredited, `T_stall` bounds a park, a grant never enables.
     window per (peer, client-epoch) container (§9.4), on the client one per
     `Conn`, counted toward the server incarnation the `Conn` is locked to
     (*Restart*, below).
-- **Assumption.** The connection window is never advertised. Every sender
-  assumes `W_conn` = 1024 messages (§10.1, Appendix B) toward each peer
-  incarnation from the moment it holds state for it — the `Conn` at
-  construction, the server at container creation — and counts every data
-  frame against it from the first. A receiver MUST therefore be able to hold
+- **Advertisement.** A receiver advertises its connection window — what it
+  will buffer from this peer across all of its calls, `MaxPeerWindow` (§15)
+  — as `Frame.conn_window`, beside the per-stream one:
+  - the client on **every `OPEN`**;
+  - the server on **every `H` and `T`** (§7).
+  Every frame of those kinds carries it, and the value is fixed for the
+  advertiser's lifetime, so whichever arrives first is right and nothing
+  needs telling apart — not a creation ack from a `SendHeader` flush, not a
+  streaming call from a unary one, not an admitted `OPEN` from a rejected
+  one. A peer applies the **first** advertisement it hears from a peer
+  incarnation and ignores the rest: the client from the first `H` or `T`
+  the `Conn` accepts from a server incarnation, on a live call or on one it
+  has already released (*Restart*, below); the server from the `OPEN` that
+  creates the (peer, client-epoch) container (§9.4), admitted or rejected.
+  A `conn_window` of 0 (absent) on one of those frames means "this peer does
+  no connection flow control": the sender's connection window is then
+  **off** toward that incarnation, whatever the per-stream `window` said —
+  which is what makes a partial implementation harmless, one that paces
+  streams but never grants on `sid = 0` (Appendix A, entry 11). The field
+  means nothing on any other frame, and a grant never enables (above): only
+  the advertisement does.
+- **Initial window.** Until the advertisement arrives a sender paces itself
+  by `W_conn` = 1024 messages (§10.1, Appendix B) toward each peer
+  incarnation, exactly as it paces a call by `W_init` before the call's
+  advertisement. Only the client ever needs it — it may stream before the
+  first `H` — and only from the `Conn`'s construction to that `H`; the
+  server's sender is created by an `OPEN` that carries the advertisement
+  (§9.4), so it never assumes. A receiver MUST therefore be able to hold
   `W_conn` messages from one peer: `MaxPeerWindow` (§15) is floored at
-  `W_conn`, for the same reason the rx buffer is floored at `W_init`.
-- **Settle.** The assumption is settled **exactly once per peer incarnation**
-  by the peer's first per-stream advertisement — the protocol's only "this
-  peer does flow control" signal. `window > 0` **confirms** it: the credit
-  stays as assumed, plus anything already granted on `sid = 0`, counted
-  against what was already sent. `window = 0` turns the connection window
-  **off** toward that peer, as it turns the stream's off. Which advertisement
-  settles is fixed, and a settle that fires on the wrong frame would switch
-  the window off while the peer enforces:
-  - **client:** the first accepted **creation-ack `H`** (§8 — a header frame,
-    payload absent) of a **streaming** call, when it is that stream's first
-    accepted frame. A unary `T` and a `SendHeader`-flushed `H` carry no
-    `window` (§7, §8) and MUST NOT settle; a unary-first `Conn` stays assumed
-    until its first streaming ack.
-  - **server:** the container's first **admitted** `OPEN` (§9.4). Every
-    `OPEN` a reliable-mode client sends carries its advertisement, unary
-    included, so the first admitted call of any shape settles. A rejected
-    `OPEN` creates the container (§9.4) but settles nothing.
-  Nothing else settles it — in particular a `sid = 0` grant does not.
+  `W_conn`, for the same reason the rx buffer is floored at `W_init`. The
+  advertisement is **authoritative** and replaces the assumption, counted
+  against what the sender has already sent; a smaller window simply parks the
+  sender until the receiver drains. No grant can precede it: a `sid = 0`
+  grant is applied only by a `Conn` already locked to the server incarnation
+  or by a container that already exists (*Grants*, below), and the lock and
+  the container are made by the very frame that advertises — so an
+  advertisement never has an earlier grant to preserve, and a grant that
+  arrives ahead of one comes from a peer that broke §8.
 - **Grants.** A `WINDOW` frame with `sid = 0` carries additive credit for the
   peer's connection window in `window` (§7): `seq = 0`, no payload, the
   sender's own `epoch`; server→client it names the client incarnation in
@@ -399,42 +414,18 @@ frames are uncredited, `T_stall` bounds a park, a grant never enables.
   — a permanent shrink of the live sender. The starvation clause reads the
   shared bound against one incarnation's held-back credit, which can only
   fire early, never late.
-- **Raise.** A receiver whose `MaxPeerWindow` exceeds `W_conn` MUST lift the
-  sender's assumption **once per peer incarnation** with a `sid = 0` grant of
-  `MaxPeerWindow − W_conn`: the client right behind its first `OPEN` (the OPEN
-  creates the container the grant addresses, admitted or rejected — §9.4) and,
-  when it hears a new server incarnation, at once (the call that heard it has
-  already opened there); the server right behind the first creation-ack `H`
-  it sends to a (peer, client-epoch) container — a unary-only incarnation is
-  owed nothing until its first streaming call, and on an ordered channel the
-  `H` settles the client before the grant lands. The `Conn` locks to the
-  server from that `H` even when it lands on a call the client has already
-  released (*Restart*), so the raise behind it is never dropped as a
-  stranger's. It is a MUST because the receiver's cadence is computed against
-  its own window: a sender left at `W_conn` against a larger one parks before
-  any batched grant fires — and for a receiver above 2 × `W_conn` no grant
-  ever fires, since neither half its window nor a full one can be reached by
-  a sender capped at `W_conn`. A receiver at the floor sends none. It is
-  best-effort against a draining peer: an `OPEN` a stopping server RESETs
-  (§9.4) creates no container, and the raise behind it is lost with the call.
-  A container-cap eviction (§9.4) does not repeat it while the ledger holds
-  the evicted position: the container is recreated from it, raise included.
-  Past the ledger's own cap the position is gone, the recreated container is
-  assumed at `W_conn` and raised again, and the client — whose own raise
-  latch is per server incarnation — is over-credited by up to
-  `MaxPeerWindow − W_conn` (§16).
 - **Restart on a surviving channel.** Each client stream locks to a server
   epoch (§6.1); the `Conn` likewise locks its connection sender to a server
   incarnation, on the first sequenced frame it hears from it, for a live call
   or for one it has already released: a frame that draws a RESET (§9.3) still
-  answers one of this `Conn`'s OPENs and names its epoch, and the server's
-  raise may ride right behind it. When it first hears a **different** server
-  epoch (§10.6 allows a restarted server on a datagram channel forced
-  reliable, §4.3), the `Conn` MUST start its sender over — assumed at
-  `W_conn`, unsettled, nothing sent — treat the raise as due again, drop
-  grants naming the old epoch, and stop returning credit for frames of the
-  incarnation it moved past (their calls are RESET-failed anyway; the new
-  server never counted them). A reliable channel is ordered, so a dead
+  answers one of this `Conn`'s OPENs and names its epoch — and if it is an
+  `H` or `T`, carries its advertisement, which the `Conn` applies as it
+  locks. When it first hears a **different** server epoch (§10.6 allows a
+  restarted server on a datagram channel forced reliable, §4.3), the `Conn`
+  MUST start its sender over — assumed at `W_conn`, unadvertised, nothing
+  sent — drop grants naming the old epoch, and stop returning credit for
+  frames of the incarnation it moved past (their calls are RESET-failed
+  anyway; the new server never counted them). A reliable channel is ordered, so a dead
   incarnation's frame never follows a live one's. Server side, a client
   restart at the same peer key is a new container with a fresh sender (§9.4),
   while the receiver's ledger is inherited across incarnations exactly as
@@ -452,8 +443,9 @@ frames are uncredited, `T_stall` bounds a park, a grant never enables.
   an outage for every call. HTTP/2 answers the same violation with a
   connection error because its connection is the transport unit; here it is
   not. A conforming sender never triggers this.
-- **Unreliable mode** has no connection window: no assumption, no ledger, no
-  raise, and a `WINDOW sid = 0` is dropped like every other `WINDOW` there.
+- **Unreliable mode** has no connection window: no advertisement, no
+  assumption, no ledger, and a `WINDOW sid = 0` is dropped like every other
+  `WINDOW` there.
 
 **In both windows**
 
@@ -636,6 +628,7 @@ message Frame {
                               // on WINDOW sid 0: the peer's connection window.
   string  compressor   = 16;  // message compressor name; OPEN only (§12.1).
   repeated google.protobuf.Any details = 17;  // google.rpc.Status.details (§5).
+  uint32 conn_window = 18;                    // connection-window advertisement (§4.2.1)
 }
 
 message Envelope { repeated Frame frames = 1; }
@@ -678,6 +671,12 @@ Notes:
   the call named by `sid`, or for the peer's connection window when
   `sid = 0`. `compressor` names a message compressor for the whole call, like
   `codec` (§12.1).
+- `conn_window` is the advertiser's **connection window** (§4.2.1), also in
+  messages: the client's on every `OPEN`, the server's on every `H` and `T`.
+  Absent there, it means the advertiser does no connection flow control;
+  anywhere else the field means nothing. A two-byte tag, deliberately: it
+  rides only frames that are rare and already large, so field 6 stays for a
+  per-frame field (`ack`, §10.3).
 - **Metadata values are `bytes`, not text** (§11). gRPC's binary metadata
   (`-bin` keys) carries arbitrary octets, which a proto `string` cannot hold;
   `bytes` and `string` share wire type 2, so text metadata encodes
@@ -697,7 +696,7 @@ Notes:
   on every implementation — the golden vectors compare them — and what makes
   the byte-identical retransmission of §10.3 literally true for a frame that
   carries metadata.
-- The next free field number is 18.
+- The next free field number is 19.
 
 ## 6. Identity
 
@@ -882,7 +881,10 @@ A unary or client-streaming client that receives a payload-bearing data frame
 (its shape has none) drops and counts it.
 
 `H` and `OPEN` frames additionally carry the flow-control advertisement of
-§4.2.1 in `window` when the sending side is in reliable mode.
+§4.2.1 in `window` when the sending side is in reliable mode; in the same
+mode every `OPEN` (client) and every `H` and `T` (server) also carries the
+connection-window advertisement in `conn_window` (§4.2.1, §5) — the only
+frames on which that field means anything.
 
 ## 8. Call shapes (canonical and mandatory)
 
@@ -1009,8 +1011,8 @@ On every received frame, in order:
       connection credit (§4.2.1): the peer spent one on it, and it is never
       buffered. At the client any sequenced frame that lands here first locks
       the `Conn` to the frame's server epoch (§4.2.1 *Restart*): it answers
-      one of this `Conn`'s OPENs, and the server's raise may ride right
-      behind it.
+      one of this `Conn`'s OPENs, and if it is an `H` or `T` it carries the
+      server's advertisement, applied as the `Conn` locks.
 
 **Validated frame** — normative definition (exhaustive): a frame that is
 (i) accepted or dedup-dropped by a live stream's seq check, (ii) an OPEN
@@ -1133,9 +1135,10 @@ frames only — junk floods cannot keep a ghost peer alive.
   when it does not exist yet, in **both** modes (unreliable mode already
   needed it for the tombstone). In reliable mode that is the only state a
   rejection leaves, and it exists so the peer's connection-window state has a
-  home (§4.2.1): the OPEN was validated (§9.1), the client's raise rides
-  right behind it, and the credit for data frames the peer pipelines after a
-  rejected call must have an incarnation to go back to. It is bounded by the
+  home (§4.2.1): the OPEN was validated (§9.1) and carries the client's
+  advertisement, from which the container's sender is created, and the
+  credit for data frames the peer pipelines after a rejected call must have
+  an incarnation to go back to. It is bounded by the
   per-peer container cap (§15) exactly as in unreliable mode.
 - The handler ctx derives from the Server root ctx (§6.4) and is cancelled by:
   terminal frames, RESET, liveness expiry, deadline (§10.2), window-overrun
@@ -1155,20 +1158,19 @@ frames only — junk floods cannot keep a ghost peer alive.
   (§4.5): reliable containers are never swept, and the ledger, keyed by the
   transport peer, lives exactly as long as the peer's containers. When the
   container cap evicts a reliable container, the ledger keeps the evicted
-  container's connection sender — its credit, its settle and the raise it
-  already got — and a `sid = 0` grant naming that incarnation still lands on
-  it, so that the incarnation's next OPEN continues it: an idle `Conn` is not
-  a dead one, and a container recreated at `W_conn` against a client that had
-  raised it would park at `T_stall` with no grant able to reach it (§4.2.1
-  *Raise*), while a repeated raise would over-credit the client; a data frame
-  the evicted incarnation still had in flight returns its credit to that
-  position too (§4.2.1). The ledger holds as many such positions as the cap
+  container's connection sender — its window and its credit — and a
+  `sid = 0` grant naming that incarnation still lands on it, so that the
+  incarnation's next OPEN continues it: an idle `Conn` is not a dead one, and
+  a sender recreated with a full window against a client whose buffers still
+  hold the evicted one's frames could overrun it (§4.2.1 *Overrun*); a data
+  frame the evicted incarnation still had in flight returns its credit to
+  that position too (§4.2.1). The ledger holds as many such positions as the cap
   holds containers, oldest dropped first with the credit held back for it —
   an incarnation coming back takes its own position out before the eviction
   its OPEN causes puts another in, so a key with exactly 2 × `MaxDeadPeers`
   idle incarnations keeps every one of them. Past that an incarnation starts
-  over as a new one would: assumed at `W_conn` and raised again, which
-  over-credits the client by up to `MaxPeerWindow − W_conn` (§16).
+  over as a new one would, at the window its OPEN advertises with nothing
+  sent — over-credited by whatever the dropped position had spent (§16).
 
 ## 10. Liveness, deadlines, retransmission (core: G1)
 
@@ -1185,7 +1187,7 @@ frames only — junk floods cannot keep a ghost peer alive.
 | `T_hold` | `RTI` | Delayed-RESET grace (§9.3). |
 | `T_stall` | 30 s | Longest a send may wait for flow-control credit — on either window, one budget for both — before the call fails `UNAVAILABLE` (§4.2.1). **Runs in reliable mode too** — it is the only bound a parked sender has there. |
 | `W_init` | 32 messages | Initial per-stream window a sender assumes before the peer advertises (§4.2.1); also the minimum reliable-mode rx buffer. |
-| `W_conn` | 1024 messages | Connection window a sender assumes per peer incarnation before any `sid = 0` grant (§4.2.1); also the minimum `MaxPeerWindow` (§15). Fixed protocol constant (= 32 × `W_init`). |
+| `W_conn` | 1024 messages | Connection window a sender assumes per peer incarnation until the peer's advertisement arrives (§4.2.1); also the minimum `MaxPeerWindow` (§15). Fixed protocol constant (= 32 × `W_init`). |
 
 The timers — `T_call`, `T_live`, `RTI`, `TTL_tomb`, `T_hold`, `T_stall` — are
 option-overridable (`WithTiming`); `T_probe` is derived from `T_live`.
@@ -1334,8 +1336,9 @@ The frame is small and its additive changes — a new field — need no signal,
 because a receiver ignores fields it does not know (§5). What this document
 reserves is the exit for a change that is **not** additive. A **breaking
 generation** — one that changes what an existing frame means, which is what
-the connection window did without touching a field (Appendix A, entry 11) —
-MUST set modifier bit `64` on the first frame of every call: the client on
+the connection window did when it gave `WINDOW sid = 0` a meaning (Appendix
+A, entry 11) — MUST set modifier bit `64` on the first frame of every call:
+the client on
 its `OPEN`, the server on its creation ack (`H`, or the `T` that answers a
 unary without one). §7.1 then does the rest. Every implementation of this
 text meets a modifier it does not know and fails that call `INTERNAL` at
@@ -1574,7 +1577,8 @@ lengths split into message size and wire size (§12.1).
   per-method rx buffer sizes (§4.2); max **buffered messages per transport
   peer across all of its calls and client epochs** (`MaxPeerWindow`, the
   connection window of §4.2.1 — reliable mode only; per `Conn` on the
-  client; floored at `W_conn`, since a sender assumes that much; past it the
+  client; floored at `W_conn`, since a sender assumes that much before the
+  advertisement lands; past it the
   frame that overruns fails **its own call** `INTERNAL`, never the peer).
   `W_fwd`/`K_loud`/`W_init`/`W_conn` are fixed protocol constants (§10.1).
   Message size is bounded by the adapter (§4.4), not by a core knob.
@@ -1652,19 +1656,15 @@ its live-call count, and can cost the new one `INTERNAL` on one call, never a
 hang and never its credit (the ledger holds back and grants per incarnation,
 §4.2.1); a `MaxDeadPeers` eviction of an idle reliable container leaves its
 sender's position in the peer's ledger (§9.4), so the recreated container
-neither starts over at `W_conn` nor draws a second raise, and a data frame
+continues at its window and its credit, and a data frame
 the evicted incarnation still had in flight returns its credit to that
 position (§4.2.1) — only past the ledger's own cap, `MaxDeadPeers` held
 positions, does an incarnation start over (reachable only with **more than**
 2 × `MaxDeadPeers` idle incarnations on one key: an incarnation coming back
 takes its own position out before its OPEN's eviction puts another in), and
-then two things follow: it is assumed at `W_conn` and **raised again**, so a
-server whose `MaxPeerWindow` exceeds `W_conn` over-credits that client's
-sender by up to `MaxPeerWindow − W_conn` (less the credit dropped with the
-position) and the client can overrun and fail one call `INTERNAL` there
-(§4.2.1); and the server's sender toward it, back at `W_conn` against a
-client whose raise latch is per server incarnation, parks at `T_stall` for
-good when that client's `MaxPeerWindow` exceeds 2 × `W_conn`; and at the
+it starts over at the window its OPEN advertises with nothing sent —
+over-credited by whatever the dropped position had spent — so the client
+can overrun and fail one call `INTERNAL` there (§4.2.1); and at the
 window's edge the starvation rule costs one grant per consumed message
 (§4.2.1). Two more, both on a **datagram channel forced reliable** (§4.3), where
 frames are neither authenticated nor strictly ordered by the transport: a
@@ -1677,8 +1677,13 @@ injection class as L3, closed by an encrypted transport); and after a genuine
 server restart a **receive-only** call locked to the dead epoch never ends
 without a deadline (reliable mode runs no timers and only a send draws the
 RESET), so its pinned buffers count against the new incarnation's
-`MaxPeerWindow` for as long as it lives. The bound is in messages, not bytes
-(§15).
+`MaxPeerWindow` for as long as it lives; and a `Conn` that has heard only
+RESETs — data frames it pipelined behind OPENs that a stopping server
+answered with RESET, which returns no credit (§9.3) — locks to the first
+incarnation it does hear with those frames still counted as sent, since no
+earlier lock exists to start over from: a permanent shrink of its sender by
+up to `W_conn`, the most it can pipeline before an advertisement. The bound
+is in messages, not bytes (§15).
 
 **Resolved in v1.0 (were blockers L4/L5):** the per-peer live-call cap
 (§15, `Limits.MaxLiveCalls`) and reliable-mode strict-seq fail-loud (§10.6)
@@ -1732,27 +1737,27 @@ v1.1 (2026-07-25), breaking, pre-release:
 10. The unary shape may now carry an `H` before its `T` when the handler
     flushes a header (§8, §11).
 
-v1.1 (2026-09-05), **behavioral, no wire change** — pre-release:
+v1.1 (2026-09-05), breaking, pre-release:
 
-11. `WINDOW sid=0` carries a per-peer **connection window** (§4.2.1). A
-    conforming reliable-mode receiver bounds `MaxPeerWindow` messages per
-    transport peer and grants on `sid = 0`; a conforming reliable-mode sender
-    assumes `W_conn` = 1024 messages toward every peer incarnation and
-    honours it. Was: `WINDOW sid=0` dropped silently (the client looked up
-    sid 0 and found nothing; the server took the finished-call branch), no
-    aggregate bound, no assumption. **There is no negotiation (§10.6)**, so
-    the two texts do not coexist gracefully: a sender on this text talking to
-    a receiver on the previous one parks after 1024 cumulative streamed data
-    frames to that peer and fails `UNAVAILABLE` at `T_stall` on that send and
-    on every later streaming send for the incarnation's life — loud, bounded,
-    attributable (a peer-stall event, a distinct error text), unary-exempt
-    (the request rides `OPEN|CLOSE`, the response rides `T`, both uncredited)
-    and corrupting nothing, but fatal for a long-lived streaming sender. A
-    receiver on this text talking to a sender on the previous one changes
-    nothing while that sender pins ≤ `MaxPeerWindow` messages, and past it
-    fails the overrunning call `INTERNAL`, one call at a time. This is why
-    the change precedes the wire freeze: no released peer carries the old
-    obligation, and a third implementation must not miss it.
+11. `Frame.conn_window` (18) + `WINDOW sid=0`: a per-peer **connection
+    window** (§4.2.1). A conforming reliable-mode receiver bounds
+    `MaxPeerWindow` messages per transport peer, advertises that bound — the
+    client on every `OPEN`, the server on every `H` and `T` — and grants on
+    `sid = 0`; a conforming sender assumes `W_conn` = 1024 messages toward a
+    peer incarnation until its advertisement arrives and honours the
+    advertisement from then on. Was: `WINDOW sid=0` dropped silently (the
+    client looked up sid 0 and found nothing; the server took the
+    finished-call branch), no aggregate bound, no advertisement. The
+    advertisement is what lets this text meet a peer that lacks it: such a
+    peer advertises nothing, which reads as "no connection flow control" —
+    the sender streams unpaced on that window, and the receiver on this text
+    bounds it anyway and fails an overrunning call `INTERNAL`, one call at a
+    time. An earlier draft of this round *assumed* the window instead of
+    advertising it, and against the same peer parked a streaming sender
+    after 1024 data frames, for the incarnation's life, at `T_stall`. A
+    partial implementation that paces streams but never grants on `sid = 0`
+    walks that same path, which is why the field exists rather than an
+    assumption: a third implementation must not be able to miss it.
 
 Behavioral:
 

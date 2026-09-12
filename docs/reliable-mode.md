@@ -231,23 +231,20 @@ from the peer, and a receiver holds at most `Limits.MaxPeerWindow` messages
 from one peer at a time, whatever the calls. Three things make it different
 from the stream window.
 
-- **It is never advertised.** Every sender assumes `W_conn` = **1024
-  messages** toward each peer and counts from its first data frame. The
-  peer's first per-stream advertisement settles that assumption — a window
-  above 0 confirms it, 0 turns it off — and only a *streaming* call's
-  creation-ack `H` does so on the client: a unary `T` carries no window and
-  never settles anything, so a `Conn` that only ever made unary calls stays
-  on the assumption. On the server the first OPEN it admits from a client
-  incarnation settles it, unary included, since every reliable-mode OPEN
-  carries the client's window. Because the assumption is the whole of the
-  sender's initial credit, `MaxPeerWindow` has a **floor of 1024**: a
-  receiver holding less would be overrun by a conforming sender — the
-  `W_init` argument again. A receiver configured *above* it lifts the sender
-  once, with a `sid = 0` grant of the difference right behind its first OPEN
-  (client) or its first creation ack to that incarnation (server).
-  `TestPeerWindow_UnaryTerminalNeverSettles`,
-  `TestPeerWindow_StreamingAckWithWindowZeroTurnsItOff` and
-  `TestPeerWindow_RaiseBehindFirstOpen` pin the three halves of that rule.
+- **It rides frames the peer was sending anyway, and is assumed only until
+  then.** A receiver puts its `MaxPeerWindow` in `conn_window` — the client
+  on every OPEN, the server on every `H` and `T` — and a peer takes the first
+  one it hears from an incarnation and ignores the rest. Absent means "this
+  peer does no connection flow control": the window is off toward it,
+  whatever the stream window said. The server never assumes: the OPEN that
+  creates a container carries the client's window. The client does, briefly
+  — it may stream before the first `H` lands — so from the `Conn`'s
+  construction to the first `H` or `T` it paces itself by `W_conn` = **1024
+  messages**, and `MaxPeerWindow` has a **floor of 1024** for the `W_init`
+  reason: a receiver holding less would be overrun by a conforming sender on
+  its way to the first advertisement. The advertisement replaces the
+  assumption, counted against what was already sent, so a server
+  advertising 4096 lets the client run to 4096 before any grant is needed.
 - **Credit rides `WINDOW` with `sid = 0`.** A grant on sid 0 credits the
   peer's connection window; every other sid credits its call, as before.
   The receiver returns one credit for **every** data frame it received, once,
@@ -268,14 +265,14 @@ from the stream window.
   epoch-spoofing peer holds no more than an honest one
   (`TestLimits_PeerWindowScope`) — and per `Conn` on the client. The sender's
   credit is per incarnation: one per (peer, client-epoch) container on the
-  server, one per `Conn` on the client, started over from `W_conn` if the
+  server, one per `Conn` on the client, started over from `W_conn` — assumed
+  again until the new incarnation's first `H` or `T` advertises — if the
   `Conn` hears a new server incarnation on a surviving channel
   (`TestPeerWindow_ReassumeOnNewServerEpoch`). The `Conn` locks to a server
   incarnation on the first sequenced frame it hears from it, for a live call
-  or for one it has already released — the server's raise rides right behind
-  its first creation ack, and a `Conn` that only locked from live calls would
-  drop it when that call was cancelled before the ack arrived
-  (`TestPeerWindow_RaiseSurvivesACancelledFirstCall`). And because the
+  or for one it has already released, and takes the advertisement from that
+  frame when it is an `H` or `T`: a call cancelled before its ack arrived
+  still teaches the `Conn` the server's window. And because the
   ledger is per peer while grants are per incarnation, what it holds back is
   held back per incarnation too: a restarted client's returned credit never
   rides in a grant addressed to its dead predecessor
@@ -289,8 +286,8 @@ Nothing changes at the defaults for the flows that exist today: 1024 messages
 is 32 full stream windows, so a sender never parks on the connection window
 with fewer than 32 saturated streams, and no `sid = 0` frame appears until 512
 messages have been consumed in one direction — a stream's first WINDOW is
-still its own, the flows the existing tests move never see one, and a
-receiver at the floor has nothing to raise by.
+still its own, the flows the existing tests move never see one, and the
+advertisement itself rides frames that were going out anyway.
 `TestPeerWindow_ParksAcrossStreamsAndKeepsTheChannelLive` is the scenario the
 window exists for: two 600-message streams nobody reads, on a channel whose
 stream buffers are deep enough that no stream window binds, and a unary `Once`
@@ -476,13 +473,13 @@ _ = drpc.NewConn(tx,
 )
 ```
 
-Values below 1024 are raised to it — a sender assumes that much — so the
-memory one peer can pin is min(`MaxLiveCalls` × per-call buffer,
-`MaxPeerWindow`) messages, times the adapter's frame size. A deployment that
-needs a tighter pin than 1024 messages lowers `MaxLiveCalls` or the per-call
-buffer; a deployment with many concurrently saturated streams to one peer
-raises `MaxPeerWindow`, and the raise reaches the peer as a single `sid = 0`
-grant behind the first OPEN or creation ack.
+Values below 1024 are raised to it — a client assumes that much until the
+server's first `H` or `T` advertises — so the memory one peer can pin is
+min(`MaxLiveCalls` × per-call buffer, `MaxPeerWindow`) messages, times the
+adapter's frame size. A deployment that needs a tighter pin than 1024
+messages lowers `MaxLiveCalls` or the per-call buffer; a deployment with many
+concurrently saturated streams to one peer raises `MaxPeerWindow`, and the
+value reaches the peer in `conn_window` on every OPEN, `H` and `T`.
 
 ## The adapter's teardown duty
 

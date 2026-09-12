@@ -22,7 +22,8 @@ server and vice versa.
   the channel — the browser case where a blocked receive path would otherwise
   wedge the whole event loop: a credit window per stream, and beside it a
   connection window per peer (`limits.maxPeerWindow`, 1024 messages by
-  default) that bounds what one peer can pin across *all* of its calls, as
+  default, advertised on every OPEN by a `Conn` and on every H and T by a
+  `Server`) that bounds what one peer can pin across *all* of its calls, as
   HTTP/2's does.
 - **v1.1 surface.** Binary metadata (`-bin` keys carry arbitrary octets;
   base64 at the TS API, raw bytes on the wire), rich status details on the
@@ -221,7 +222,7 @@ else maps to `UNKNOWN`).
 | mutexes + atomics | none needed: state transitions are synchronous between `await` points |
 | `WithProtocolStats(obs)` (repeatable) | `protocolStats: obs` or `protocolStats: [obs, …]` on `ConnOptions` / `ServerOptions`; `Counters.observe` is the ready-made observer |
 | `ProtocolEventKind` (`EventSkipped` … `EventFlowStall`, `EventFlowResume`, `EventPeerFlowStall`, `EventPeerFlowResume`) | `ProtocolEventKind`, the strings Go's `String()` fixes (`'skipped'` … `'flow-stall'`, `'flow-resume'`, `'peer-flow-stall'`, `'peer-flow-resume'`); `Counters` keeps `flowStall` / `flowResume` and `peerFlowStall` / `peerFlowResume` apart, as Go does |
-| `WithLimits(Limits{MaxPeerWindow: n})` (the §4.2.1 connection window) | `limits: { maxPeerWindow: n }` on `ConnOptions` / `ServerOptions`, floored at `W_CONN` (1024, exported beside `W_INIT`) for the reason `W_init` floors the rx buffer, and capped at 2³² − 1 — the wire's uint32 — so `Infinity` means that much, not off |
+| `WithLimits(Limits{MaxPeerWindow: n})` (the §4.2.1 connection window) | `limits: { maxPeerWindow: n }` on `ConnOptions` / `ServerOptions` — advertised as `Frame.connWindow` on every OPEN (`Conn`) and on every H and T (`Server`), the peer honouring the first it hears; floored at `W_CONN` (1024, exported beside `W_INIT`) because a client streams on that assumption until the server's first H or T; capped at 2³² − 1 — the wire's uint32 — so `Infinity` means that much, not off |
 | `WithChainUnaryInterceptor(…)` / `ChainUnaryInterceptor(…)` and the stream twins | `unaryInterceptors: […]` / `streamInterceptors: […]` on `ConnOptions` / `ServerOptions` — same order (element 0 outermost), `(req, call, next)` shape; see `docs/typescript.md` |
 
 Deliberately not ported (yet): the `stats.Handler` bridge (a grpc-go type; the
@@ -250,15 +251,16 @@ calls sharing the channel.
 
 ## Tests
 
-`pnpm test` — 549 tests mirroring the Go suites: the §5 golden wire vectors
+`pnpm test` — 569 tests mirroring the Go suites: the §5 golden wire vectors
 byte-for-byte (including the v1.1 vectors generated from the Go
 implementation), e2e for all four RPC types, the §10 timeout system under
 deterministic fake-timer loss (blackhole, lost terminals/acks/half-closes,
 probes, liveness), the §6.5 restart walkthroughs, §15 caps and §4.2 drop
 policies, §4.2.1 flow control — per stream (advertisement, parking, grants,
-`T_stall`, overrun) and per peer (the `W_conn` assumption, settle and off,
-`sid = 0` grants and the raise, the starvation clause, credit returned for
-every non-buffered frame, one stall budget across both windows, the evicted
+`T_stall`, overrun) and per peer (the advertisement on every OPEN / H / T and
+its once-only adoption, the `W_conn` assumption until it arrives, absent =
+off, `sid = 0` grants, the starvation clause, credit returned for every
+non-buffered frame, one stall budget across both windows, the evicted
 sender's stash) — compression, size caps and binary metadata, each adapter
 (WebRTC/WebSocket/WebTransport/Port/UDP/protobuf-es/Connect) next to its
 source, `open()`

@@ -100,4 +100,16 @@ message Frame {
   // terminal that would not fit the channel is re-sent without them
   // (PROTOCOL.md §4.4, §5).
   repeated google.protobuf.Any details = 17;
+
+  // The sender's connection window, in messages — reliable mode only
+  // (§4.2.1): what the advertiser will buffer from this peer across all of
+  // its calls (`Limits.MaxPeerWindow`). The client advertises it on every
+  // OPEN, the server on every H and T. Absent on one of those frames means
+  // the advertiser does no connection flow control; on any other frame the
+  // field means nothing. A peer applies the first advertisement it hears
+  // from an incarnation and ignores the rest — the value is fixed for the
+  // advertiser's lifetime. A two-byte tag on purpose: it rides only frames
+  // that are rare and already large, so field 6, the free one-byte slot,
+  // stays for a per-frame field.
+  uint32 conn_window = 18;
 }

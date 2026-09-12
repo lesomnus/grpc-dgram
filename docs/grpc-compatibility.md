@@ -460,8 +460,10 @@ queueing to absorb a burst sees failed calls instead.
 The other capacity knob has HTTP/2's shape and one deliberate difference.
 `Limits.MaxPeerWindow` (§4.2.1, reliable mode) is a connection-level
 flow-control window beside the per-stream ones — counted in messages, 1024 by
-default, one per transport peer — and a sender assumes that much toward every
-peer, as an HTTP/2 sender assumes 65535 bytes. Where HTTP/2 answers an
+default, one per transport peer, advertised in `conn_window` on every OPEN,
+`H` and `T`; a client assumes that much toward the server until its first `H`
+or `T` lands, as an HTTP/2 sender assumes 65535 bytes before `SETTINGS`. Where
+HTTP/2 answers an
 overrun with `FLOW_CONTROL_ERROR` and `GOAWAY` for the whole connection, dRPC
 fails **only the overrunning call** with `INTERNAL`: the transport belongs to
 the adapter, and tearing it down from inside the read loop would turn one

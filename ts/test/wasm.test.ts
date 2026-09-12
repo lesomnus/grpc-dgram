@@ -309,6 +309,9 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go wasm ser
     // The client's rx buffer, floored at W_init = 32 (§4.2.1). Over UDP this
     // field is always 0 — flow control does not exist in unreliable mode.
     expect(open.window).toBe(32)
+    // The TS client's connection window, MaxPeerWindow at its default of
+    // 1024, advertised on every OPEN (§4.2.1).
+    expect(open.connWindow).toBe(1024)
     // Reliable mode propagates no default deadline: T_call is an
     // unreliable-mode timer (§10.2, §10.6).
     expect(open.timeoutMs).toBeUndefined()
@@ -318,6 +321,8 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go wasm ser
     const ack = ackOf(wire.rx.slice(rxAt))
     expect(ack.sid).toBe(stream.sid)
     expect(ack.window).toBe(32)
+    // and the Go server's connection window, on every H and T (§4.2.1)
+    expect(ack.connWindow).toBe(1024)
     expect(ack.header).toBeUndefined()
   })
 

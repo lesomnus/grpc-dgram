@@ -566,6 +566,10 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
     expect(windowsOf(wire.rx)).toEqual([])
     expect(wire.tx.filter((f) => f.window !== 0)).toEqual([])
     expect(wire.rx.filter((f) => f.window !== 0)).toEqual([])
+    // nor a connection-window advertisement: unreliable mode has no
+    // connection window either (§4.2.1)
+    expect(wire.tx.filter((f) => f.connWindow !== 0)).toEqual([])
+    expect(wire.rx.filter((f) => f.connWindow !== 0)).toEqual([])
   })
 
   // -------------------------------------------------------------------------
@@ -597,10 +601,15 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go server o
       const rx = relWire.rx.slice(rxAt)
       // The advertisement: the client's rx buffer, floored at W_init = 32.
       expect(openOf(tx).window).toBe(32)
+      // and the client's connection window, MaxPeerWindow at its default of
+      // 1024, on every OPEN (§4.2.1)
+      expect(openOf(tx).connWindow).toBe(1024)
       // The server's own, on the creation-ack H — which is NOT a header flush,
       // so its header field stays absent (§8).
       const ack = rx.find((f) => shapeOf(f) === 0 && f.payload === undefined)!
       expect(ack.window).toBe(32)
+      // the Go server's connection window rides every H and T (§4.2.1)
+      expect(ack.connWindow).toBe(1024)
       expect(ack.header).toBeUndefined()
 
       const grants = streamGrantsOf(rx)

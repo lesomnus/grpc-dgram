@@ -174,6 +174,7 @@ func TestClientSend_CallEndedAfterAcquireRefundsConnectionCredit(t *testing.T) {
 			h.SetSid(f.GetSid())
 			h.SetSeq(1)
 			h.SetWindow(1)
+			h.SetConnWindow(wConn) // the connection window stays on: the refund is measured on it
 			return c.Handle(ctx, h)
 		})
 		var s *clientStream
@@ -228,9 +229,9 @@ func TestClientSend_CallEndedAfterAcquireRefundsConnectionCredit(t *testing.T) {
 }
 
 // Pins §9.4 / §15: "the ledger keeps the evicted container's connection
-// sender ... so that the incarnation's next OPEN continues it" — its credit,
-// its settle and the raise it already got; a sid-0 grant addressed to it in
-// the meantime still lands.
+// sender — its window and its credit ... so that the incarnation's next OPEN
+// continues it"; a sid-0 grant addressed to it in the meantime still lands,
+// and the recreating OPEN's own advertisement is ignored (§4.2.1).
 func TestEvictedContainerContinuesItsSender(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		srv := NewServer(FrameHandlerFunc(func(context.Context, *Frame) error {
@@ -248,7 +249,7 @@ func TestEvictedContainerContinuesItsSender(t *testing.T) {
 		}, struct{}{})
 		const peer = "peer"
 		ctx := NewPeerContext(t.Context(), peer)
-		open := func(epoch, sid uint32) {
+		open := func(epoch, sid, connWindow uint32) {
 			f := &Frame{}
 			f.SetEpoch(epoch)
 			f.SetSid(sid)
@@ -257,6 +258,7 @@ func TestEvictedContainerContinuesItsSender(t *testing.T) {
 			f.SetMethod("/t.T/M")
 			f.SetPayload([]byte{})
 			f.SetWindow(32)
+			f.SetConnWindow(connWindow)
 			if err := srv.Handle(ctx, f); err != nil {
 				t.Fatal(err)
 			}
@@ -278,22 +280,21 @@ func TestEvictedContainerContinuesItsSender(t *testing.T) {
 			return srv.peers[epochKey{peer: peer, epoch: epoch}]
 		}
 
-		// Incarnation 1: settled by its OPEN, raised by this side (by hand:
-		// the unary service sends no H), lifted by the client to 4096.
-		open(1, 1)
+		// Incarnation 1: its sender created at the W_conn its OPEN
+		// advertises, lifted by the client's grants to 4096.
+		open(1, 1, wConn)
 		ps := container(1)
 		if ps == nil {
 			t.Fatal("no container for epoch 1")
 		}
-		ps.raised.Store(true)
 		grant(1, 3*wConn)
 		if on, granted, sent := ps.connTx.snapshot(); !on || granted != int64(4*wConn) || sent != 0 {
 			t.Fatalf("epoch 1 before eviction: on %v, granted %d, sent %d", on, granted, sent)
 		}
 
 		// Two more idle incarnations: the third OPEN evicts 1, the oldest.
-		open(2, 1)
-		open(3, 1)
+		open(2, 1, wConn)
+		open(3, 1, wConn)
 		if container(1) != nil {
 			t.Fatal("epoch 1 must have been evicted by the cap")
 		}
@@ -309,16 +310,17 @@ func TestEvictedContainerContinuesItsSender(t *testing.T) {
 		// positions as the cap holds containers — 1 and 2, oldest first —
 		// and epoch 1 is its oldest entry. Exactly 2 × MaxDeadPeers idle
 		// incarnations on the key: the bound §16 states holds exactly.
-		open(4, 1)
+		open(4, 1, wConn)
 		if container(2) != nil {
 			t.Fatal("epoch 2 must have been evicted by the cap")
 		}
 
 		// Its next OPEN recreates the container from that position — not at
-		// W_conn, not owed a second raise. That OPEN itself evicts 3 into a
-		// full ledger: the position of the one coming back must not be what
-		// the trim drops.
-		open(1, 2)
+		// the window that OPEN advertises, however large: the position's
+		// latch is set, so the advertisement is ignored (§4.2.1). That OPEN
+		// itself evicts 3 into a full ledger: the position of the one coming
+		// back must not be what the trim drops.
+		open(1, 2, 8*wConn)
 		ps = container(1)
 		if ps == nil {
 			t.Fatal("epoch 1 must be back")
@@ -326,19 +328,16 @@ func TestEvictedContainerContinuesItsSender(t *testing.T) {
 		if on, granted, sent := ps.connTx.snapshot(); !on || granted != int64(4*wConn+5) || sent != 0 {
 			t.Fatalf("epoch 1 recreated: on %v, granted %d, sent %d; want on, 4096+5, 0", on, granted, sent)
 		}
-		if !ps.raised.Load() {
-			t.Fatal("the raise it already got must not be repeated")
-		}
 		srv.mu.Lock()
 		pf := srv.peerFlow[peer]
 		srv.mu.Unlock()
-		if _, _, held := pf.unstash(1); held {
+		if _, held := pf.unstash(1); held {
 			t.Fatal("the position went back into the container: the ledger holds it no more")
 		}
 		// The ledger holds the two the cap evicted and nothing was trimmed:
 		// 2, then 3 (evicted by epoch 1's return).
 		for _, epoch := range []uint32{2, 3} {
-			if _, _, held := pf.unstash(epoch); !held {
+			if _, held := pf.unstash(epoch); !held {
 				t.Fatalf("epoch %d's position must still be held", epoch)
 			}
 		}
@@ -400,7 +399,8 @@ func TestServerSend_CallEndedAfterAcquireRefundsConnectionCredit(t *testing.T) {
 		open.SetFlags(FlagOpen | FlagClose)
 		open.SetMethod("/t.T/S")
 		open.SetPayload([]byte{})
-		open.SetWindow(1) // a stream window of one
+		open.SetWindow(1)         // a stream window of one
+		open.SetConnWindow(wConn) // and the connection window on: the refund is measured on it
 		ctx := NewPeerContext(t.Context(), peer)
 		if err := srv.Handle(ctx, open); err != nil {
 			t.Fatal(err)

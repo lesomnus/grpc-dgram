@@ -53,6 +53,7 @@ type Frame struct {
 	xxx_hidden_Window      uint32                 `protobuf:"varint,15,opt,name=window"`
 	xxx_hidden_Compressor  string                 `protobuf:"bytes,16,opt,name=compressor"`
 	xxx_hidden_Details     *[]*anypb.Any          `protobuf:"bytes,17,rep,name=details"`
+	xxx_hidden_ConnWindow  uint32                 `protobuf:"varint,18,opt,name=conn_window,json=connWindow"`
 	XXX_raceDetectHookData protoimpl.RaceDetectHookData
 	XXX_presence           [1]uint32
 	unknownFields          protoimpl.UnknownFields
@@ -198,6 +199,13 @@ func (x *Frame) GetDetails() []*anypb.Any {
 	return nil
 }
 
+func (x *Frame) GetConnWindow() uint32 {
+	if x != nil {
+		return x.xxx_hidden_ConnWindow
+	}
+	return 0
+}
+
 func (x *Frame) SetEpoch(v uint32) {
 	x.xxx_hidden_Epoch = v
 }
@@ -231,12 +239,12 @@ func (x *Frame) SetPayload(v []byte) {
 		v = []byte{}
 	}
 	x.xxx_hidden_Payload = v
-	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 7, 16)
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 7, 17)
 }
 
 func (x *Frame) SetCode(v uint32) {
 	x.xxx_hidden_Code = v
-	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 8, 16)
+	protoimpl.X.SetPresent(&(x.XXX_presence[0]), 8, 17)
 }
 
 func (x *Frame) SetDesc(v string) {
@@ -265,6 +273,10 @@ func (x *Frame) SetCompressor(v string) {
 
 func (x *Frame) SetDetails(v []*anypb.Any) {
 	x.xxx_hidden_Details = &v
+}
+
+func (x *Frame) SetConnWindow(v uint32) {
+	x.xxx_hidden_ConnWindow = v
 }
 
 func (x *Frame) HasTimeout() bool {
@@ -382,6 +394,17 @@ type Frame_builder struct {
 	// terminal that would not fit the channel is re-sent without them
 	// (PROTOCOL.md §4.4, §5).
 	Details []*anypb.Any
+	// The sender's connection window, in messages — reliable mode only
+	// (§4.2.1): what the advertiser will buffer from this peer across all of
+	// its calls (`Limits.MaxPeerWindow`). The client advertises it on every
+	// OPEN, the server on every H and T. Absent on one of those frames means
+	// the advertiser does no connection flow control; on any other frame the
+	// field means nothing. A peer applies the first advertisement it hears
+	// from an incarnation and ignores the rest — the value is fixed for the
+	// advertiser's lifetime. A two-byte tag on purpose: it rides only frames
+	// that are rare and already large, so field 6, the free one-byte slot,
+	// stays for a per-frame field.
+	ConnWindow uint32
 }
 
 func (b0 Frame_builder) Build() *Frame {
@@ -396,11 +419,11 @@ func (b0 Frame_builder) Build() *Frame {
 	x.xxx_hidden_Codec = b.Codec
 	x.xxx_hidden_Timeout = b.Timeout
 	if b.Payload != nil {
-		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 7, 16)
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 7, 17)
 		x.xxx_hidden_Payload = b.Payload
 	}
 	if b.Code != nil {
-		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 8, 16)
+		protoimpl.X.SetPresentNonAtomic(&(x.XXX_presence[0]), 8, 17)
 		x.xxx_hidden_Code = *b.Code
 	}
 	x.xxx_hidden_Desc = b.Desc
@@ -410,6 +433,7 @@ func (b0 Frame_builder) Build() *Frame {
 	x.xxx_hidden_Window = b.Window
 	x.xxx_hidden_Compressor = b.Compressor
 	x.xxx_hidden_Details = &b.Details
+	x.xxx_hidden_ConnWindow = b.ConnWindow
 	return m0
 }
 
@@ -417,7 +441,7 @@ var File_drpc_frame_proto protoreflect.FileDescriptor
 
 const file_drpc_frame_proto_rawDesc = "" +
 	"\n" +
-	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x19google/protobuf/any.proto\x1a\x1egoogle/protobuf/duration.proto\"\xe3\x03\n" +
+	"\x10drpc/frame.proto\x12\x04drpc\x1a\x13drpc/metadata.proto\x1a\x19google/protobuf/any.proto\x1a\x1egoogle/protobuf/duration.proto\"\x84\x04\n" +
 	"\x05Frame\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\aR\x05epoch\x12\x10\n" +
 	"\x03sid\x18\x02 \x01(\aR\x03sid\x12\x10\n" +
@@ -438,7 +462,9 @@ const file_drpc_frame_proto_rawDesc = "" +
 	"\n" +
 	"compressor\x18\x10 \x01(\tR\n" +
 	"compressor\x12.\n" +
-	"\adetails\x18\x11 \x03(\v2\x14.google.protobuf.AnyR\adetailsB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
+	"\adetails\x18\x11 \x03(\v2\x14.google.protobuf.AnyR\adetails\x12\x1f\n" +
+	"\vconn_window\x18\x12 \x01(\rR\n" +
+	"connWindowB*Z#github.com/lesomnus/grpc-dgram;drpc\x92\x03\x02\b\x02b\beditionsp\xe8\a"
 
 var file_drpc_frame_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_drpc_frame_proto_goTypes = []any{

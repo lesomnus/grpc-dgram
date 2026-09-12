@@ -52,28 +52,31 @@ export interface Limits {
   // Caps, in messages, what one transport peer may have buffered here across
   // all of its calls and client epochs — the connection flow-control window
   // (§4.2.1, reliable mode only); on a Conn it bounds the one peer the Conn
-  // talks to. Values below W_CONN (1024) are raised to it: a sender assumes
-  // W_CONN before any sid-0 grant, so a receiver holding less would be
-  // overrun by a conforming sender — the same reason the rx buffer is
-  // floored at W_INIT. Past it, the frame that overruns fails its own call
-  // with INTERNAL, never the peer. Capped at 2^32 − 1, the wire's uint32
-  // (§7): Infinity means that much, not "off".
+  // talks to. It is advertised as Frame.connWindow — on every OPEN by a
+  // Conn, on every H and T by a Server — and the peer honours the first
+  // advertisement it hears. Values below W_CONN (1024) are raised to it: a
+  // client streams on the W_CONN assumption until the server's first H or T
+  // arrives, so a receiver holding less would be overrun by a conforming
+  // sender — the same reason the rx buffer is floored at W_INIT. Past it,
+  // the frame that overruns fails its own call with INTERNAL, never the
+  // peer. Capped at 2^32 − 1, the wire's uint32 (§5): Infinity means that
+  // much, not "off".
   maxPeerWindow?: number
 }
 
 // DEFAULT_MAX_PEER_WINDOW is the default and the floor of maxPeerWindow: it
-// equals W_CONN (util.ts), the sender's assumption — spelled out here rather
+// equals W_CONN (util.ts), the client's assumption — spelled out here rather
 // than imported, since util.ts already imports this module.
 const DEFAULT_MAX_PEER_WINDOW = 1024
 
-// MAX_PEER_WINDOW is the cap of maxPeerWindow: `window` is a uint32 on the
-// wire (§7), and the window is what the raise puts there (window − W_CONN,
-// §4.2.1) and what the grant rule measures against. Go's field is an int
+// MAX_PEER_WINDOW is the cap of maxPeerWindow: `conn_window` is a uint32 on
+// the wire (§5), and the window is what the advertisement puts there
+// (§4.2.1) and what the grant rule measures against. Go's field is an int
 // cast to uint32 at the ledger, so it can never hold more; in JS a number
 // can, and Infinity is the natural spelling of "unlimited" — unclamped it
-// would encode as a WINDOW of 0 (dropped: a grant never enables) and never
-// trip a batched grant, so the peer would spend its assumed W_CONN and park
-// for good. Clamped, it is a window no peer can fill.
+// would reach the ledger, where no batched or starvation grant ever fires
+// against it, and the wire, whose uint32 varint cannot carry it. Clamped,
+// it is a window no peer can fill, and the advertisement says exactly that.
 const MAX_PEER_WINDOW = 0xffff_ffff
 
 export interface ResolvedLimits {
@@ -95,7 +98,7 @@ export function resolveLimits(l: Limits = {}): ResolvedLimits {
     maxPendingResets: pos(l.maxPendingResets, 1024),
     maxLiveCalls: pos(l.maxLiveCalls, 4096),
     maxRepliesPerRTI: pos(l.maxRepliesPerRTI, 64),
-    // Floored, not just defaulted (the sender's assumption), capped at the
+    // Floored, not just defaulted (the client's assumption), capped at the
     // wire's uint32, and whole: a message count. Infinity clamps to the cap;
     // NaN, like any non-positive value, keeps the default.
     maxPeerWindow: Math.min(Math.max(Math.floor(pos(l.maxPeerWindow, DEFAULT_MAX_PEER_WINDOW)), DEFAULT_MAX_PEER_WINDOW), MAX_PEER_WINDOW),

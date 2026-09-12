@@ -1,5 +1,7 @@
 package drpc
 
+import "math"
+
 // This file holds the configurable delivery buffers (PROTOCOL.md §4.2) and
 // the resource caps (PROTOCOL.md §15).
 
@@ -85,11 +87,14 @@ type Limits struct {
 	// MaxPeerWindow caps, in messages, what one transport peer may have
 	// buffered here across all of its calls and client epochs — the
 	// connection flow-control window (§4.2.1, reliable mode only); on a Conn
-	// it bounds the one peer the Conn talks to. Values below W_conn (1024)
-	// are raised to it: a sender assumes W_conn before any sid-0 grant, so a
-	// receiver holding less would be overrun by a conforming sender — the
-	// same reason the rx buffer is floored at W_init. Past it, the frame that
-	// overruns fails its own call with INTERNAL, never the peer.
+	// it bounds the one peer the Conn talks to. It is advertised to the peer
+	// as conn_window — on every OPEN by a Conn, on every H and T by a Server
+	// — and the peer paces itself by it. Values below W_conn (1024) are
+	// raised to it: a client streams on the assumption of W_conn until the
+	// server's first H or T carries the advertisement, so a receiver holding
+	// less would be overrun by a conforming sender — the same reason the rx
+	// buffer is floored at W_init. Past it, the frame that overruns fails
+	// its own call with INTERNAL, never the peer.
 	MaxPeerWindow int
 }
 
@@ -116,10 +121,21 @@ func (l Limits) withDefaults() Limits {
 		l.MaxPeerWindow = defaultMaxPeerWindow
 	}
 	if l.MaxPeerWindow < int(wConn) {
-		l.MaxPeerWindow = int(wConn) // the sender's assumption, see above
+		l.MaxPeerWindow = int(wConn) // the client's assumption, see above
+	}
+	// Capped at the wire's uint32: the advertisement (§5) and the ledger both
+	// carry it as one, and int → uint32 truncates mod 2^32, which would turn
+	// a huge configured window into a tiny — or an absent, i.e. off —
+	// advertisement, below the floor just applied. The TS port clamps the
+	// same way. (A variable, not a constant: the conversion back must compile
+	// where int is 32 bits, even though the branch cannot be taken there.)
+	if uint64(l.MaxPeerWindow) > maxUint32 {
+		l.MaxPeerWindow = int(maxUint32)
 	}
 	return l
 }
+
+var maxUint32 uint64 = math.MaxUint32
 
 // WithRxBuffer sets the default per-stream rx buffer size and drop policy for
 // every call (PROTOCOL.md §4.2). size <= 0 keeps the default 32.
