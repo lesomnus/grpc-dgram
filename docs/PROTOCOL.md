@@ -853,7 +853,8 @@ container with a fresh sender at the server.
 - The legal shapes are exactly: `0`, `OPEN`, `CLOSE`, `OPEN|CLOSE`, `RESET`,
   `PING`, `WINDOW`. Any other combination is unroutable.
 - Bits outside `SHAPE_MASK` are **modifiers**; `COMPRESSED` is the only one
-  defined. A receiver that meets an unroutable shape, or a modifier it does
+  defined, and bit `64` is reserved as the generation marker of §10.6 — it
+  is deliberately *not* defined here, so that this rule refuses it. A receiver that meets an unroutable shape, or a modifier it does
   not implement, MUST NOT deliver the frame and MUST NOT silently drop it:
   it fails the call with `INTERNAL`. Delivering would corrupt (the bit changes
   what the payload means); dropping would be a silent gap, which §14 forbids
@@ -1315,6 +1316,30 @@ hung without bound absent an explicit ctx deadline (§10.2; the transport is
 healthy, so §4.5's teardown never fires). Mixed reliabilities under one
 server are expressed per peer (§4.3), never by letting one channel's two
 ends disagree.
+
+**Generation agreement.** There is no protocol version on the wire and no
+negotiation of one, and that is a decision, not an omission: the two ends of
+a datagram channel are deployed together, and a peer that has to be told
+which protocol it is speaking is a peer the deployment already got wrong.
+The frame is small and its additive changes — a new field — need no signal,
+because a receiver ignores fields it does not know (§5). What this document
+reserves is the exit for a change that is **not** additive. A **breaking
+generation** — one that changes what an existing frame means, which is what
+the connection window did without touching a field (Appendix A, entry 11) —
+MUST set modifier bit `64` on the first frame of every call: the client on
+its `OPEN`, the server on its creation ack (`H`, or the `T` that answers a
+unary without one). §7.1 then does the rest. Every implementation of this
+text meets a modifier it does not know and fails that call `INTERNAL` at
+once — a refusal on the first frame, not a park that surfaces as
+`UNAVAILABLE` after `T_stall`. Successor generations take `128`, `256`, and
+so on. Bit `64` is free (`OPEN|64` and `T|64` are still one varint byte);
+each later bit costs one more byte, on those two frames and nowhere else.
+An implementation of this text MUST NOT treat bit `64` as known, since its
+whole value is that this text does not. Where a channel is addressed by a
+URL — WebSocket, WebTransport — the deployment has a cheaper signal
+available in the path (docs/transports.md), and SHOULD use it; the bit is
+for the channels that have no path, which are the datagram ones this
+protocol exists for.
 
 | Aspect | Unreliable | Reliable |
 |---|---|---|

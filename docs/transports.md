@@ -183,6 +183,29 @@ The core never fragments and never asks for an MTU. On an unreliable channel
 that is deliberate: reassembly over a lossy link would rebuild the reliability
 layer this protocol exists to avoid.
 
+## Upgrading across a breaking change
+
+The wire carries no version and negotiates nothing (PROTOCOL.md §10.6). The
+usual reason that is fine is that both ends ship together. When they cannot —
+a dashboard tab left open across a deploy, a fleet of sensors that updates on
+its own schedule — what you can do depends on whether the channel has a
+path.
+
+| channel | address | zero-downtime upgrade |
+|---|---|---|
+| WebSocket, WebTransport | a URL | **version the path.** `wss://host/rpc/2` beside `/rpc/1`, routed by any L7 proxy before the connection is even upgraded. The protocol never sees it. |
+| UDP | host and port | no path: a datagram arrives at a port and that is all a proxy can see without parsing the envelop. |
+| WebRTC DataChannel | a negotiated channel | no path and no proxy: after ICE the peers are connected directly. |
+
+For the last two, the only signal is the one PROTOCOL.md §10.6 reserves: a
+breaking generation sets modifier bit `64` on the first frame of every call,
+and every implementation of the current text refuses that call with
+`INTERNAL` on the spot (§7.1). That is a refusal, not a negotiation — an old
+peer learns it is old, loudly, on its first call, instead of parking for
+`T_stall` and failing `UNAVAILABLE` with nothing to say why. Plan the fleet
+rollout around that: old clients fail fast against a new server, so upgrade
+the clients first or run the two generations on separate ports.
+
 ## Writing your own
 
 Four seams, in the order you will meet them.

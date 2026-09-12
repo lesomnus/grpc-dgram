@@ -32,6 +32,11 @@ export const FlagCompressed = 32
 // modifier bit this implementation understands. A frame carrying a bit
 // outside KNOWN_FLAGS was built by a newer peer and MUST NOT be delivered:
 // the receiver cannot know what the bit changes about the payload (§7.1).
+//
+// Bit 64 stays out of KNOWN_FLAGS on purpose. §10.6 reserves it as the marker
+// a breaking generation sets on the first frame of every call, and the
+// refusal this produces IS the mechanism: adding it here would turn a loud
+// INTERNAL on the first frame into a silent misread of every frame after it.
 export const SHAPE_MASK = FlagOpen | FlagClose | FlagReset | FlagPing | FlagWindow // 0x1f
 export const KNOWN_FLAGS = SHAPE_MASK | FlagCompressed // 0x3f
 
