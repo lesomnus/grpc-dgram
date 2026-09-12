@@ -1,12 +1,12 @@
 # Envelop batching: the measurement (issue #5)
 
-`docs/TODO.md` §1 defers the `Coalescer` behind one entry condition: "a
+`docs/TODO.md` §1 deferred the `Coalescer` behind one entry condition: "a
 benchmark that shows syscall or header overhead dominating at a real message
-rate". This is that benchmark's run. The harness is
-`transport/udp/bench_test.go`; the table below is regenerated from its output
-by `TestBenchTable` (`DRPC_BENCH_OUT=<file> go test -run TestBenchTable -v
-./transport/udp`), so it can be reproduced on another machine without editing
-a number by hand.
+rate". This is that benchmark's run; §1 now carries what it decided. The
+harness is `transport/udp/bench_test.go`; the table below is regenerated from
+its output by `TestBenchTable` (`DRPC_BENCH_OUT=<file> go test -run
+TestBenchTable -v ./transport/udp`), so it can be reproduced on another machine
+without editing a number by hand.
 
 ## The run
 
@@ -88,7 +88,8 @@ within the spread of the raw rows. The share divides by the measured one.
 rate × MaxDelay that arrive while it is held — capped by the 1200 B budget.
 `k/stream` batches within one call (the narrow option of TODO §1); `k/all`
 batches across the streams of one peer (the wide one — it couples their loss,
-§4.1). A server cannot batch across peers at all: one datagram, one address.
+§4.1). A server cannot batch across peers at all: one datagram, one address, and
+PROTOCOL.md §4.1 makes that a duty of whatever sits at the seam.
 The measured column is the largest k the run has a number for, at or below `k/all`.
 
 ### 22 B payload (k ≤ 29 fits the 1200 B budget)

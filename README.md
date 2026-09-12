@@ -63,7 +63,7 @@ subsequence** instead of stalling.
 | A server compiled to `js/wasm`, served to the page over a message port | ✅ [`transport/jsport`](./transport/jsport) ↔ [`ts/…/transport/port`](./ts/src/transport/port) — same wire as WebSocket, both ends in one process |
 | Browser / Node TypeScript port (client + server, same wire) | ✅ [`ts/`](./ts) — WebRTC DataChannel, WebSocket, WebTransport datagrams (client), JS message port, Node UDP, protobuf-es & Connect-ES bindings |
 | Runnable examples | ✅ [`examples/`](./examples) — UDP sensor stream, WebSocket echo, browser↔Go WebRTC, a Go server compiled to wasm and started by the page |
-| `Envelop` batching (`Coalescer`) | ⬜ planned |
+| Application-written `Envelop` batching | ✅ the seam, not a policy — the core emits frames, adapters take envelops of 1..n ([`Wrap1`](./frame.go) is the 1-frame default, [`udp.Transport.Send`](./transport/udp) the way in); the library ships no batcher and [the measurement](./docs/batching-measurement.md) says why |
 
 ## Install
 

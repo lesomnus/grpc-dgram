@@ -227,9 +227,19 @@ else maps to `UNKNOWN`).
 Deliberately not ported (yet): the `stats.Handler` bridge (a grpc-go type; the
 drpc half of the observability surface,
 `ProtocolStats`/`Counters`, is ported — `protocolStats` on `ConnOptions` and
-`ServerOptions`, `docs/observability.md`), and `Envelop` batching
-(`Coalescer` — deferred to M8 in Go; every envelop carries one frame, as the
-shipped Go adapters do).
+`ServerOptions`, `docs/observability.md`).
+
+Missing rather than deliberate: an **envelop-level send seam**. Batching is
+the application's policy in both languages and neither ships a batcher
+(`docs/TODO.md` §1), but Go ships the seam to write one against —
+`EnvelopHandler` beside `FrameHandler`, and a `Send(ctx, *Envelop)` on every
+adapter. Here only the receive half exists: `unpack` already delivers the n
+frames of a datagram in order, but nothing exported takes an envelop. Three
+adapters (WebRTC, WebSocket, port) already have an n-frame `send` internally;
+it sits on a module-private channel class the exported `Transport`/`Gateway`
+holds privately, so a subclass cannot reach it. The other two (Node UDP,
+WebTransport) encode `encodeEnvelop([f])` inline in `handle`. `wire.ts`
+exports `encodeEnvelop`, so what is missing is reach, not encoding.
 
 Receive-path note for browsers: an `RTCDataChannel` cannot pause delivery, so
 adapter-level buffering is unavoidable — but since v1.1 the *protocol* paces

@@ -79,13 +79,16 @@ Non-goals:
 - **Session** — the pairing of one `Conn` incarnation with one `Server`
   incarnation, identified by the two epochs (§6.1).
 - **Unreliable / reliable mode** — per §4.3.
+- **Batching middleware** — an application-supplied `FrameHandler` (§3) that
+  packs several frames into one envelop. This document states its duties but
+  defines no such component: the policy is workload-specific (§4.1).
 - **Validated frame** — defined in §9.1; load-bearing for liveness (§10.4)
   and the idle clocks (§10.5).
 
 ## 3. Architecture
 
 ```
-generated stubs ──> drpc.Conn ──(FrameHandler)──> [Wrap1 | Coalescer] ──(EnvelopHandler)──> adapter ──> channel
+generated stubs ──> drpc.Conn ──(FrameHandler)──> [Wrap1 | batching middleware] ──(EnvelopHandler)──> adapter ──> channel
 generated impls <── drpc.Server <──(Handle per frame)── adapter (unpacks Envelop) <── channel
 ```
 
@@ -99,9 +102,12 @@ type EnvelopHandler interface { Handle(ctx context.Context, e *Envelop) error }
 ```
 
 - tx path: the core writes frames to a `FrameHandler`. `drpc.Wrap1(a)` adapts an
-  `EnvelopHandler` by wrapping each frame in a 1-frame envelop (default). A
-  `Coalescer` batching middleware is **planned, not yet implemented** (§4.1;
-  milestone M8) — its normative duties below bind whenever it lands.
+  `EnvelopHandler` by wrapping each frame in a 1-frame envelop — the
+  no-batching default. This is a **seam, not a component**: batching policy is
+  workload-specific (§4.1), so this document defines no batcher and an
+  implementation need not ship one. An application that wants batching
+  installs its own `FrameHandler` here; the duties below bind whatever it
+  installs.
 - rx path: the adapter reads a transport message, unmarshals **one `Envelop`**,
   and calls `Conn.Handle`/`Server.Handle` once per contained frame, in order,
   attaching the peer to `ctx` (§6.4).
@@ -110,8 +116,10 @@ type EnvelopHandler interface { Handle(ctx context.Context, e *Envelop) error }
   adapter wrapped by it loses `Reliable()` discovery. Single-mode adapter
   endpoints therefore implement `FrameHandler` + `TransportInfo` directly on
   one type; a mixed-mode gateway (pion) skips `TransportInfo` and advertises
-  per peer via `NewReliableContext` instead (§4.3). A future `Coalescer`
-  MUST re-expose the wrapped adapter's `TransportInfo`.
+  per peer via `NewReliableContext` instead (§4.3). A batching middleware
+  installed at this seam MUST re-expose the wrapped adapter's `TransportInfo`,
+  and with it everything else its implementation discovers by type assertion:
+  hiding one of those fails silently rather than loudly (Appendix C).
 
 ## 4. Transport contract
 
@@ -137,12 +145,48 @@ type EnvelopHandler interface { Handle(ctx context.Context, e *Envelop) error }
 - **Loss atomicity:** an envelop is lost/duplicated/reordered as a unit; every
   frame inside shares that fate. Batching couples the fates of otherwise
   independent frames — the sender's choice.
-- Batching is **sender-local policy**, invisible to the protocol: the
-  planned `Coalescer` (M8) packs queued frames while the marshaled envelop
-  stays within its own byte budget (§4.4), flushing on `MaxDelay`, on budget
-  exhaustion, or on explicit `Flush()`. Retransmission ticks (§10.3) would
-  naturally batch into one envelop. Until it exists, every envelop carries
-  one frame (`Wrap1`, or the shipped adapters' equivalent).
+- Batching is **sender-local policy**, invisible to the protocol, and this
+  document specifies no batcher. The two *policy* questions a batcher has to
+  answer — *what may share an envelop* and *how long a frame may wait for
+  company* —
+  are answerable only against a workload: the first trades the loss
+  independence above for bytes, the second trades latency (§10.7) for them.
+  Neither has a default that is right for every application, so both belong
+  to the application: it installs a **batching middleware** (§3) that packs
+  queued frames while the marshaled envelop stays within its own byte budget
+  (§4.4), flushing on a delay budget (`MaxDelay`, cited by §10.7), on budget
+  exhaustion, or on an explicit flush. Retransmission ticks (§10.3) batch
+  naturally into one envelop.
+- What is **not** the application's to choose are the duties of the seam
+  itself. They bind whatever is installed there, and every one of them fails
+  silently:
+  - **One destination per envelop.** An envelop is addressed by the `ctx` of
+    the call that hands it to the adapter (§6.4), never by anything inside its
+    frames: on a multi-peer adapter — every gateway — the whole datagram goes
+    to the peer named in the flushing call's `ctx`. A batching middleware MAY
+    therefore pack together only frames whose contexts name the same
+    destination, and on a mixed-mode gateway the same channel mode (§4.3), and
+    it MUST flush on a context naming that destination. Mixing two peers sends
+    one peer's frames to the other and nothing to the first: the first peer's
+    calls die of their deadlines, the second silently drops frames for an
+    epoch/sid it does not own, and no error is raised anywhere. A single-peer
+    adapter (a connected-socket client transport) has one destination and is
+    unaffected. Whatever context a deferred flush keeps for this MUST be a tx
+    context: no tx path may depend on an rx context surviving (§6.4).
+  - **`Handle` is called concurrently.** The core transmits from every call's
+    goroutine, from its retransmission/keepalive sweep (§10.3) and from the
+    paths that emit `WINDOW` grants (§4.2.1). An adapter holds no state below
+    `Handle`; a batcher does, so it MUST serialise its buffer. On a
+    **reliable** adapter it MUST also preserve the order in which envelops
+    reach the channel: §4.3 promises no reordering and reliable mode runs no
+    retransmission, so a reorder introduced here is unrepairable. Holding the
+    buffer lock across the flush buys that ordering at a price the core itself
+    declines to pay — it emits control frames outside every lock precisely so
+    a blocking adapter cannot wedge `Handle` for everyone — while a single
+    flushing goroutine buys it without blocking the next `Handle`.
+- With no batching middleware installed every envelop carries one frame
+  (`Wrap1`, or an adapter's equivalent). That is always conformant: batching
+  is an optimization the sender chooses, never something a peer can require.
 - The transport MUST preserve message boundaries and integrity (DTLS/SCTP/WSS
   qualify; raw UDP relies on the weak UDP checksum — users accept that risk).
 - The transport MAY lose, duplicate, and reorder messages (unreliable mode).
@@ -417,6 +461,24 @@ frames are uncredited, `T_stall` bounds a park, a grant never enables.
   runs no timers and does not bound the tx ctx, so the adapter MUST bound a
   stalled write itself (e.g. a write deadline tied to its keepalive): a peer
   that stops draining is transport death (§4.5), not something to wait out.
+- **Batching does not change the accounting, but it can stall it.** A sender
+  takes its credit before the frame it will send exists — the park above
+  happens on the way *into* the tx path, not inside it — so every frame that
+  reaches the `FrameHandler` seam (§3) is already paid for. A batching
+  middleware sits below that seam and therefore never runs out of credit
+  mid-batch and never has credit of its own to return. What it does hold is
+  the return trip: a `WINDOW` grant travels that seam like any other frame, so
+  a batcher waiting for company can be holding the very frame that would
+  unpark the peer — and the peer, parked at zero credit, sends nothing more to
+  complete the batch. The duty above ("it MUST grant whenever the sender could
+  otherwise starve") runs through the seam: an endpoint whose batcher is still
+  holding the grant has not granted. A batcher SHOULD therefore flush an
+  uncredited control frame — a `WINDOW` grant above all — immediately instead
+  of waiting for company. Where it waits anyway, the wait is bounded by its
+  own delay budget if it has one (the `MaxDelay` of §10.7, seen from the
+  window side) and by `T_stall` if it has not — and `T_stall` is not a slower
+  bound but the peer's call failing `UNAVAILABLE`, in reliable mode with no
+  timer left to break the deadlock.
 - `Handle` returns `nil` for dropped/stray/duplicate frames — these are
   *normal* on datagram channels. A non-nil error means "malformed input" or a
   fatal local condition; adapters MUST NOT tear down the channel on
@@ -484,11 +546,27 @@ where the channel is known — in the adapter:
   `ResourceExhausted` on the owning call (pinned by
   `TestChar_AdapterRefusesTooLargeSend` and end-to-end by the UDP adapter's
   suite).
-- The planned `Coalescer` (batching middleware, M8) owns its own byte budget
-  as plain config (e.g. `Coalescer{MaxBytes: n}`): a frame that fits alone
-  but not in the current batch triggers flush-then-new-batch; a frame that
-  cannot fit alone MUST fail synchronously in `Coalescer.Handle` (an async
-  `MaxDelay` flush has no owning call to fail).
+- A **batching middleware** (§4.1) owns its own byte budget as plain config
+  (`MaxBytes`): a frame that fits alone but not in the current batch triggers
+  flush-then-new-batch; a frame that cannot fit alone MUST fail
+  **synchronously**, from the `Handle` call that carried that frame in. Of a
+  batcher's duties this is the one that cannot be deferred, and the reason is
+  structural: the error's only route back to the application is the return
+  value of the `Handle` its sending call is still blocked in. Once a frame has
+  been buffered that call has moved on — and a deferred flush's error does not
+  become nobody's, which would be the harmless outcome. It is returned out of
+  whichever `Handle` happened to trigger the flush, which is generally a
+  *different* call's, and the core believes it: a synchronous
+  `ErrMessageTooLarge` means "the frame I just handed you never reached the
+  wire", so the core reclaims that call's `seq` and refunds its credit while
+  the frame that actually overran is discarded in silence. The reclaimed `seq`
+  is then handed out again although the frame holding it is still in the
+  buffer — two different frames with one `sid`+`seq` (§10.6). Any other
+  flush-time error mis-kills the same innocent call without even that rewind.
+  A batching middleware therefore MUST NOT surface a deferred flush's failure
+  through an unrelated `Handle`, and its byte budget MUST NOT exceed the
+  adapter's: with the budgets equal, a frame the batcher accepted is a frame
+  the adapter will take, and no flush-time size failure is left to report.
 
 Non-normative sizing guidance for adapter authors: UDP ≈1200 B (below typical
 path MTU); WebRTC unreliable ≈1200 B; WebRTC reliable 16 KiB (SCTP-friendly);
@@ -1258,8 +1336,10 @@ trigger the event — the triggering side always observes immediately. Bounds
 assume a single loss of the named frame and exclude one-way propagation delay;
 `k` independent losses add ~`k` recovery rounds **at the then-current backoff
 interval** (`RTI` doubling, ≤ `T_probe` cap, §10.3). The `+ RTI` terms cover
-the per-tombstone replay / per-call `H`-replay rate limits. The planned
-`Coalescer` (M8) would add up to `MaxDelay` per direction to every row.
+the per-tombstone replay / per-call `H`-replay rate limits. A batching
+middleware (§4.1) adds up to its `MaxDelay` per direction to every row below —
+the price of the batching, paid on every bound in both directions, which is why
+that budget belongs to the application and has no default.
 
 With defaults, in unreliable mode:
 
@@ -1355,6 +1435,12 @@ path, where its write deadline would otherwise have been the backstop.
   `UNIMPLEMENTED`, so nothing silently degrades.
 - Compression happens **below** the size caps of §16/gRPC parity: a send cap
   measures the compressed bytes, a receive cap the decompressed message.
+- Compression belongs to the **core**, above the seams of §3: `COMPRESSED` is
+  a frame flag and a receiver decompresses per frame. A batching middleware
+  (§4.1) sits below it and so only ever packs frames whose compression is
+  already decided; it MUST pack them unchanged. Compressing a whole envelop is
+  not this protocol — there is no envelop-level flag to carry it — and adding
+  one would be a wire change.
 
 ## 13. Method addressing
 
@@ -1693,8 +1779,21 @@ Appendix B mirrors the body; where they disagree, the body governs.
   depend on an rx ctx surviving.
 - **Header fields:** separate rx-header / tx-header per stream + `headerReady`
   signal (§11); the server stores its creation `H` for replay (§8).
-- **Coalescer** (planned, M8) must re-expose `TransportInfo` of the wrapped
-  adapter (§3) and fail oversize frames synchronously (§4.4). Remember
-  `MaxDelay` appears in the §10.7 bounds.
+- **Batching middleware** (§4.1) must re-expose `TransportInfo` of the wrapped
+  adapter (§3), keep its byte budget at or below the adapter's and fail
+  oversize frames synchronously (§4.4), pack only frames whose tx ctx names
+  one destination (§4.1 — on a gateway the ctx *is* the address), serialise a
+  buffer that `Handle` is called into concurrently (§4.1), and not sit on a
+  `WINDOW` grant (§4.2.1); its `MaxDelay` appears in the §10.7 bounds. In Go
+  the re-exposure is **method promotion**: embed the adapter rather than
+  holding it in a field, and override `Handle`
+  alone — `AttachConn` (`ConnAttacher`), `Close` (`io.Closer`), `Reliable`
+  (`TransportInfo`) and `Peer` (`TransportPeer`) then stay visible to the type
+  assertions in `NewConn`, and the envelop-level send the adapters export
+  (e.g. `udp.Transport.Send`) is what the override calls with the packed
+  envelop. A field-wrapper hides all four, and the worst of those failures is
+  silent: without `AttachConn` the receive pump never starts and the endpoint
+  hears nothing, with no error anywhere — which is what `Wrap1`'s own doc
+  comment warns about.
 - **Eager OPEN** is emitted by the innermost streamer after interceptors run
   (§8), so interceptor-added metadata reaches the OPEN frame.

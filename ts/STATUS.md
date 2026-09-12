@@ -9,8 +9,10 @@ complete, green, and adversarially audited**. Cross-language interop with the
 Go server is verified at runtime over UDP — including the v1.1 surface, where
 a Go/TS split would be silent: binary metadata, status details and the
 flow-control advertisements are asserted against exact bytes, not mirrored
-shapes. What remains is the one optional Go-parity stretch item (`Coalescer`
-batching), unbuilt in Go too.
+shapes. What remains is one seam Go has and this port does not: an
+envelop-level send for an application's own batcher to call
+(`../docs/TODO.md` §1 — the batching policy is the workload's, and neither
+language ships a batcher).
 
 **v1.1 round (2026-07-25)** — mirrored from the Go core: metadata values are
 bytes on the wire (`-bin` keys hold base64 in the TS API), `Frame.window` /
@@ -200,9 +202,10 @@ Do not "fix" these — they are intentional, matching the Go feature set or TS
 idiom: the **`stats.Handler` bridge** (Go's
 `WithStatsHandler` takes a grpc-go type with no TS counterpart — the drpc
 half, `ProtocolStats`/`Counters`, IS ported: `src/stats.ts`,
-`docs/observability.md`); **`Envelop` batching / `Coalescer`**
-(deferred to M8 in Go, design open in `docs/TODO.md`; every envelop carries one
-frame, as the shipped Go adapters do); handler signatures are
+`docs/observability.md`); **a batcher / `Coalescer`** (neither language ships
+one and neither will — the batching policy is workload-specific,
+`docs/TODO.md` §1; what this port is missing is the *seam* to install one
+against, which is a gap, item 5 of Remaining work); handler signatures are
 TS-native functions (not grpc-go codegen); `context.Context` → `AbortSignal` +
 `CallOptions`; `metadata.MD` → `Record<string,string[]>`. One genuine
 environmental difference, documented in `transport/webrtc/index.ts`: a browser `RTCDataChannel`
@@ -277,10 +280,25 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
    bytes — so a TS client and the Go server address the same methods with the
    same encoding. Regenerate the fixture with `pnpm gen`. Core stays zero-dep;
    verified the core bundles carry no `@bufbuild/protobuf` reference.)*
-5. Optional parity with Go stretch items if/when they land there:
-   `Coalescer` batching. (The connection window, once the sequenced gap
-   here, landed in the connection-window round above — nothing of §4.2.1
-   is outstanding on this side.)
+5. **An envelop-level send seam** — the one thing the Go side exports that
+   this port does not (`../docs/TODO.md` §1). There, `EnvelopHandler` sits
+   beside `FrameHandler` and every adapter exports `Send(ctx, *Envelop)`, so
+   an application can slot its own batcher between the core and the channel.
+   Here the receive half is already in place — `unpack` delivers the n frames
+   of a datagram in order — but nothing exported takes an envelop. Three of
+   the five adapter families already have an n-frame `send` one layer down
+   (`Channel.send`, `Socket.send`, `Port.send`, each enforcing the §4.4 size
+   refusal), and it is unreachable only because those classes are
+   module-private and the exported `Transport`/`Gateway` holds them privately
+   (one field on a transport, a per-peer map on a gateway); node-udp and
+   webtransport encode `encodeEnvelop([f])` inline in `handle` instead. The
+   work is a public envelop-level entry per adapter plus the type that names
+   it (`wire.ts` already exports `encodeEnvelop`) — a forward to the existing
+   `send` for three of them, the encode lifted out of `handle` for the other
+   two; it is not porting a feature, since there is no batcher to port. (The
+   connection window, once the sequenced gap here, landed in the
+   connection-window round above — nothing of §4.2.1 is outstanding on this
+   side.)
 
 ## Build / test
 

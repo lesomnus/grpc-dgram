@@ -215,13 +215,19 @@ call the value the chain resolves to is the response (resolving to nothing
 fails the call with `INTERNAL`). Under the Connect binding a Conn's own chain
 runs inside Connect's: the drpc transport sits at the centre of that onion.
 
-## What the port deliberately does not have
+## What the port does not have
 
 The **`stats.Handler` bridge** (grpc-go's type; the drpc half,
 `ProtocolStats`/`Counters`, is ported — see
-[observability.md](./observability.md#typescript)) and **`Envelop`
-batching** — the latter is unbuilt in Go too ([TODO.md](./TODO.md)). These
-are gaps, not divergences: the wire is identical either way.
+[observability.md](./observability.md#typescript)) and the **envelop-level
+send seam**: Go exports `EnvelopHandler` beside `FrameHandler` and a
+`Send(ctx, *Envelop)` on every adapter, so an application can install its own
+batcher there, while here nothing exported takes an envelop: three adapters
+already have an n-frame `send` on a module-private channel class a subclass
+cannot reach, and the other two encode their one-frame envelop inline. Neither
+language ships a batcher — the policy is the workload's
+([TODO.md](./TODO.md) §1). These are gaps, not divergences: the
+wire is identical either way.
 
 One genuine environmental difference: a browser `RTCDataChannel` cannot pause
 delivery, so inbound messages queue in the adapter while a slow consumer

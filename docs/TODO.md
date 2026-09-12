@@ -4,48 +4,156 @@ What is left, and what has to be decided before it can start. Everything that
 is *done* lives in the code, in [PROTOCOL.md](./PROTOCOL.md), or in the feature
 docs next to this file — this list is only the open end.
 
-## 1. `Envelop` batching (`Coalescer`) — deferred on purpose
+## 1. `Envelop` batching — the seam is ours, the policy is the application's
 
 The wire has always been "one marshaled `Envelop` of 1..n frames per transport
-message" (§4.1), and the spec already carries the normative duties a batching
-middleware would have to honor: re-expose the wrapped adapter's `TransportInfo`
-(§3), fail an oversize frame synchronously in `Handle` because an async
-`MaxDelay` flush has no owning call to fail (§4.4), and add up to `MaxDelay` per
-direction to every bound in §10.7. What does not exist is the design.
+message" (§4.1), and the receive side has always delivered n of them
+(`drpc.Unpack`). What this section deferred was a `Coalescer` — a batcher the
+library itself would ship — behind four decisions, a benchmark that shows the
+win, and a §4.1/§10.7 revision to match. The benchmark now exists
+([Envelop batching: the measurement](./batching-measurement.md)), and it
+resolves the section by answering a different question than the one it was
+asked.
 
-Four decisions come first. They are not implementation details; each one
-changes what the feature is.
+**What it found.** At a 22 B payload the transport is 4727 ns of the 5442 ns a
+`SendMsg` costs — 86.9%, of which 3936 ns is the bare `write` syscall — and a
+second frame in the same datagram is free: two batched cost 4717 ns where the
+same two sent apart cost 9459 ns. Twenty-nine frames fit the 1200 B budget at
+22 B, at 306 ns/frame: a 93.5% saving. And none of that matters at the rate
+this library is for — at the 200 Hz one stream of `examples/udp-sensor` runs
+at, that whole transport is about 0.1% of one core.
 
-**What may share an envelop.** Frames in one envelop share its fate (§4.1): if
-it is lost, all of them are. Batching frames of *different calls* therefore
-couples calls that the protocol otherwise keeps independent — one datagram loss
-becomes a gap in three streams. The narrow version (batch only within a call, or
-only control frames: retransmission ticks, probes, keepalives, which §10.3
-already emits in bursts) is safe and much less useful; the wide version needs an
-argument for why coupled loss is acceptable.
+So there is no `MaxDelay` worth choosing on an application's behalf: a window
+that collects anything at 200 Hz costs tens of milliseconds, added to every
+bound in *both* directions (§10.7), to recover a tenth of a percent of a core.
+But a batcher that waits for nobody — one that packs only frames already
+together in the sender, as a retransmission tick's burst is (§10.3) — pays no
+latency at all and keeps the whole saving. Whether a workload produces such
+frames is the only thing that decides the question, and it is not something
+this repository can know. Hence: **the library provides the seam, and the
+batching policy is the application's to write.** PROTOCOL.md now says the same
+normatively (§3, §4.1).
 
-**The latency budget.** `MaxDelay` is added to every termination bound, in both
-directions. The workload this library targets is sensor streams where a reading
-loses value as it ages, so a batching window that helps throughput is directly
-subtracted from the thing the library exists to protect. Before writing code:
-measure. A benchmark that shows syscall or header overhead dominating at a real
-message rate is the entry condition.
+**In Go the seam is complete and exported.** `frame.go` has both handler types
+— `FrameHandler` (core-facing, one frame) and `EnvelopHandler` (adapter-facing,
+one envelop of 1..n frames) — plus `Wrap1`, the no-batching default, which the
+adapters implement directly rather than install (it re-exposes nothing,
+`frame.go`), and `Unpack` for the receive side. Every shipped adapter exports
+an envelop-level send (`udp.Transport.Send(ctx, *drpc.Envelop)`, and the same
+shape in the others). A batcher is a
+`FrameHandler` that buffers frames and calls that `Send` with what it packed;
+it needs no library change to write, and `transport/udp/batcher_test.go` is one
+built entirely out of what is exported today.
 
-**Interaction with flow control (new in v1.1).** Credit is accounted in
-*messages* (§4.2.1); a batch is a *transport message*. Open questions: if a
-sender runs out of credit mid-batch — on its stream window or on the peer's
-connection window — does it flush the partial batch or park holding it? May a
-`WINDOW` grant, per-stream or `sid = 0`, ride the same batch as data — and if
-it does, can a credit update end up waiting behind the very frames it would
-release?
+Five duties bind whatever is installed there. None of them is a policy
+choice, and every one of them fails silently — which is why they are written
+normatively in §4.1, §4.4 and Appendix C rather than left to taste:
 
-**Interaction with compression (new in v1.1).** Per-frame compression (§12.1) or
-per-batch? Per-batch compresses better across small similar messages but makes
-the COMPRESSED marker a property of the envelop, which the frame-level flag
-cannot express today.
+- **Embed the adapter; do not hold it in a field.** `ConnAttacher`,
+  `io.Closer`, `TransportInfo` and `TransportPeer` are all found on the tx by
+  type assertion (`conn.go`). Embedding promotes `AttachConn`, `Close`,
+  `Reliable` and `Peer` through the batcher; a
+  field-wrapper hides all four, and the worst of those failures is silent —
+  without `AttachConn` the receive pump never starts and the endpoint receives
+  nothing, with no error. (`Wrap1`'s own doc comment says the same of the
+  wrapper it returns — it "re-exposes nothing"; §3 and Appendix C put the duty
+  normatively.)
+- **One destination per envelop.** A datagram is addressed by the `ctx` of the
+  call that flushes it, not by anything in its frames — `udp.Gateway.Send`
+  reads the peer out of `ctx` (§6.4), and the server hands one tx a different
+  per-peer ctx per peer. So a batcher above a **gateway** may pack together
+  only frames whose ctx names the same peer (on pion, the same channel mode
+  too, §4.3), and must flush on a ctx naming that peer. Mix two and peer B
+  receives A's frames while A receives nothing: A's calls die of their
+  deadlines, B drops a frame for an epoch it does not own, nothing errors. A
+  client `Transport` over a connected socket has one destination and is
+  exempt. The ctx a deferred flush holds on to must be a tx ctx — no tx path
+  may depend on an rx ctx surviving (§6.4).
+- **Serialise the buffer; `Handle` is called concurrently.** Every call
+  goroutine transmits, and so do the retransmission/keepalive sweep
+  (`unreliable.go`) and the `WINDOW` grant paths (`conn.go`, `server.go`). The
+  shipped adapters are stateless below `Handle` and never had to care; a
+  batcher is the first thing at this seam with mutable state, and without a
+  lock it races on its own buffer on the second concurrent call. On a
+  *reliable* adapter it must also keep envelops in the order it packed them
+  (§4.3 promises no reordering, and reliable mode has no retransmission to
+  repair one): holding the lock across the flush does that, at the price the
+  core refuses to pay itself (it sends outside every lock so a blocking
+  adapter cannot wedge `Handle`), and one flushing goroutine does it without
+  that price.
+- **Own a byte budget no larger than the adapter's, and reject an oversize
+  frame synchronously** from the `Handle` that carried it in (§4.4). Once a
+  frame is buffered its call has moved on, and a later flush's error is worse
+  than lost: it comes back out of whatever *other* call's `Handle` triggered
+  the flush, and the core reads a synchronous `ErrMessageTooLarge` as "this
+  frame never reached the wire" — it reclaims that innocent call's `seq` and
+  refunds its credit while the frame that really overran is dropped in
+  silence, and the reclaimed `seq` goes back out on a second frame. Equal
+  budgets remove the case: what the batcher accepts, the adapter takes.
+- **Count the delay, and never sit on a grant.** Whatever the batcher holds a
+  frame for is added to every termination bound of §10.7, in both directions —
+  and a `WINDOW` grant rides the same seam as data, so a batcher with no delay
+  budget at all (flush every k frames, say) can hold the grant that would
+  unpark its peer while the peer, parked, sends nothing that would complete
+  the batch. Flush uncredited control frames at once; otherwise the bound is
+  not `MaxDelay` but `T_stall`, where the peer's call fails `UNAVAILABLE`
+  (§4.2.1).
 
-Entry conditions: (1) a benchmark that shows the win, (2) the four decisions
-above, (3) a §4.1/§10.7 spec revision to match.
+The four decisions this section said had to come first resolve like this — two
+belong to the application, one dissolves, and one stays ours:
+
+**What may share an envelop** — the application's. Frames in one envelop share
+its fate (§4.1): batching frames of *different calls* couples calls the
+protocol otherwise keeps independent, and one datagram loss becomes a gap in
+three streams. The narrow version (within one call, or only control frames:
+the retransmission ticks §10.3 already emits in bursts, probes, keepalives) is
+safe and much less useful. Which trade is acceptable is a property of the
+workload, not of the protocol. Across *peers* there is no trade to make: one
+datagram carries one address, so that boundary is a duty above, not a choice.
+
+**The latency budget** — the application's, and the measurement prices it: at
+200 Hz, `k = 2` costs 5 ms and saves half the transport, `k = 8` saves 84% for
+35 ms, `k = 29` saves 93.5% for 140 ms; at 1000 msg/s per stream the same three
+cost 1 ms, 7 ms and 28 ms. How much age a reading can take is the operator's
+number.
+
+**Interaction with flow control (new in v1.1)** — *dissolves*. Credit is
+accounted in messages (§4.2.1) and the core takes it on the way *into* the tx
+path, before the frame it will send exists (`stream.go`: `acquire2` runs ahead
+of the frame build, and refunds it if the call ends before the wire). Every
+frame that reaches the `FrameHandler` seam is therefore already paid for, so a
+batcher below that seam can never run out of credit mid-batch and has no credit
+of its own to return. What is left is the return trip, and it is a liveness
+question rather than an accounting one: a `WINDOW` grant goes out through the
+same seam, so a batcher that holds it holds the thing that would make its peer
+send again. With a delay budget the cost is that budget, on the §10.7 bounds;
+without one — a count-only flush, and §4.1 allows it — the peer stays parked
+until `T_stall` and its call fails `UNAVAILABLE`. Hence the duty above: flush
+uncredited control frames immediately.
+
+**Interaction with compression (new in v1.1)** — *stays ours*, if we ever want
+it. Per-frame compression belongs to the core and `COMPRESSED` is a frame flag
+(§12.1), so a batcher below the core only ever packs frames whose compression
+is already decided, and must pack them unchanged. Per-batch compression would
+need an envelop-level flag to carry the marker — a wire change, and one that is
+cheap only before the freeze (item 2).
+
+**What the decision leaves open is one piece of real work, in TypeScript.** The
+port has half the seam: `ts/src/seam.ts` exports `FrameHandler` and `unpack`,
+so the receive side already takes n frames per datagram, the same as Go. The
+send side has no way in — there is no `EnvelopHandler` equivalent, and no
+exported class carries an envelop-level entry. Three of the five adapter
+families already have one internally: `Channel.send`, `Socket.send` and
+`Port.send` each take n frames and each already enforce the §4.4 refusal, but
+those classes are module-private and the exported `Transport`/`Gateway` holds
+them privately (one field on a transport, a per-peer map on a gateway), so a
+subclass cannot reach them. The other
+two (node-udp, webtransport) encode `encodeEnvelop([f])` inline in `handle`.
+`encodeEnvelop` is exported from `wire.ts`; what is missing is reach, not
+encoding. The work is a public envelop-level entry on each exported adapter
+plus the type that names it — a forward to the existing n-frame `send` for
+three of them, the encode lifted out of `handle` for the other two — not a
+port of a feature, because there is no feature to port.
 
 ## 2. Release preparation
 
@@ -66,13 +174,17 @@ above, (3) a §4.1/§10.7 spec revision to match.
 
 ## 3. TypeScript parity, if and when it is wanted
 
-The port deliberately stops short of the Go feature set in two places
+The port stops short of the Go side in two places — one deliberate, one a gap
 (`ts/STATUS.md` has the reasoning):
 
 - the **`stats.Handler` bridge** — `ProtocolStats`/`Counters` are ported
   (`ts/src/stats.ts`, so a browser client reports the §14 gap counter), but the
   grpc-go `stats.Handler` type has no TS counterpart and is not mirrored;
-- **`Envelop` batching**, which follows item 1 in both languages.
+- the **envelop-level send seam** of item 1 — a gap, not a decision. Go exports
+  `EnvelopHandler` beside `FrameHandler` and an envelop-level `Send` on every
+  adapter, so an application can install its own batcher between the core and
+  the channel; here there is nothing to install it against. Neither language
+  ships a batcher, and neither is going to.
 
 That is the whole of it. The **connection window** (`WINDOW sid=0`, §4.2.1)
 that this section once listed as sequenced rather than deliberate is in the
