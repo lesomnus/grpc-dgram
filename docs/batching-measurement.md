@@ -2,11 +2,16 @@
 
 `docs/TODO.md` §1 deferred the `Coalescer` behind one entry condition: "a
 benchmark that shows syscall or header overhead dominating at a real message
-rate". This is that benchmark's run; §1 now carries what it decided. The
-harness is `transport/udp/bench_test.go`; the table below is regenerated from
-its output by `TestBenchTable` (`DRPC_BENCH_OUT=<file> go test -run
-TestBenchTable -v ./transport/udp`), so it can be reproduced on another machine
-without editing a number by hand.
+rate". This is that benchmark's run, and §1 now carries what it decided.
+
+The harness is not in the tree. It was two test files under `transport/udp`
+— `bench_test.go`, which measured the send path, and `benchtable_test.go`,
+which turned a `go test -bench` output file into the tables below — and both
+were retired once the question was answered: they existed to decide one thing,
+they decided it, and a benchmark nobody reads is a file that has to keep
+compiling. `git show ab77531:transport/udp/bench_test.go` (and the same for
+`benchtable_test.go`) brings them back if the numbers ever need re-deriving on
+other hardware.
 
 ## The run
 
