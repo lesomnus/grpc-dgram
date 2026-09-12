@@ -14,8 +14,8 @@ It is **not** a general-purpose or reliable RPC framework, and it is **not**
 wire-compatible with standard gRPC. See [What it is / isn't](#what-it-is--isnt).
 
 ```
-generated stubs ──> drpc.Conn ──(FrameHandler)──> adapter (1 Envelop per message) ──> channel
-generated impls <── drpc.Server <──(per frame)──── adapter (unpacks Envelop) <──────── channel
+generated stubs ──> drpc.Conn ──(FrameHandler)──> adapter (1 Envelope per message) ──> channel
+generated impls <── drpc.Server <──(per frame)──── adapter (unpacks Envelope) <──────── channel
 ```
 
 - Package: `github.com/lesomnus/grpc-dgram` (import name `drpc`); the wire
@@ -63,7 +63,7 @@ subsequence** instead of stalling.
 | A server compiled to `js/wasm`, served to the page over a message port | ✅ [`transport/jsport`](./transport/jsport) ↔ [`ts/…/transport/port`](./ts/src/transport/port) — same wire as WebSocket, both ends in one process |
 | Browser / Node TypeScript port (client + server, same wire) | ✅ [`ts/`](./ts) — WebRTC DataChannel, WebSocket, WebTransport datagrams (client), JS message port, Node UDP, protobuf-es & Connect-ES bindings |
 | Runnable examples | ✅ [`examples/`](./examples) — UDP sensor stream, WebSocket echo, browser↔Go WebRTC, a Go server compiled to wasm and started by the page |
-| Application-written `Envelop` batching | ✅ the seam, not a policy — the core emits frames, adapters take envelops of 1..n ([`Wrap1`](./frame.go) is the 1-frame default, [`udp.Transport.Send`](./transport/udp) the way in, `sendFrames` its [TypeScript](./ts/src/transport) twin); the library ships no batcher and [the measurement](./docs/batching-measurement.md) says why |
+| Application-written `Envelope` batching | ✅ the seam, not a policy — the core emits frames, adapters take envelopes of 1..n ([`Wrap1`](./frame.go) is the 1-frame default, [`udp.Transport.Send`](./transport/udp) the way in, `sendFrames` its [TypeScript](./ts/src/transport) twin); the library ships no batcher and [the measurement](./docs/batching-measurement.md) says why |
 
 ## Install
 
@@ -126,7 +126,7 @@ direction: registration must precede the first received frame, so the
 server transport starts explicitly after `RegisterService` — the
 `Serve`/`ServePeer` calls above, the same shape as `grpc.Server.Serve(lis)`.
 
-To wire a custom transport instead: the wire unit is one marshaled `Envelop`
+To wire a custom transport instead: the wire unit is one marshaled `Envelope`
 (1..n `Frame`s) per transport message; implement `FrameHandler` (send) +
 `TransportInfo` (+ `ConnAttacher` and `io.Closer` for the self-managing
 client shape), feed received frames to `Conn.Handle`/`Server.Handle`, and

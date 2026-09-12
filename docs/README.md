@@ -38,7 +38,7 @@ side you are on.
 - **[PROTOCOL.md](./PROTOCOL.md)** — the wire format, the state machines, and
   the reasoning behind them. Cited as "§4.2" throughout the other pages.
 - **[TODO.md](./TODO.md)** — what is left, and what has to be decided first.
-- **[Envelop batching: the measurement](./batching-measurement.md)** — the
+- **[Envelope batching: the measurement](./batching-measurement.md)** — the
   benchmark behind TODO §1's decision that the batching policy belongs to the
   application, and what it found: the transport is 87% of what a message costs
   to send, and that is 0.1% of a core at the rate this library is for.

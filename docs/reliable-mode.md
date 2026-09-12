@@ -215,7 +215,7 @@ eager OPEN of a client-streaming call is free, and so is the response riding
 a `SendAndClose` terminal.
 
 Credit taken for a frame the adapter then refuses synchronously — an
-oversize envelop wrapping `drpc.ErrMessageTooLarge` (§4.4) — is refunded.
+oversize envelope wrapping `drpc.ErrMessageTooLarge` (§4.4) — is refunded.
 That frame never reached the wire, and gRPC lets a handler ignore what `Send`
 returns; without the refund such a handler would leak its whole window and
 then park on every later message until `T_stall`.

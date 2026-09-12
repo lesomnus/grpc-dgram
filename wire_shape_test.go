@@ -1,8 +1,8 @@
 package drpc_test
 
 // wire_shape_test.go pins the on-wire shape rules two implementations (the Go
-// core and the planned TS port) must agree on: envelop framing and in-order
-// processing (PROTOCOL.md §4.1), the exact Frame/Envelop encoding (§5), codec
+// core and the planned TS port) must agree on: envelope framing and in-order
+// processing (PROTOCOL.md §4.1), the exact Frame/Envelope encoding (§5), codec
 // addressing (§12), the registration freeze (§13), and the rx drop policies
 // (§4.2).
 
@@ -66,16 +66,16 @@ func drainFor(is *injectServer, d time.Duration) []*drpc.Frame {
 }
 
 // ---------------------------------------------------------------------------
-// §4.1: one envelop, many frames — receivers process them in order, and a
-// frame later in the envelop lands on the call created earlier in the SAME
-// envelop (mid-envelop creation).
+// §4.1: one envelope, many frames — receivers process them in order, and a
+// frame later in the envelope lands on the call created earlier in the SAME
+// envelope (mid-envelope creation).
 // ---------------------------------------------------------------------------
 
-func TestWireShape_MultiFrameEnvelop(t *testing.T) {
+func TestWireShape_MultiFrameEnvelope(t *testing.T) {
 	is := newInjectServerMode(t, false) // unreliable: the datagram framing mode
 
 	const cEpoch, sid = uint32(1), uint32(11)
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{
 		liveOpen(cEpoch, sid),
 		echoData(t, cEpoch, sid, 2, "abc"),
@@ -92,7 +92,7 @@ func TestWireShape_MultiFrameEnvelop(t *testing.T) {
 	x.Equal(t, cEpoch, h.GetPeerEpoch(), "server frames echo the client epoch (§6.1)")
 
 	// The data frame took effect TOO: it routed into the call created
-	// mid-envelop, and the Live handler echoed it back.
+	// mid-envelope, and the Live handler echoed it back.
 	res := is.recv(t)
 	x.True(t, res != nil, "expected the echoed data frame")
 	x.Equal(t, uint32(0), res.GetFlags())
@@ -101,28 +101,28 @@ func TestWireShape_MultiFrameEnvelop(t *testing.T) {
 	x.NoError(t, proto.Unmarshal(res.GetPayload(), got))
 	x.Equal(t, "bca", got.GetMessage())
 
-	t.Run("empty envelop is a no-op", func(t *testing.T) {
-		// §4.1: an empty envelop is dropped — no panic, no reply.
-		x.NoError(t, drpc.Unpack(context.Background(), &drpc.Envelop{}, is.srv))
-		x.True(t, is.recv(t) == nil, "an empty envelop must draw no reply")
+	t.Run("empty envelope is a no-op", func(t *testing.T) {
+		// §4.1: an empty envelope is dropped — no panic, no reply.
+		x.NoError(t, drpc.Unpack(context.Background(), &drpc.Envelope{}, is.srv))
+		x.True(t, is.recv(t) == nil, "an empty envelope must draw no reply")
 	})
 }
 
 // ---------------------------------------------------------------------------
-// §4.1 + §9.3: frames are processed in the order they appear in the envelop.
+// §4.1 + §9.3: frames are processed in the order they appear in the envelope.
 // [data(seq2), OPEN(seq1)] — the data frame precedes creation, so it is
 // dropped (delayed-RESET path; its loss is within the §14 contract) and the
 // OPEN then creates the call. The pending RESET is cancelled by the OPEN, so
 // no RESET ever fires.
 // ---------------------------------------------------------------------------
 
-func TestWireShape_EnvelopInOrderProcessing(t *testing.T) {
+func TestWireShape_EnvelopeInOrderProcessing(t *testing.T) {
 	// Short T_hold so a leaked delayed RESET would fire inside the assertion
 	// window; every other timer keeps its (long) default.
 	is := newInjectServerMode(t, false, drpc.WithTiming(drpc.Timing{Hold: 50 * time.Millisecond}))
 
 	const cEpoch, sid = uint32(1), uint32(12)
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{
 		echoData(t, cEpoch, sid, 2, "early"), // before its OPEN: dropped, held
 		liveOpen(cEpoch, sid),
@@ -132,7 +132,7 @@ func TestWireShape_EnvelopInOrderProcessing(t *testing.T) {
 	// The OPEN created the call: creation ack H arrives (§8). No crash from
 	// the mis-ordered data frame.
 	h := is.recv(t)
-	x.True(t, h != nil, "the OPEN later in the envelop must still create the call")
+	x.True(t, h != nil, "the OPEN later in the envelope must still create the call")
 	x.Equal(t, uint32(0), h.GetFlags())
 	x.False(t, h.HasPayload())
 	x.Equal(t, cEpoch, h.GetPeerEpoch())
@@ -171,10 +171,10 @@ func TestWireShape_EnvelopInOrderProcessing(t *testing.T) {
 const goldenFrameHex = "0d0403020115050000001d0600000020032a062f612e422f433a046a736f6e420808011080cab5ee014a01aa50005a0164750d0c0b0a"
 
 // golden vector for cross-implementation agreement (TS port).
-// Envelop{frames:[OPEN{epoch:1 sid:2 seq:1 flags:1 method:"/a.B/C"},
+// Envelope{frames:[OPEN{epoch:1 sid:2 seq:1 flags:1 method:"/a.B/C"},
 // data{epoch:1 sid:2 seq:2 payload:[0xAA]}]} — frames is field 1 (§4.1, §5;
 // the old frames=8 / payload=8 collision is gone, Appendix A).
-const goldenEnvelopHex = "0a190d0100000015020000001d0100000020012a062f612e422f430a120d0100000015020000001d020000004a01aa"
+const goldenEnvelopeHex = "0a190d0100000015020000001d0100000020012a062f612e422f430a120d0100000015020000001d020000004a01aa"
 
 func goldenFrame() *drpc.Frame {
 	f := &drpc.Frame{}
@@ -227,7 +227,7 @@ func TestWireShape_GoldenBytes(t *testing.T) {
 		x.False(t, g.HasTrailer())
 		x.Equal(t, 0x0A0B0C0D, g.GetPeerEpoch())
 	})
-	t.Run("Envelop", func(t *testing.T) {
+	t.Run("Envelope", func(t *testing.T) {
 		open := &drpc.Frame{}
 		open.SetEpoch(1)
 		open.SetSid(2)
@@ -239,7 +239,7 @@ func TestWireShape_GoldenBytes(t *testing.T) {
 		data.SetSid(2)
 		data.SetSeq(2)
 		data.SetPayload([]byte{0xAA})
-		e := &drpc.Envelop{}
+		e := &drpc.Envelope{}
 		e.SetFrames([]*drpc.Frame{open, data})
 
 		a, err := proto.Marshal(e)
@@ -248,13 +248,13 @@ func TestWireShape_GoldenBytes(t *testing.T) {
 		x.NoError(t, err)
 		x.Equal(t, hex.EncodeToString(a), hex.EncodeToString(b), "marshal must be deterministic")
 
-		if got := hex.EncodeToString(a); got != goldenEnvelopHex {
-			t.Fatalf("Envelop wire bytes drifted (frames must stay field 1):\n got  %s\n want %s", got, goldenEnvelopHex)
+		if got := hex.EncodeToString(a); got != goldenEnvelopeHex {
+			t.Fatalf("Envelope wire bytes drifted (frames must stay field 1):\n got  %s\n want %s", got, goldenEnvelopeHex)
 		}
 
-		raw, err := hex.DecodeString(goldenEnvelopHex)
+		raw, err := hex.DecodeString(goldenEnvelopeHex)
 		x.NoError(t, err)
-		g := &drpc.Envelop{}
+		g := &drpc.Envelope{}
 		x.NoError(t, proto.Unmarshal(raw, g))
 		fs := g.GetFrames()
 		x.Len(t, fs, 2)

@@ -124,7 +124,7 @@ describe('reliable websocket echo (the gorilla pair, TS side)', () => {
     expect(net.gateway.reliable()).toBe(true)
     expect(net.a.binaryType).toBe('arraybuffer') // browser-safe framing (§4.1)
     expect(await net.conn.invoke(echo.once, { text: 'hello' })).toEqual({ text: 'echo:hello' })
-    expect(net.a.sent).toHaveLength(1) // one marshaled Envelop per message
+    expect(net.a.sent).toHaveLength(1) // one marshaled Envelope per message
     net.conn.close()
     await net.serving
   })
@@ -167,7 +167,7 @@ describe('reliable websocket echo (the gorilla pair, TS side)', () => {
     net.conn.close()
   })
 
-  it('carries a 256 KiB envelop: no size ceiling by default (§4.4)', async () => {
+  it('carries a 256 KiB envelope: no size ceiling by default (§4.4)', async () => {
     const net = wireEnds()
     const text = 'x'.repeat(256 * 1024)
     expect(await net.conn.invoke(echo.once, { text })).toEqual({ text: `echo:${text}` })
@@ -177,7 +177,7 @@ describe('reliable websocket echo (the gorilla pair, TS side)', () => {
 })
 
 describe('message size (§4.4)', () => {
-  it('refuses an oversize envelop synchronously and the call fails RESOURCE_EXHAUSTED', async () => {
+  it('refuses an oversize envelope synchronously and the call fails RESOURCE_EXHAUSTED', async () => {
     const net = wireEnds({ client: { maxMessageSize: 128 } })
     const err = (await net.conn.invoke(echo.once, { text: 'x'.repeat(500) }).catch((e) => e)) as StatusError
     expect(err.code).toBe(Code.RESOURCE_EXHAUSTED)
@@ -284,7 +284,7 @@ describe('nothing is delivered after close (§4.5)', () => {
     const net = wireEnds()
     expect(await net.conn.invoke(echo.once, { text: 'live' })).toEqual({ text: 'echo:live' })
     expect(net.counts.once).toBe(1)
-    const replay = net.a.sent[0] // the OPEN envelop the server already handled
+    const replay = net.a.sent[0] // the OPEN envelope the server already handled
     expect(replay).toBeDefined()
 
     const spy = vi.spyOn(net.server, 'handle')
@@ -309,7 +309,7 @@ describe('nothing is delivered after close (§4.5)', () => {
     a.close()
     await tick()
     expect(conn.close).toHaveBeenCalledTimes(1) // the §4.5 teardown, exactly once
-    a.emit('message', { data: new Uint8Array([0x0a, 0x00]).buffer }) // a well-formed envelop
+    a.emit('message', { data: new Uint8Array([0x0a, 0x00]).buffer }) // a well-formed envelope
     await tick()
     expect(conn.handle).not.toHaveBeenCalled()
   })

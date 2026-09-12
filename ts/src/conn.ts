@@ -284,7 +284,7 @@ export class Conn {
   }
 
   // handle delivers one server frame to this Conn. Adapters call it for each
-  // frame of a received envelop, in order, awaiting each (PROTOCOL.md §9.1).
+  // frame of a received envelope, in order, awaiting each (PROTOCOL.md §9.1).
   async handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
     const sid = f.sid
 

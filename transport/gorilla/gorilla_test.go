@@ -270,7 +270,7 @@ func TestLargeMessage(t *testing.T) {
 	}
 }
 
-// An explicit send limit refuses oversized envelops with
+// An explicit send limit refuses oversized envelopes with
 // drpc.ErrMessageTooLarge, which the core maps to ResourceExhausted on the
 // owning call — without disturbing the connection.
 func TestMaxMessageSize(t *testing.T) {

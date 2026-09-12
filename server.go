@@ -201,7 +201,7 @@ func (s *Server) rxReliable(ctx context.Context) bool {
 }
 
 // Handle delivers one client frame to this Server. Adapters call it for each
-// frame of a received envelop, in order, with the peer attached to ctx
+// frame of a received envelope, in order, with the peer attached to ctx
 // (PROTOCOL.md §9.1).
 func (s *Server) Handle(ctx context.Context, f *Frame) error {
 	s.serving.Store(true)

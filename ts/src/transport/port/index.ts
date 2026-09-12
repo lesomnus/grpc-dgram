@@ -1,5 +1,5 @@
 // drpc over a JS message port: one posted message carries one marshaled
-// Envelop (PROTOCOL.md §4.1) — byte for byte the wire the WebSocket adapter
+// Envelope (PROTOCOL.md §4.1) — byte for byte the wire the WebSocket adapter
 // speaks. A "port" here is anything with `postMessage(data)` and a `message`
 // event: both ends of a MessageChannel, a Worker seen from the main thread,
 // and `self` inside a dedicated worker. It deliberately does NOT cover
@@ -22,7 +22,7 @@
 // invented, because there is no socket to die:
 //
 //   - **The goodbye is an empty message.** A 0-byte message decodes to an
-//     Envelop with zero frames, which the wire never otherwise carries (§4.1
+//     Envelope with zero frames, which the wire never otherwise carries (§4.1
 //     says 1..n), so it is free to mean "this endpoint is going away".
 //     close() posts one, best effort, before closing the port; a pump that
 //     reads a 0-byte message treats it as EOF, exits, and runs the §4.5
@@ -58,15 +58,15 @@ import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '..
 import { unpack } from '../../seam'
 import { Code, MessageTooLargeError, StatusError } from '../../status'
 import { abortListener, Latch, noop } from '../../util'
-import { decodeEnvelop, encodeEnvelop, type Frame } from '../../wire'
+import { decodeEnvelope, encodeEnvelope, type Frame } from '../../wire'
 
 // DefaultMaxMessageSize is 0 — unlimited. Structured clone has no protocol
 // ceiling, so like WebSocket this endpoint refuses nothing by default
 // (PROTOCOL.md §4.4).
 export const DefaultMaxMessageSize = 0
 
-// The goodbye: a zero-frame envelop, which is exactly 0 bytes (see §4.1 and
-// encodeEnvelop). One instance, since it is immutable and never transferred.
+// The goodbye: a zero-frame envelope, which is exactly 0 bytes (see §4.1 and
+// encodeEnvelope). One instance, since it is immutable and never transferred.
 const GOODBYE = new Uint8Array(0)
 
 // PortLike is the structural subset of a JS message port the adapter needs.
@@ -95,7 +95,7 @@ export interface PortLike {
 }
 
 export interface PortOptions {
-  // Largest marshaled Envelop this endpoint will send, in bytes; 0 (the
+  // Largest marshaled Envelope this endpoint will send, in bytes; 0 (the
   // default) is unlimited (PROTOCOL.md §4.4). Bounds sends only; receives
   // accept any message.
   maxMessageSize?: number
@@ -147,7 +147,7 @@ function wakeAll(waiters: (() => void)[]): void {
 
 // Port owns one message port: it buffers inbound messages from the moment it
 // is constructed (a MessagePort queues them itself until start(), but a
-// Worker does not), posts one message per envelop, and turns both flavours of
+// Worker does not), posts one message per envelope, and turns both flavours of
 // goodbye — the peer's empty message and the host's close() — into the single
 // death signal the §4.5 teardown hangs off.
 class Port {
@@ -214,7 +214,7 @@ class Port {
     wakeAll(this.rxWaiters)
   }
 
-  // send posts one envelop as one message. An envelop over the size limit is
+  // send posts one envelope as one message. An envelope over the size limit is
   // refused before anything reaches the port (PROTOCOL.md §4.4) — the core
   // then fails the owning call with RESOURCE_EXHAUSTED and reclaims its seq.
   // Nothing else here can park: postMessage has no backpressure, so a send
@@ -222,7 +222,7 @@ class Port {
   // therefore has nothing to bound.
   async send(frames: readonly Frame[]): Promise<void> {
     if (frames.length === 0) {
-      // A zero-frame envelop encodes to 0 bytes, which on this adapter is the
+      // A zero-frame envelope encodes to 0 bytes, which on this adapter is the
       // goodbye (see pump) — so sending one here would tear the channel down
       // instead of doing nothing. A batching middleware (§4.1) flushes on a
       // delay budget, and an idle tick flushes an empty buffer, so this is a
@@ -230,9 +230,9 @@ class Port {
       // unaffected.
       return
     }
-    const data = encodeEnvelop(frames)
+    const data = encodeEnvelope(frames)
     if (this.max > 0 && data.length > this.max) {
-      throw new MessageTooLargeError(`port: ${data.length}-byte envelop over the ${this.max}-byte limit`)
+      throw new MessageTooLargeError(`port: ${data.length}-byte envelope over the ${this.max}-byte limit`)
     }
     if (this.dead.tripped) throw this.closedErr()
     try {
@@ -246,7 +246,7 @@ class Port {
   }
 
   // post hands the bytes over rather than copying them when the array owns
-  // its whole buffer — which encodeEnvelop's output always does — and falls
+  // its whole buffer — which encodeEnvelope's output always does — and falls
   // back to a plain post if this port refuses transfer lists.
   private post(data: Uint8Array): void {
     if (this.transferable && data.byteOffset === 0 && data.byteLength === data.buffer.byteLength) {
@@ -280,13 +280,13 @@ class Port {
     for (;;) {
       const data = this.rx.shift()
       if (data !== undefined) {
-        // The goodbye is 0 BYTES, not merely an envelop that decoded to no
-        // frames: decodeEnvelop skips envelop fields it does not know — a
+        // The goodbye is 0 BYTES, not merely an envelope that decoded to no
+        // frames: decodeEnvelope skips envelope fields it does not know — a
         // v1.2 extension, another library's protobuf sharing the port — so
         // plenty of messages decode to zero frames, and reading any of them
         // as EOF would tear a healthy channel down over input §4.2 says to
         // drop. Only the empty message can be the close frame: §4.1 carries
-        // 1..n frames and encodeEnvelop([]) is exactly 0 bytes, in Go too.
+        // 1..n frames and encodeEnvelope([]) is exactly 0 bytes, in Go too.
         // Anything else that decodes to no frames is delivered as no frames,
         // i.e. dropped like the malformed message it is.
         if (data.length === 0) {
@@ -300,7 +300,7 @@ class Port {
         }
         let frames: Frame[]
         try {
-          frames = decodeEnvelop(data)
+          frames = decodeEnvelope(data)
         } catch {
           continue // malformed messages are dropped; never tear down (§4.2)
         }
@@ -410,13 +410,13 @@ export class PortTransport implements FrameHandler, TransportInfo, ConnAttacher 
     })()
   }
 
-  // sendFrames posts these frames as ONE message — one marshaled Envelop of
+  // sendFrames posts these frames as ONE message — one marshaled Envelope of
   // 1..n frames is the wire unit either way (PROTOCOL.md §4.1). A thin
   // passthrough: Port.send owns the §4.4 refusal, which happens before
   // anything reaches the port. No ctx is taken because none is used: a post
   // never parks, so a frame's signal has nothing to bound (see Port.send).
   //
-  // It is the envelop-level seam a batching middleware flushes through (§4.1).
+  // It is the envelope-level seam a batching middleware flushes through (§4.1).
   // The library ships no batcher: what may share a message and how long a
   // frame may wait for company (§10.7) are answerable only against a
   // workload. A user subclasses this transport, overrides `handle` to buffer,
@@ -428,7 +428,7 @@ export class PortTransport implements FrameHandler, TransportInfo, ConnAttacher 
     return this.pt.send(frames)
   }
 
-  // handle posts one frame as a single-frame envelop: the no-batching default
+  // handle posts one frame as a single-frame envelope: the no-batching default
   // (§4.1), and always conformant.
   handle(f: Frame): Promise<void> {
     return this.sendFrames([f])
@@ -625,7 +625,7 @@ export class PortGateway implements FrameHandler, TransportInfo {
   }
 
   // sendFrames posts these frames as ONE message to the peer named in ctx,
-  // with the same size ceiling as the client transport — the envelop-level
+  // with the same size ceiling as the client transport — the envelope-level
   // seam a batching middleware flushes through (PROTOCOL.md §4.1).
   //
   // The ctx IS the address (§6.4): the whole message goes to the one port it
@@ -645,7 +645,7 @@ export class PortGateway implements FrameHandler, TransportInfo {
     return pt.send(frames)
   }
 
-  // handle posts one frame as a single-frame envelop to the peer named in ctx:
+  // handle posts one frame as a single-frame envelope to the peer named in ctx:
   // the no-batching default (§4.1).
   handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
     return this.sendFrames([f], ctx)

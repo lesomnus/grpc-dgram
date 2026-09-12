@@ -27,13 +27,13 @@ type portAddr struct{ label string }
 func (a portAddr) Network() string { return "js" }
 func (a portAddr) String() string  { return a.label }
 
-func marshal(e *drpc.Envelop, limit int) ([]byte, error) {
+func marshal(e *drpc.Envelope, limit int) ([]byte, error) {
 	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(e)
 	if err != nil {
 		return nil, err
 	}
 	if limit > 0 && len(data) > limit {
-		return nil, fmt.Errorf("jsport: %d-byte envelop over the %d-byte limit: %w",
+		return nil, fmt.Errorf("jsport: %d-byte envelope over the %d-byte limit: %w",
 			len(data), limit, drpc.ErrMessageTooLarge)
 	}
 	return data, nil
@@ -186,7 +186,7 @@ func (p *msgPort) onMessage(ev js.Value) {
 	data, ok := p.bytesOf(ev.Get("data"))
 	if !ok {
 		// A string, or an object from something else sharing this port. Not an
-		// envelop; ignored, never a teardown (§4.2).
+		// envelope; ignored, never a teardown (§4.2).
 		return
 	}
 	p.mu.Lock()
@@ -221,7 +221,7 @@ func (p *msgPort) pop() ([]byte, bool) {
 // bytesOf copies an inbound message into Go memory. A Uint8Array is the
 // contract (§4.1); any other ArrayBufferView is accepted by wrapping its range,
 // because a peer that posted an Int8Array or a DataView still posted our bytes.
-// Anything else is not an envelop.
+// Anything else is not an envelope.
 //
 // The copy is the design, not a cost to optimize away: crossing the wasm
 // boundary as marshaled bytes is 2.5-3x faster than building the equivalent JS
@@ -313,12 +313,12 @@ func (p *msgPort) post(data []byte, transfer bool) error {
 	return p.call("postMessage", buf)
 }
 
-// send transmits one envelop as one posted message. An envelop over the size
+// send transmits one envelope as one posted message. An envelope over the size
 // limit is refused synchronously with an error wrapping drpc.ErrMessageTooLarge
 // (PROTOCOL.md §4.4) and the port stays up.
-func (p *msgPort) send(e *drpc.Envelop) error {
+func (p *msgPort) send(e *drpc.Envelope) error {
 	if len(e.GetFrames()) == 0 {
-		// A zero-frame envelop marshals to 0 bytes, which on this adapter is
+		// A zero-frame envelope marshals to 0 bytes, which on this adapter is
 		// the goodbye (below) — so sending one here would tear the channel
 		// down instead of doing nothing. A batching middleware (§4.1) flushes
 		// on a delay budget, and an idle tick flushes an empty buffer, so this
@@ -342,8 +342,8 @@ func (p *msgPort) send(e *drpc.Envelop) error {
 	return nil
 }
 
-// goodbye posts the empty envelop that means "this endpoint is going away"
-// (§4.1: the wire never otherwise carries a zero-frame envelop). Best effort —
+// goodbye posts the empty envelope that means "this endpoint is going away"
+// (§4.1: the wire never otherwise carries a zero-frame envelope). Best effort —
 // a port whose peer is already gone has nobody left to tell. No transfer list:
 // a zero-length buffer saves nothing and every runtime accepts the plain form.
 func (p *msgPort) goodbye() { _ = p.post(nil, false) }
@@ -422,11 +422,11 @@ func (p *msgPort) serve(ctx context.Context, rxCtx context.Context, h drpc.Frame
 // frame-level errors never tear down the channel (§4.2).
 //
 // The goodbye is 0 BYTES, not merely a message that decoded to no frames.
-// proto.Unmarshal keeps fields it does not know — a later envelop extension,
+// proto.Unmarshal keeps fields it does not know — a later envelope extension,
 // another library's protobuf sharing the port, two bytes of anyone's junk — so
 // plenty of messages decode to zero frames, and reading any of them as EOF
 // would tear a healthy channel down over input §4.2 says to drop. Only the
-// empty message can be the close frame: an envelop carries 1..n frames (§4.1)
+// empty message can be the close frame: an envelope carries 1..n frames (§4.1)
 // and marshaling one with none is exactly 0 bytes, in TypeScript too — the
 // twin adapter makes the same check, and the two halves must agree on the byte
 // sequence that ends a connection.
@@ -434,11 +434,11 @@ func deliver(ctx context.Context, data []byte, h drpc.FrameHandler) bool {
 	if len(data) == 0 {
 		return true
 	}
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	if err := proto.Unmarshal(data, e); err != nil {
 		return false
 	}
-	// An envelop that decoded to no frames is delivered as no frames, i.e.
+	// An envelope that decoded to no frames is delivered as no frames, i.e.
 	// dropped like the malformed message it is.
 	drpc.Unpack(ctx, e, h)
 	return false

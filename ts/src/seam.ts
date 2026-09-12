@@ -1,7 +1,7 @@
 // The transport seams (PROTOCOL.md §3, §4). The core emits and consumes
-// individual frames; the wire unit is always one Envelop per transport
-// message, which adapters marshal/unmarshal themselves (encodeEnvelop /
-// decodeEnvelop in wire.ts).
+// individual frames; the wire unit is always one Envelope per transport
+// message, which adapters marshal/unmarshal themselves (encodeEnvelope /
+// decodeEnvelope in wire.ts).
 
 import type { Conn } from './conn'
 import type { Frame } from './wire'
@@ -22,7 +22,7 @@ export interface FrameContext {
 }
 
 // FrameHandler is the seam both directions share. On the rx path adapters
-// call Conn.handle / Server.handle once per frame of a received envelop, in
+// call Conn.handle / Server.handle once per frame of a received envelope, in
 // order — awaiting each so reliable-mode backpressure propagates (§4.2). On
 // the tx path the core calls the adapter; a returned promise lets a send
 // block (backpressure), and a synchronous throw of MessageTooLargeError
@@ -64,7 +64,7 @@ export function hasConnAttacher(tx: FrameHandler): tx is FrameHandler & ConnAtta
   return typeof (tx as Partial<ConnAttacher>).attachConn === 'function'
 }
 
-// unpack delivers each frame of a decoded envelop to h in order, awaiting
+// unpack delivers each frame of a decoded envelope to h in order, awaiting
 // each so backpressure propagates (PROTOCOL.md §4.1). Frame-level failures
 // are swallowed: they never tear down the channel (§4.2).
 export async function unpack(frames: readonly Frame[], h: FrameHandler, ctx?: FrameContext): Promise<void> {

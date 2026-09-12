@@ -1,5 +1,5 @@
 // Package gorilla runs drpc over WebSocket: one binary message carries one
-// marshaled Envelop. The channel is reliable and ordered, so the core runs
+// marshaled Envelope. The channel is reliable and ordered, so the core runs
 // in reliable mode with every protocol timer and retransmission off
 // (PROTOCOL.md §10.6) — leaving this adapter the two duties the protocol no
 // longer covers:
@@ -59,7 +59,7 @@ type options struct {
 
 type Option func(*options)
 
-// WithMaxMessageSize sets the largest marshaled Envelop this endpoint will
+// WithMaxMessageSize sets the largest marshaled Envelope this endpoint will
 // send, in bytes; 0 (the default) means unlimited — a reliable transport
 // carries any size (PROTOCOL.md §4.4). It bounds sends only; receives accept
 // any message.
@@ -93,13 +93,13 @@ func buildOptions(opts []Option) options {
 	return o
 }
 
-func marshal(e *drpc.Envelop, limit int) ([]byte, error) {
+func marshal(e *drpc.Envelope, limit int) ([]byte, error) {
 	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(e)
 	if err != nil {
 		return nil, err
 	}
 	if limit > 0 && len(data) > limit {
-		return nil, fmt.Errorf("gorilla: %d-byte envelop over the %d-byte limit: %w",
+		return nil, fmt.Errorf("gorilla: %d-byte envelope over the %d-byte limit: %w",
 			len(data), limit, drpc.ErrMessageTooLarge)
 	}
 	return data, nil
@@ -141,7 +141,7 @@ func (s *sock) write(data []byte, timeout time.Duration) error {
 // can run.
 //
 // Frame-level Handle errors mean malformed input and never tear down the
-// channel (§4.2). Non-binary messages and unparseable envelops are ignored.
+// channel (§4.2). Non-binary messages and unparseable envelopes are ignored.
 //
 // Returns nil on ctx cancellation, local socket close, or an orderly close
 // handshake; the fatal transport error otherwise.
@@ -245,7 +245,7 @@ func serve(ctx context.Context, c *websocket.Conn, o options, rxCtx context.Cont
 		if typ != websocket.BinaryMessage {
 			continue
 		}
-		e := &drpc.Envelop{}
+		e := &drpc.Envelope{}
 		if err := proto.Unmarshal(data, e); err != nil {
 			continue
 		}
@@ -314,15 +314,15 @@ func (t *Transport) Peer() *peer.Peer {
 	return &peer.Peer{Addr: t.s.c.RemoteAddr(), LocalAddr: t.s.c.LocalAddr()}
 }
 
-// Handle sends one frame as a single-frame envelop.
+// Handle sends one frame as a single-frame envelope.
 func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return t.Send(ctx, e)
 }
 
-// Send transmits one envelop as one binary message.
-func (t *Transport) Send(_ context.Context, e *drpc.Envelop) error {
+// Send transmits one envelope as one binary message.
+func (t *Transport) Send(_ context.Context, e *drpc.Envelope) error {
 	data, err := marshal(e, t.o.maxMessageSize)
 	if err != nil {
 		return err
@@ -356,15 +356,15 @@ func NewGateway(opts ...Option) *Gateway {
 // §10.6), which is what makes ServePeer's teardown duty mandatory.
 func (g *Gateway) Reliable() bool { return true }
 
-// Handle sends one frame as a single-frame envelop to the peer named in ctx.
+// Handle sends one frame as a single-frame envelope to the peer named in ctx.
 func (g *Gateway) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return g.Send(ctx, e)
 }
 
-// Send transmits one envelop as one binary message to the peer named in ctx.
-func (g *Gateway) Send(ctx context.Context, e *drpc.Envelop) error {
+// Send transmits one envelope as one binary message to the peer named in ctx.
+func (g *Gateway) Send(ctx context.Context, e *drpc.Envelope) error {
 	key, ok := drpc.PeerFromContext(ctx)
 	if !ok {
 		return errors.New("gorilla: no peer in context")

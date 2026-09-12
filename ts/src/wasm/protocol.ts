@@ -11,7 +11,7 @@
 //
 // Every one of them is a plain object with a `drpc` tag and NEVER a
 // Uint8Array, so none can be confused with a frame: the drpc wire only ever
-// crosses the transferred MessagePorts — one message per marshaled Envelop
+// crosses the transferred MessagePorts — one message per marshaled Envelope
 // (PROTOCOL.md §4.1) — and never the worker's own channel. That is what lets a
 // worker started here also be a worker of the application's own, talking about
 // something else on the same channel: anything untagged is not ours (see

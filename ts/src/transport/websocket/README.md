@@ -2,7 +2,7 @@
 
 dRPC over **WebSocket** — the TS twin of the Go `transport/gorilla` adapter,
 and wire-compatible with it. **One binary message carries one marshaled
-`Envelop`.** The channel is reliable and ordered, so the core auto-detects
+`Envelope`.** The channel is reliable and ordered, so the core auto-detects
 reliable mode and runs with every protocol timer off (§10.6): plain gRPC
 semantics over a WebSocket.
 

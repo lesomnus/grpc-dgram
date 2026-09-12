@@ -150,7 +150,7 @@ func NewConn(tx FrameHandler, opts ...ConnOption) *Conn {
 }
 
 // Handle delivers one server frame to this Conn. Adapters call it for each
-// frame of a received envelop, in order (PROTOCOL.md §9.1).
+// frame of a received envelope, in order (PROTOCOL.md §9.1).
 func (c *Conn) Handle(ctx context.Context, f *Frame) error {
 	sid := f.GetSid()
 

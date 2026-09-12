@@ -18,7 +18,7 @@
 // It also runs in ONE process. There is no socket, no port number to announce
 // and no stdin to watch for the parent going away: the client is the same node
 // process that instantiated this module, and everything crosses as marshaled
-// Envelop bytes over the port (§4.1).
+// Envelope bytes over the port (§4.1).
 //
 // It serves TWO servers, which is the other thing only this fixture can prove.
 // One instance may run several — a second drpc.Server with its own registry and
@@ -40,7 +40,7 @@
 //	                 set before Serve so they exist by the time it fires)
 //	drpcAdmin(port)  the second server's entry point, published one event-loop
 //	                 turn after readiness, so a dial to it necessarily WAITS
-//	drpcStop()       Gateway.Close: the empty-envelop goodbye on every served
+//	drpcStop()       Gateway.Close: the empty-envelope goodbye on every served
 //	                 port, so the TS side can prove that a peer which says
 //	                 goodbye tears its peer's calls down (§4.5)
 //	drpcExit()       os.Exit: the instance dies saying nothing — no deferred

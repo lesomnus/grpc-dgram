@@ -83,7 +83,7 @@ jobs:
 
       # The comparison runs below stay on the root package (`.`): benchstat
       # wants a number a shared runner can reproduce, and a loopback write
-      # syscall is not one. The measurement that decided Envelop batching ran
+      # syscall is not one. The measurement that decided Envelope batching ran
       # once on a quiet machine instead — docs/batching-measurement.md — and
       # its harness was retired with the question.
       - name: Lookup last successful commit

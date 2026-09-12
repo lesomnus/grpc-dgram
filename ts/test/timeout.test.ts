@@ -293,11 +293,11 @@ describe('at-most-once (§9.2, §9.4, §14)', () => {
   })
 })
 
-describe('multi-frame envelops (§4.1)', () => {
-  it('frames later in an envelop land on the call created earlier in it', async () => {
+describe('multi-frame envelopes (§4.1)', () => {
+  it('frames later in an envelope land on the call created earlier in it', async () => {
     // An inject server (recording tx, no live client — the Go
-    // TestWireShape_MultiFrameEnvelop shape): two sequential awaited
-    // handle() calls are exactly what unpack() does for a 2-frame envelop.
+    // TestWireShape_MultiFrameEnvelope shape): two sequential awaited
+    // handle() calls are exactly what unpack() does for a 2-frame envelope.
     const sent: Frame[] = []
     const server = new Server({ handle: (f: Frame) => void sent.push(f) }, { reliable: false, timing: fast })
     registerEcho(server)

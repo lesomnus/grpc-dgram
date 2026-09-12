@@ -1,6 +1,6 @@
 # transport/udp
 
-dRPC over UDP datagrams: **one datagram carries one marshaled `Envelop`**, the
+dRPC over UDP datagrams: **one datagram carries one marshaled `Envelope`**, the
 channel is unreliable (dRPC's default mode, timers on), and nothing is ever
 fragmented. This is the sensor-stream path.
 
@@ -51,11 +51,11 @@ conn.Close(nil)
 
 | Option | Default | Meaning |
 |---|---|---|
-| `WithMaxMessageSize(n)` | `DefaultMaxMessageSize` (1200 B) | largest marshaled `Envelop` this endpoint will **send**; receives accept any datagram |
+| `WithMaxMessageSize(n)` | `DefaultMaxMessageSize` (1200 B) | largest marshaled `Envelope` this endpoint will **send**; receives accept any datagram |
 
 ## Caveats
 
-- **One message = one datagram, never fragmented.** A marshaled envelop over
+- **One message = one datagram, never fragmented.** A marshaled envelope over
   the limit is refused at send and the owning call fails with
   `ResourceExhausted`. The 1200 B default stays under the typical 1500 B path
   MTU; raise it only if you control the path. Keep messages small — natural

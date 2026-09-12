@@ -32,7 +32,7 @@ teardown to remember. What is left for the application is what only it can
 decide: when to dial another connection, and when to close.
 
 The wire underneath is [`transport/port`](../transport/port) — one posted
-message per marshaled `Envelop` (`PROTOCOL.md` §4.1), byte for byte the
+message per marshaled `Envelope` (`PROTOCOL.md` §4.1), byte for byte the
 WebSocket wire — and the running example is
 [`examples/browser-wasm`](../../../examples/browser-wasm).
 
@@ -324,6 +324,6 @@ stack knows the file's name, let alone where it comes from.
 - **A wasm server has no trust boundary in front of it.** The port is exactly
   as trustworthy as the code holding its other end (`PROTOCOL.md` §15), and
   with `{ worker: false }` the page holds both.
-- Everything the transport itself does — the goodbye, the ignored non-envelop
+- Everything the transport itself does — the goodbye, the ignored non-envelope
   message, backpressure, the `Worker` it never terminates — is
   [`transport/port`](../transport/port), unchanged.

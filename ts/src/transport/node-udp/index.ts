@@ -1,5 +1,5 @@
 // drpc over UDP datagrams on Node.js: one datagram carries one marshaled
-// Envelop, the channel is unreliable (drpc's default mode), and nothing is
+// Envelope, the channel is unreliable (drpc's default mode), and nothing is
 // ever fragmented — a message over the size limit is refused at send with
 // MessageTooLargeError, which the core surfaces as RESOURCE_EXHAUSTED on the
 // owning call (PROTOCOL.md §4.4). This is the TS twin of the Go
@@ -21,7 +21,7 @@ import { MessageTooLargeError } from '../../status'
 import type { Server } from '../../server'
 import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '../../seam'
 import { unpack } from '../../seam'
-import { decodeEnvelop, encodeEnvelop, type Frame } from '../../wire'
+import { decodeEnvelope, encodeEnvelope, type Frame } from '../../wire'
 
 // DefaultMaxMessageSize keeps a datagram under the typical 1500-byte path MTU
 // with room for IP/UDP headers and a tunnel or two.
@@ -77,7 +77,7 @@ export class UdpTransport implements FrameHandler, TransportInfo, ConnAttacher {
     this.socket.on('message', (data) => {
       let frames: Frame[]
       try {
-        frames = decodeEnvelop(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
+        frames = decodeEnvelope(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
       } catch {
         return // malformed datagram: dropped, never a teardown (§4.2)
       }
@@ -98,12 +98,12 @@ export class UdpTransport implements FrameHandler, TransportInfo, ConnAttacher {
     this.socket.on('close', () => this.conn?.close())
   }
 
-  // sendFrames writes these frames as ONE datagram — one marshaled Envelop of
+  // sendFrames writes these frames as ONE datagram — one marshaled Envelope of
   // 1..n frames is the wire unit either way (PROTOCOL.md §4.1) — refusing an
-  // oversize envelop synchronously with MessageTooLargeError before anything
+  // oversize envelope synchronously with MessageTooLargeError before anything
   // reaches the socket (§4.4).
   //
-  // It is the envelop-level seam a batching middleware flushes through. The
+  // It is the envelope-level seam a batching middleware flushes through. The
   // library ships no batcher: what may share a datagram (which couples the
   // frames' fate under loss, §4.1) and how long a frame may wait for company
   // (§10.7) are answerable only against a workload. A user subclasses this
@@ -115,14 +115,14 @@ export class UdpTransport implements FrameHandler, TransportInfo, ConnAttacher {
   // connected socket's only one. On a gateway it is a duty, not a given — see
   // UdpGateway.sendFrames.
   sendFrames(frames: readonly Frame[]): Promise<void> {
-    const data = encodeEnvelop(frames)
+    const data = encodeEnvelope(frames)
     if (this.max > 0 && data.length > this.max) {
-      throw new MessageTooLargeError(`node-udp: ${data.length}-byte envelop over the ${this.max}-byte limit`)
+      throw new MessageTooLargeError(`node-udp: ${data.length}-byte envelope over the ${this.max}-byte limit`)
     }
     return sendDatagram(this.socket, data)
   }
 
-  // handle sends one frame as a single-frame envelop: the no-batching default
+  // handle sends one frame as a single-frame envelope: the no-batching default
   // (PROTOCOL.md §4.1), and always conformant.
   handle(f: Frame): Promise<void> {
     return this.sendFrames([f])
@@ -176,7 +176,7 @@ export class UdpGateway implements FrameHandler {
         this.peers.set(key, { port: rinfo.port, address: rinfo.address })
         let frames: Frame[]
         try {
-          frames = decodeEnvelop(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
+          frames = decodeEnvelope(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
         } catch {
           return
         }
@@ -188,7 +188,7 @@ export class UdpGateway implements FrameHandler {
   }
 
   // sendFrames writes these frames as ONE datagram to the peer named in ctx —
-  // the envelop-level seam a batching middleware flushes through (PROTOCOL.md
+  // the envelope-level seam a batching middleware flushes through (PROTOCOL.md
   // §4.1), as on the client transport.
   //
   // The ctx IS the address (§6.4): the whole datagram goes to the one peer it
@@ -205,14 +205,14 @@ export class UdpGateway implements FrameHandler {
     if (target === undefined) {
       return Promise.reject(new Error(`node-udp: peer ${key} is unknown`))
     }
-    const data = encodeEnvelop(frames)
+    const data = encodeEnvelope(frames)
     if (this.max > 0 && data.length > this.max) {
-      throw new MessageTooLargeError(`node-udp: ${data.length}-byte envelop over the ${this.max}-byte limit`)
+      throw new MessageTooLargeError(`node-udp: ${data.length}-byte envelope over the ${this.max}-byte limit`)
     }
     return sendDatagram(this.socket, data, target)
   }
 
-  // handle sends one frame as a single-frame envelop to the peer named in ctx:
+  // handle sends one frame as a single-frame envelope to the peer named in ctx:
   // the no-batching default (§4.1).
   handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
     return this.sendFrames([f], ctx)

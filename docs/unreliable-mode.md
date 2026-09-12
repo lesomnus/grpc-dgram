@@ -393,7 +393,7 @@ knob there would buy nothing but a setting two implementations could disagree
 on. And one knob lives outside the core — message size is the adapter's
 business (§4.4), so `udp.WithMaxMessageSize(n)` — or
 `webtransport.WithMaxMessageSize(n)`; 1200 bytes by default either way —
-decides whether a marshaled envelop fits a datagram; an oversize send is refused
+decides whether a marshaled envelope fits a datagram; an oversize send is refused
 synchronously as `ResourceExhausted` on the owning call, never as silent loss.
 
 ## Where to look next

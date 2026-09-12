@@ -2,7 +2,7 @@
 
 dRPC over WebTransport datagrams
 ([quic-go/webtransport-go](https://github.com/quic-go/webtransport-go)):
-**one datagram carries one marshaled `Envelop`**, the channel is unreliable
+**one datagram carries one marshaled `Envelope`**, the channel is unreliable
 (dRPC's default mode, timers on), and nothing is ever fragmented. This is the
 browser's sensor-stream path: a page reaches a server with a URL and nothing
 else — no signaling, no second server — and gets the mode the protocol is
@@ -106,7 +106,7 @@ wire-compatible with this adapter.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `WithMaxMessageSize(n)` | `DefaultMaxMessageSize` (1200 B) | largest marshaled `Envelop` this endpoint will **send**; receives accept any datagram |
+| `WithMaxMessageSize(n)` | `DefaultMaxMessageSize` (1200 B) | largest marshaled `Envelope` this endpoint will **send**; receives accept any datagram |
 
 The default is a constant, not "what the session reports": webtransport-go
 exposes no max-datagram-size getter. quic-go's ceiling right after the
@@ -148,7 +148,7 @@ number, fits from the first packet. The browser side reports
 
 ## Caveats
 
-- **One message = one datagram, never fragmented.** A marshaled envelop over
+- **One message = one datagram, never fragmented.** A marshaled envelope over
   the limit is refused at send and the owning call fails with
   `ResourceExhausted`; the session stays up. The QUIC stack keeps its own,
   path-dependent ceiling underneath: raising the option past it does not
@@ -179,7 +179,7 @@ number, fits from the first packet. The browser side reports
   the H3 server's `QUICConfig` alike. Received datagrams past the stack's
   per-session queue (32) are dropped — datagram semantics, and the pump
   keeps up.
-- **Received garbage is ignored.** Unparseable envelops are dropped; they
+- **Received garbage is ignored.** Unparseable envelopes are dropped; they
   never tear the session down.
 - The wire is encrypted by QUIC, but the protocol itself authenticates
   nothing beyond the session — see `PROTOCOL.md` §15.

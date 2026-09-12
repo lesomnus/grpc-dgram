@@ -1,7 +1,7 @@
 # transport/gorilla
 
 dRPC over WebSocket ([gorilla/websocket](https://github.com/gorilla/websocket)):
-**one binary message carries one marshaled `Envelop`**. The transport is
+**one binary message carries one marshaled `Envelope`**. The transport is
 reliable and ordered, so the core auto-detects reliable mode and runs with
 every protocol timer off — plain gRPC semantics over a WebSocket.
 
@@ -66,7 +66,7 @@ conn.Close(nil)
   equal to the keepalive timeout: a peer that stops draining would otherwise
   block a send forever with no timer to save it. A stalled write is treated
   as transport death.
-- Received non-binary messages and unparseable envelops are ignored; they
+- Received non-binary messages and unparseable envelopes are ignored; they
   never tear the connection down.
 - **Use `wss://`** (or a trusted network): the protocol itself has no
   authentication or encryption — see `PROTOCOL.md` §15.

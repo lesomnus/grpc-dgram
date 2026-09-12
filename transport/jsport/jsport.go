@@ -1,7 +1,7 @@
 //go:build js && wasm
 
 // Package jsport runs drpc over a JS message port: one posted message carries
-// one marshaled Envelop as a Uint8Array (PROTOCOL.md §4.1) — byte for byte
+// one marshaled Envelope as a Uint8Array (PROTOCOL.md §4.1) — byte for byte
 // the WebSocket wire, so a peer here and a peer behind transport/gorilla speak
 // the same protocol.
 //
@@ -25,7 +25,7 @@
 // the protocol no longer covers — teardown (§4.5) — and there is no socket to
 // die here, so death has to be said out loud. Two mechanisms, both required:
 //
-//   - The goodbye is an empty message. A 0-byte message is a marshaled Envelop
+//   - The goodbye is an empty message. A 0-byte message is a marshaled Envelope
 //     with zero frames, which the wire never otherwise carries (§4.1 says
 //     1..n), so it is free to mean "this endpoint is going away". Close posts
 //     one; a pump that reads an empty message treats it as EOF, exits, and the
@@ -95,10 +95,10 @@ type options struct {
 
 type Option func(*options)
 
-// WithMaxMessageSize sets the largest marshaled Envelop this endpoint will
+// WithMaxMessageSize sets the largest marshaled Envelope this endpoint will
 // send, in bytes; 0 (the default) means unlimited. It bounds sends only;
 // receives accept any message. Set it for a peer whose path caps message size
-// (a Worker pool with its own framing, a relay) — an envelop past it is
+// (a Worker pool with its own framing, a relay) — an envelope past it is
 // refused synchronously and the core fails the owning call with
 // ResourceExhausted (PROTOCOL.md §4.4).
 func WithMaxMessageSize(n int) Option {
@@ -215,17 +215,17 @@ func (t *Transport) Peer() *peer.Peer {
 	return &peer.Peer{Addr: portAddr{label: t.p.label}}
 }
 
-// Handle sends one frame as a single-frame envelop.
+// Handle sends one frame as a single-frame envelope.
 func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return t.Send(ctx, e)
 }
 
-// Send transmits one envelop as one posted message. An envelop over the size
+// Send transmits one envelope as one posted message. An envelope over the size
 // limit is refused synchronously with an error wrapping drpc.ErrMessageTooLarge
 // (PROTOCOL.md §4.4); a send racing the teardown fails Unavailable.
-func (t *Transport) Send(_ context.Context, e *drpc.Envelop) error {
+func (t *Transport) Send(_ context.Context, e *drpc.Envelope) error {
 	return t.p.send(e)
 }
 
@@ -416,15 +416,15 @@ func isPort(v js.Value) bool {
 	return v.Type() == js.TypeObject && v.Get("postMessage").Type() == js.TypeFunction
 }
 
-// Handle sends one frame as a single-frame envelop to the peer named in ctx.
+// Handle sends one frame as a single-frame envelope to the peer named in ctx.
 func (g *Gateway) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return g.Send(ctx, e)
 }
 
-// Send transmits one envelop as one posted message to the peer named in ctx.
-func (g *Gateway) Send(ctx context.Context, e *drpc.Envelop) error {
+// Send transmits one envelope as one posted message to the peer named in ctx.
+func (g *Gateway) Send(ctx context.Context, e *drpc.Envelope) error {
 	key, ok := drpc.PeerFromContext(ctx)
 	if !ok {
 		return errors.New("jsport: no peer in context")

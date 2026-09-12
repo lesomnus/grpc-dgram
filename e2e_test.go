@@ -40,13 +40,13 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 		l = x.NopLogger{}
 	}
 
-	// The wire carries one marshaled Envelop per message (PROTOCOL.md §4.1),
+	// The wire carries one marshaled Envelope per message (PROTOCOL.md §4.1),
 	// so frames round-trip through real serialization.
 	ca := make(chan []byte, 256) // server -> client
 	cb := make(chan []byte, 256) // client -> server
 
 	wire := func(ch chan []byte) drpc.FrameHandler {
-		return drpc.Wrap1(drpc.EnvelopHandlerFunc(func(_ context.Context, e *drpc.Envelop) error {
+		return drpc.Wrap1(drpc.EnvelopeHandlerFunc(func(_ context.Context, e *drpc.Envelope) error {
 			data, err := proto.Marshal(e)
 			if err != nil {
 				return err
@@ -98,7 +98,7 @@ func (o PipeOption) Build(t *testing.T) (*Client, func()) {
 				case <-ctx.Done():
 					return
 				case data := <-ch:
-					e := &drpc.Envelop{}
+					e := &drpc.Envelope{}
 					if err := proto.Unmarshal(data, e); err != nil {
 						panic(err)
 					}

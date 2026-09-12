@@ -1,7 +1,7 @@
 # `@lesomnus/grpc-dgram/transport/webrtc`
 
 dRPC over **WebRTC DataChannels** — the TS twin of the Go `transport/pion`
-adapter. One channel message carries one marshaled `Envelop`, and the protocol
+adapter. One channel message carries one marshaled `Envelope`, and the protocol
 mode is **derived from the channel's own configuration**: an ordered channel
 with no retransmit or lifetime cap runs reliable (all timers off, §10.6);
 anything else is unreliable and the full timer machinery is on. Same adapter,

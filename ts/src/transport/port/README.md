@@ -2,7 +2,7 @@
 
 dRPC over a **JS message port** — the TS twin of the Go `transport/jsport`
 adapter, and wire-compatible with it. **One posted message carries one
-marshaled `Envelop`**, byte for byte the WebSocket wire. A port neither loses,
+marshaled `Envelope`**, byte for byte the WebSocket wire. A port neither loses,
 duplicates nor reorders, so the core auto-detects reliable mode and runs with
 every protocol timer off (§10.6): plain gRPC semantics between two endpoints in
 one process.
@@ -165,14 +165,14 @@ longer there.
 ## The goodbye: an empty message
 
 There is no socket to die here, so **death has to be said out loud**. A 0-byte
-message decodes to an `Envelop` with zero frames, which the wire never
+message decodes to an `Envelope` with zero frames, which the wire never
 otherwise carries (§4.1 says 1..n), so it is free to mean *this endpoint is
 going away*. `close()` on either role posts one, best effort, before closing the
 port; the peer that reads it treats it as EOF, stops its pump and performs the
 §4.5 teardown — `conn.close()` / `server.disconnectPeer()`.
 
 What means EOF is the *empty message*, recognized by its byte count — not an
-envelop that merely decoded to no frames. `decodeEnvelop` skips envelop fields
+envelope that merely decoded to no frames. `decodeEnvelope` skips envelope fields
 it does not know, so a v1.2 extension, or another library's protobuf sharing
 the port, would otherwise be read as a close frame and tear a healthy channel
 down; anything non-empty that carries no frames is dropped like the malformed
@@ -220,7 +220,7 @@ partitioned, and an unanswered ping would only measure how busy the peer is.
   flight than the windows it was granted — per stream by the advertisement,
   in all by `limits.maxPeerWindow` (§4.2.1). A received frame is never
   dropped — a gap in reliable mode is a protocol error, not a lost datagram.
-- A message that is not a binary envelop (a string, another library's object
+- A message that is not a binary envelope (a string, another library's object
   sharing the port), an undecodable one, and a `messageerror` are all ignored;
   none of them tears the channel down (§4.2).
 - **If you write your own glue in Go/wasm**, the `message` callback must

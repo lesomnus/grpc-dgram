@@ -498,7 +498,7 @@ export class Server {
   }
 
   // handle delivers one client frame to this Server. Adapters call it for
-  // each frame of a received envelop, in order, with the peer in ctx,
+  // each frame of a received envelope, in order, with the peer in ctx,
   // awaiting each (PROTOCOL.md §9.1).
   async handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
     this.serving = true

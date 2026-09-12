@@ -47,7 +47,7 @@ export interface WorkerScope {
   postMessage(message: unknown): void
 }
 
-// The goodbye: a zero-frame envelop, which is exactly 0 bytes (PROTOCOL.md
+// The goodbye: a zero-frame envelope, which is exactly 0 bytes (PROTOCOL.md
 // §4.1 carries 1..n frames, so the empty message is free to mean "this
 // endpoint is going away"). Spelled out here rather than imported from
 // ../transport/port so the shipped worker carries none of the core — it never

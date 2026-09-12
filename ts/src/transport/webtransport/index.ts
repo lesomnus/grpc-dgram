@@ -1,6 +1,6 @@
 // drpc over WebTransport datagrams: one datagram carries one marshaled
-// Envelop, the channel is unreliable (drpc's default mode), and nothing is
-// ever fragmented — an envelop over the size limit is refused at send with
+// Envelope, the channel is unreliable (drpc's default mode), and nothing is
+// ever fragmented — an envelope over the size limit is refused at send with
 // MessageTooLargeError, which the core surfaces as RESOURCE_EXHAUSTED on the
 // owning call (PROTOCOL.md §4.4). This is the TS twin of the Go
 // `transport/webtransport` adapter and interoperates with it on the wire: a
@@ -32,7 +32,7 @@ import type { ConnAttacher, FrameHandler, TransportInfo } from '../../seam'
 import { unpack } from '../../seam'
 import { Code, MessageTooLargeError, StatusError } from '../../status'
 import { Latch, noop } from '../../util'
-import { decodeEnvelop, encodeEnvelop, type Frame } from '../../wire'
+import { decodeEnvelope, encodeEnvelope, type Frame } from '../../wire'
 
 // DefaultMaxMessageSize is the send ceiling when the session reports no
 // maxDatagramSize of its own: one QUIC packet on the typical 1500-byte path
@@ -73,7 +73,7 @@ export interface WebTransportLike {
 }
 
 export interface WebTransportDatagramOptions {
-  // Largest marshaled Envelop this endpoint will send, in bytes; 0 removes
+  // Largest marshaled Envelope this endpoint will send, in bytes; 0 removes
   // the adapter's check (the platform still drops what its own ceiling
   // refuses — silently). Unset, it follows the session once established —
   // its datagrams.maxDatagramSize at the time of each write, or
@@ -234,7 +234,7 @@ export class WebTransportDatagramTransport implements FrameHandler, TransportInf
         if (data === undefined) continue
         let frames: Frame[]
         try {
-          frames = decodeEnvelop(data)
+          frames = decodeEnvelope(data)
         } catch {
           continue // malformed datagram: dropped, never a teardown (§4.2)
         }
@@ -261,17 +261,17 @@ export class WebTransportDatagramTransport implements FrameHandler, TransportInf
     return typeof m === 'number' && m > 0 ? m : DefaultMaxMessageSize
   }
 
-  // check refuses an envelop over the ceiling as of now (PROTOCOL.md §4.4).
+  // check refuses an envelope over the ceiling as of now (PROTOCOL.md §4.4).
   private check(data: Uint8Array): void {
     const max = this.limit()
     if (max > 0 && data.length > max) {
-      throw new MessageTooLargeError(`webtransport: ${data.length}-byte envelop over the ${max}-byte limit`)
+      throw new MessageTooLargeError(`webtransport: ${data.length}-byte envelope over the ${max}-byte limit`)
     }
   }
 
-  // sendFrames writes these frames as ONE datagram — one marshaled Envelop of
+  // sendFrames writes these frames as ONE datagram — one marshaled Envelope of
   // 1..n frames is the wire unit either way (PROTOCOL.md §4.1) — gated on
-  // `ready`. An envelop over the ceiling is refused with MessageTooLargeError
+  // `ready`. An envelope over the ceiling is refused with MessageTooLargeError
   // before the platform, which would drop an oversize datagram silently, ever
   // sees it (§4.4): synchronously here, against the ceiling known now, and
   // once more at the write when the session was still connecting (see send) —
@@ -280,7 +280,7 @@ export class WebTransportDatagramTransport implements FrameHandler, TransportInf
   // when it goes out. The core treats the rejection as it does the throw: it
   // walks the cause chain for the refusal and reclaims the seq.
   //
-  // It is the envelop-level seam a batching middleware flushes through (§4.1).
+  // It is the envelope-level seam a batching middleware flushes through (§4.1).
   // The library ships no batcher: what may share a datagram (which couples
   // the frames' fate under loss) and how long a frame may wait for company
   // (§10.7) are answerable only against a workload. A user subclasses this
@@ -293,12 +293,12 @@ export class WebTransportDatagramTransport implements FrameHandler, TransportInf
   // It is sendFrames and not send because `send` below is the byte-level
   // write, one name a level down that means something else.
   sendFrames(frames: readonly Frame[]): Promise<void> {
-    const data = encodeEnvelop(frames)
+    const data = encodeEnvelope(frames)
     this.check(data)
     return this.send(data)
   }
 
-  // handle sends one frame as a single-frame envelop: the no-batching default
+  // handle sends one frame as a single-frame envelope: the no-batching default
   // (§4.1), and always conformant.
   handle(f: Frame): Promise<void> {
     return this.sendFrames([f])

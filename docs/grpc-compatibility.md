@@ -268,7 +268,7 @@ There is no endpoint-wide compressor option; apply one to every call with
 `drpc.WithDefaultCallOptions(grpc.UseCompressor("gzip"))`.
 
 Message *size* is a separate axis from the caps above. The per-call caps
-measure one message; the adapter measures the whole marshaled `Envelop` and
+measure one message; the adapter measures the whole marshaled `Envelope` and
 owns the ceiling (§4.4). `transport/udp` refuses anything over 1200 bytes by
 default and the owning call fails `ResourceExhausted`; a reliable transport
 carries any size. The core never fragments.

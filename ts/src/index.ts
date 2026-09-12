@@ -76,9 +76,9 @@ export {
 export { hasConnAttacher, hasTransportInfo, unpack, type ConnAttacher, type FrameContext, type FrameHandler, type TransportInfo } from './seam'
 export { Counters, type CounterSnapshot, type ProtocolEvent, type ProtocolEventKind, type ProtocolStats } from './stats'
 export {
-  decodeEnvelop,
+  decodeEnvelope,
   decodeFrame,
-  encodeEnvelop,
+  encodeEnvelope,
   encodeFrame,
   FlagClose,
   FlagCompressed,

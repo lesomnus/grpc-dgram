@@ -8,7 +8,7 @@ import "time"
 // override discovery. See PROTOCOL.md §4.3.
 //
 // Message size, MTU, and fragmentation are deliberately absent: the core
-// deals in whole Envelops and never fragments; whether and how a message
+// deals in whole Envelopes and never fragments; whether and how a message
 // fits the channel is the adapter's concern (PROTOCOL.md §4.4).
 type TransportInfo interface {
 	// Reliable reports that the transport neither loses, duplicates, nor

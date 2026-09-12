@@ -1,7 +1,7 @@
 # transport/jsport
 
 dRPC over a JS message port: **one posted message carries one marshaled
-`Envelop`** as a `Uint8Array` — byte for byte the WebSocket wire, so a peer
+`Envelope`** as a `Uint8Array` — byte for byte the WebSocket wire, so a peer
 here and a peer behind [`transport/gorilla`](../gorilla) speak the same
 protocol. A port neither loses, duplicates nor reorders, so the core
 auto-detects reliable mode and runs with every protocol timer off: plain gRPC
@@ -183,14 +183,14 @@ itself — no goroutine to manage — and the transport owns the port from then 
 ## The goodbye: an empty message
 
 There is no socket to die here, so death has to be said out loud. **A 0-byte
-message is this adapter's close frame.** It is a marshaled `Envelop` with zero
+message is this adapter's close frame.** It is a marshaled `Envelope` with zero
 frames, which the wire never otherwise carries (`PROTOCOL.md` §4.1 says 1..n),
 so it is free to mean *this endpoint is going away*. `Close` posts one; a
 receiver that reads an empty message treats it as EOF, and the §4.5 teardown
 runs — `Conn.Close` on the client, `Server.DisconnectPeer` on the server.
 
 The close frame is the *empty message*, not merely one that decodes to no
-frames: protobuf keeps fields it does not know, so a later envelop extension —
+frames: protobuf keeps fields it does not know, so a later envelope extension —
 or two bytes of another library's traffic on the same port — decodes to zero
 frames as well, and reading any of those as EOF would tear a healthy channel
 down over input §4.2 says to drop. Both halves check the byte length;
@@ -239,7 +239,7 @@ teardown.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `WithMaxMessageSize(n)` | 0 (unlimited) | largest marshaled `Envelop` this endpoint will **send**; structured clone has no protocol ceiling, so set it only for a path that caps message size |
+| `WithMaxMessageSize(n)` | 0 (unlimited) | largest marshaled `Envelope` this endpoint will **send**; structured clone has no protocol ceiling, so set it only for a path that caps message size |
 | `WithTransfer(v)` | `true` | hand the message's `ArrayBuffer` over on the transfer list instead of copying it — safe because the adapter allocates it per message |
 | `WithLabel(s)` | `"port"` | what `Peer()` reports, and the address handlers read through `peer.FromContext`; a port has no address of its own |
 | `WithEntryPoint(name)` | `"drpcServe"` | the global `Gateway.Serve` publishes; the name is the entire handshake with the host, so change it on both sides — it is how one instance serves two servers (below) |
@@ -291,7 +291,7 @@ calls do exactly that; a busy spin wedges the process.
   "this endpoint is going away" means there, but do not call it expecting the
   worker to survive.
 - Messages that are not `ArrayBufferView`s, views that do not decode as an
-  `Envelop`, and non-empty views that decode to no frames are all ignored: a
+  `Envelope`, and non-empty views that decode to no frames are all ignored: a
   page may post its own traffic down the same port, and frame-level errors
   never tear the channel down (§4.2).
 - **The port is as trustworthy as the code on its other end.** There is no

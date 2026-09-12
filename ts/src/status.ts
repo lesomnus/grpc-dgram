@@ -42,7 +42,7 @@ export function statusError(code: Code, desc: string): StatusError {
 }
 
 // MessageTooLargeError is thrown (or set as a `cause`) by an adapter's
-// handle when a marshaled envelop cannot fit the transport's message limit.
+// handle when a marshaled envelope cannot fit the transport's message limit.
 // The core never fragments; it maps this to RESOURCE_EXHAUSTED on the owning
 // call (PROTOCOL.md §4.4). It also reclaims the refused frame's seq — the
 // refusal MUST be synchronous in the sense that no later frame of the stream

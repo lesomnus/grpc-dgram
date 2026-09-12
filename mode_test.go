@@ -35,12 +35,12 @@ func newMixedPipe(t *testing.T) *mixedPipe {
 	p := &mixedPipe{}
 
 	send := func(conn **drpc.Conn) drpc.FrameHandler {
-		return drpc.Wrap1(drpc.EnvelopHandlerFunc(func(ctx context.Context, e *drpc.Envelop) error {
+		return drpc.Wrap1(drpc.EnvelopeHandlerFunc(func(ctx context.Context, e *drpc.Envelope) error {
 			data, err := proto.Marshal(e)
 			if err != nil {
 				return err
 			}
-			de := &drpc.Envelop{}
+			de := &drpc.Envelope{}
 			if err := proto.Unmarshal(data, de); err != nil {
 				return err
 			}

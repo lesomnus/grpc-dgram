@@ -1,5 +1,5 @@
 // The drpc wire format (PROTOCOL.md §5): a hand-rolled protobuf codec for
-// exactly three messages — Frame, Envelop, Metadata (plus the two well-known
+// exactly three messages — Frame, Envelope, Metadata (plus the two well-known
 // messages they embed, Duration and Any) — so the core carries no protobuf
 // runtime dependency. The encoding must stay byte-identical to the Go
 // implementation for the §5 golden vectors (wire.test.ts): fields are written
@@ -422,7 +422,7 @@ function decodeMetadata(data: Uint8Array): Metadata {
 }
 
 // ---------------------------------------------------------------------------
-// Frame / Envelop
+// Frame / Envelope
 // ---------------------------------------------------------------------------
 
 export function encodeFrame(f: Frame): Uint8Array {
@@ -539,15 +539,15 @@ export function decodeFrame(data: Uint8Array): Frame {
   return f
 }
 
-// The wire unit is always one marshaled Envelop per transport message,
+// The wire unit is always one marshaled Envelope per transport message,
 // holding 1..n frames processed in order (PROTOCOL.md §4.1).
-export function encodeEnvelop(frames: readonly Frame[]): Uint8Array {
+export function encodeEnvelope(frames: readonly Frame[]): Uint8Array {
   const w = new Writer()
   for (const f of frames) w.bytes(1, encodeFrame(f))
   return w.finish()
 }
 
-export function decodeEnvelop(data: Uint8Array): Frame[] {
+export function decodeEnvelope(data: Uint8Array): Frame[] {
   const frames: Frame[] = []
   const r = new Reader(data)
   while (!r.eof) {

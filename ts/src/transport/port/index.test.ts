@@ -3,7 +3,7 @@
 // that must work end to end, and a mock port pair for the paths a real port
 // cannot produce — a postMessage that throws, a port with only `onmessage`, a
 // port that refuses transfer lists, and a channel where nothing but messages
-// crosses, which is what proves the empty-envelop goodbye (§4.5) does the
+// crosses, which is what proves the empty-envelope goodbye (§4.5) does the
 // teardown by itself.
 //
 // Covers the reliable echo round trip with zero mode options (the TS side of
@@ -209,7 +209,7 @@ describe('reliable port echo (the jsport pair, TS side)', () => {
     await net.serving
   })
 
-  it('carries a 256 KiB envelop: no size ceiling by default (§4.4)', async () => {
+  it('carries a 256 KiB envelope: no size ceiling by default (§4.4)', async () => {
     const net = realEnds()
     const text = 'x'.repeat(256 * 1024)
     expect(await net.conn.invoke(echo.once, { text })).toEqual({ text: `echo:${text}` })
@@ -240,11 +240,11 @@ describe('reliable port echo (the jsport pair, TS side)', () => {
   })
 })
 
-describe('one message per envelop, transferred (§4.1)', () => {
+describe('one message per envelope, transferred (§4.1)', () => {
   it('hands the buffer over instead of copying it', async () => {
     const net = mockEnds()
     expect(await net.conn.invoke(echo.once, { text: 'hi' })).toEqual({ text: 'echo:hi' })
-    expect(net.a.sent).toHaveLength(1) // one marshaled Envelop per message
+    expect(net.a.sent).toHaveLength(1) // one marshaled Envelope per message
     expect(net.a.transfers).toBe(1)
     net.conn.close()
     await net.serving
@@ -305,7 +305,7 @@ describe('one message per envelop, transferred (§4.1)', () => {
 })
 
 describe('message size (§4.4)', () => {
-  it('refuses an oversize envelop and the call fails RESOURCE_EXHAUSTED', async () => {
+  it('refuses an oversize envelope and the call fails RESOURCE_EXHAUSTED', async () => {
     const net = realEnds({ client: { maxMessageSize: 128 } })
     const err = (await net.conn.invoke(echo.once, { text: 'x'.repeat(500) }).catch((e) => e)) as StatusError
     expect(err.code).toBe(Code.RESOURCE_EXHAUSTED)
@@ -345,7 +345,7 @@ describe('teardown duty (§4.5)', () => {
     expect(handlerErr?.code).toBe(Code.UNAVAILABLE) // servePeer ran disconnectPeer on exit
   })
 
-  it('the empty-envelop goodbye is the whole teardown: nothing else crosses', async () => {
+  it('the empty-envelope goodbye is the whole teardown: nothing else crosses', async () => {
     const net = mockEnds()
     const stream = net.conn.newStream(echo.live, {})
     await stream.send({ text: 'x' })
@@ -355,7 +355,7 @@ describe('teardown duty (§4.5)', () => {
     const err = (await stream.recv().catch((e) => e)) as StatusError
     expect(err.code).toBe(Code.UNAVAILABLE)
     // The mock propagates no close and no error: the last thing the server
-    // posted was a 0-byte envelop, and that alone failed the live call.
+    // posted was a 0-byte envelope, and that alone failed the live call.
     expect(net.b.sent.at(-1)).toHaveLength(0)
     expect(await net.serving).toBeUndefined()
     await tick()
@@ -458,7 +458,7 @@ describe('nothing is delivered after close (§4.5)', () => {
     const net = mockEnds()
     expect(await net.conn.invoke(echo.once, { text: 'live' })).toEqual({ text: 'echo:live' })
     expect(net.counts.once).toBe(1)
-    const replay = net.a.sent[0] // the OPEN envelop the server already handled
+    const replay = net.a.sent[0] // the OPEN envelope the server already handled
     expect(replay).toBeDefined()
 
     const spy = vi.spyOn(net.server, 'handle')
@@ -481,7 +481,7 @@ describe('nothing is delivered after close (§4.5)', () => {
     transport.close()
     await tick()
     expect(conn.close).toHaveBeenCalledTimes(1) // the §4.5 teardown, exactly once
-    a.emit('message', { data: new Uint8Array([0x0a, 0x00]) }) // a well-formed envelop
+    a.emit('message', { data: new Uint8Array([0x0a, 0x00]) }) // a well-formed envelope
     await tick()
     expect(conn.handle).not.toHaveBeenCalled()
   })
@@ -493,7 +493,7 @@ describe('malformed messages are ignored, never fatal (§4.2)', () => {
     expect(await net.conn.invoke(echo.once, { text: 'before' })).toEqual({ text: 'echo:before' })
 
     net.a.postMessage('hello' as unknown as Uint8Array) // some other library sharing the port
-    net.a.postMessage({ kind: 'not-an-envelop' } as unknown as Uint8Array)
+    net.a.postMessage({ kind: 'not-an-envelope' } as unknown as Uint8Array)
     net.a.postMessage(new Uint8Array([0xff, 0xff, 0xff])) // truncated varint
     await settle()
 
@@ -509,9 +509,9 @@ describe('malformed messages are ignored, never fatal (§4.2)', () => {
 
     const exited = vi.fn()
     void net.serving.then(exited)
-    // A well-formed protobuf whose only field is one the envelop does not
+    // A well-formed protobuf whose only field is one the envelope does not
     // know — a v1.2 extension, or another library's message sharing the port.
-    // decodeEnvelop skips unknown fields, so it yields zero frames; reading
+    // decodeEnvelope skips unknown fields, so it yields zero frames; reading
     // THAT as the peer's close frame would tear a healthy channel down over
     // input §4.2 says to drop. The close frame is the empty message, nothing
     // else.

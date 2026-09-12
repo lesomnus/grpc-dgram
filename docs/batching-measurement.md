@@ -1,4 +1,4 @@
-# Envelop batching: the measurement (issue #5)
+# Envelope batching: the measurement (issue #5)
 
 `docs/TODO.md` §1 deferred the `Coalescer` behind one entry condition: "a
 benchmark that shows syscall or header overhead dominating at a real message
@@ -43,7 +43,7 @@ One frame is one datagram today, so the send path is charged once per message.
 | 1024 B | 370 | 4040 | 5053 | 1013 | 4 | 1073 | 4.57% | 10 |
 
 The syscall is `raw write`; `Handle − raw write` is everything the adapter adds
-on top of it: the marshal, and the envelop and one-frame slice it allocates
+on top of it: the marshal, and the envelope and one-frame slice it allocates
 around every frame. The frame itself is the core's (`core send`, below).
 Header share counts both the per-frame Frame header and the per-datagram 28 B
 IPv4+UDP header; only the second is amortised by batching.
@@ -145,7 +145,7 @@ The measured column is the largest k the run has a number for, at or below `k/al
 
 ### 1024 B payload
 
-No k > 1 fits: two frames are 2090 B of Envelop, over the 1200 B budget,
+No k > 1 fits: two frames are 2090 B of Envelope, over the 1200 B budget,
 so batching cannot apply at this size.
 
 ## Rule check
@@ -189,7 +189,7 @@ itself a check on the run.
 **The transport is the cost of a message, and the syscall is the transport.**
 At 22 B, `Handle` is 4727 ns of the 5442 ns a `SendMsg` takes, and 3936 ns of
 that `Handle` is the bare `write`. The core's own half — codec marshal, frame,
-seq, flow-control check — is 376 ns. Marshalling the `Envelop` is 198 ns.
+seq, flow-control check — is 376 ns. Marshalling the `Envelope` is 198 ns.
 Nothing else is worth looking at.
 
 **Batching removes almost all of it.** At 22 B, 29 frames fit one datagram and
@@ -211,7 +211,7 @@ unbatched and 4.9% batched. That is a different workload from the one
 **On the wire the picture is the same shape.** At 22 B a frame is 69 B on the
 wire and 47 of them are header, but only the 28 B IPv4+UDP part is
 recoverable: the 19 B `Frame` header is per frame and rides inside the
-envelop either way (§4.1). Batching 29 of them takes the frame from 69 B to
+envelope either way (§4.1). Batching 29 of them takes the frame from 69 B to
 42 B, 39% off. At 100 B it is 17% off, and at 1 KiB no two frames fit one
 1200 B datagram at all, so batching cannot apply.
 

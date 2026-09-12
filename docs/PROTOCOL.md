@@ -80,7 +80,7 @@ Non-goals:
   incarnation, identified by the two epochs (§6.1).
 - **Unreliable / reliable mode** — per §4.3.
 - **Batching middleware** — an application-supplied `FrameHandler` (§3) that
-  packs several frames into one envelop. This document states its duties but
+  packs several frames into one envelope. This document states its duties but
   defines no such component: the policy is workload-specific (§4.1).
 - **Validated frame** — defined in §9.1; load-bearing for liveness (§10.4)
   and the idle clocks (§10.5).
@@ -88,8 +88,8 @@ Non-goals:
 ## 3. Architecture
 
 ```
-generated stubs ──> drpc.Conn ──(FrameHandler)──> [Wrap1 | batching middleware] ──(EnvelopHandler)──> adapter ──> channel
-generated impls <── drpc.Server <──(Handle per frame)── adapter (unpacks Envelop) <── channel
+generated stubs ──> drpc.Conn ──(FrameHandler)──> [Wrap1 | batching middleware] ──(EnvelopeHandler)──> adapter ──> channel
+generated impls <── drpc.Server <──(Handle per frame)── adapter (unpacks Envelope) <── channel
 ```
 
 Two seams:
@@ -97,18 +97,18 @@ Two seams:
 ```go
 // Core-facing: the core emits and consumes individual frames.
 type FrameHandler   interface { Handle(ctx context.Context, f *Frame) error }
-// Adapter-facing: the wire unit is always an Envelop (§4.1).
-type EnvelopHandler interface { Handle(ctx context.Context, e *Envelop) error }
+// Adapter-facing: the wire unit is always an Envelope (§4.1).
+type EnvelopeHandler interface { Handle(ctx context.Context, e *Envelope) error }
 ```
 
 - tx path: the core writes frames to a `FrameHandler`. `drpc.Wrap1(a)` adapts an
-  `EnvelopHandler` by wrapping each frame in a 1-frame envelop — the
+  `EnvelopeHandler` by wrapping each frame in a 1-frame envelope — the
   no-batching default. This is a **seam, not a component**: batching policy is
   workload-specific (§4.1), so this document defines no batcher and an
   implementation need not ship one. An application that wants batching
   installs its own `FrameHandler` here; the duties below bind whatever it
   installs.
-- rx path: the adapter reads a transport message, unmarshals **one `Envelop`**,
+- rx path: the adapter reads a transport message, unmarshals **one `Envelope`**,
   and calls `Conn.Handle`/`Server.Handle` once per contained frame, in order,
   attaching the peer to `ctx` (§6.4).
 - Middleware note: wrapping hides interfaces obtained by type assertion, and
@@ -125,42 +125,42 @@ type EnvelopHandler interface { Handle(ctx context.Context, e *Envelop) error }
 
 ### 4.1 Framing and batching
 
-- The wire unit is always **one marshaled `Envelop` per transport
+- The wire unit is always **one marshaled `Envelope` per transport
   message/datagram**, containing 1..n `Frame`s:
 
   ```proto
-  message Envelop { repeated Frame frames = 1; }
+  message Envelope { repeated Frame frames = 1; }
   ```
 
 - Receivers MUST process contained frames in order (frames of one call may
-  share an envelop — e.g. OPEN + data; creation happens mid-envelop and later
-  frames land on the new stream). An empty envelop is dropped.
-- The core never *emits* an empty envelop, so an adapter on a channel with no
+  share an envelope — e.g. OPEN + data; creation happens mid-envelope and later
+  frames land on the new stream). An empty envelope is dropped.
+- The core never *emits* an empty envelope, so an adapter on a channel with no
   death signal of its own MAY claim the **empty message** as its own close
   frame — `transport/jsport` does exactly that (§4.5). This is adapter-local
   framing, not protocol, and it MUST key on the zero-byte message rather than
   on "decoded to no frames": unknown fields decode to no frames too, and
   reading one of those as a close would tear down a healthy channel over input
   §4.2 says to drop.
-- **Loss atomicity:** an envelop is lost/duplicated/reordered as a unit; every
+- **Loss atomicity:** an envelope is lost/duplicated/reordered as a unit; every
   frame inside shares that fate. Batching couples the fates of otherwise
   independent frames — the sender's choice.
 - Batching is **sender-local policy**, invisible to the protocol, and this
   document specifies no batcher. The two *policy* questions a batcher has to
-  answer — *what may share an envelop* and *how long a frame may wait for
+  answer — *what may share an envelope* and *how long a frame may wait for
   company* —
   are answerable only against a workload: the first trades the loss
   independence above for bytes, the second trades latency (§10.7) for them.
   Neither has a default that is right for every application, so both belong
   to the application: it installs a **batching middleware** (§3) that packs
-  queued frames while the marshaled envelop stays within its own byte budget
+  queued frames while the marshaled envelope stays within its own byte budget
   (§4.4), flushing on a delay budget (`MaxDelay`, cited by §10.7), on budget
   exhaustion, or on an explicit flush. Retransmission ticks (§10.3) batch
-  naturally into one envelop.
+  naturally into one envelope.
 - What is **not** the application's to choose are the duties of the seam
   itself. They bind whatever is installed there, and every one of them fails
   silently:
-  - **One destination per envelop.** An envelop is addressed by the `ctx` of
+  - **One destination per envelope.** An envelope is addressed by the `ctx` of
     the call that hands it to the adapter (§6.4), never by anything inside its
     frames: on a multi-peer adapter — every gateway — the whole datagram goes
     to the peer named in the flushing call's `ctx`. A batching middleware MAY
@@ -177,14 +177,14 @@ type EnvelopHandler interface { Handle(ctx context.Context, e *Envelop) error }
     goroutine, from its retransmission/keepalive sweep (§10.3) and from the
     paths that emit `WINDOW` grants (§4.2.1). An adapter holds no state below
     `Handle`; a batcher does, so it MUST serialise its buffer. On a
-    **reliable** adapter it MUST also preserve the order in which envelops
+    **reliable** adapter it MUST also preserve the order in which envelopes
     reach the channel: §4.3 promises no reordering and reliable mode runs no
     retransmission, so a reorder introduced here is unrepairable. Holding the
     buffer lock across the flush buys that ordering at a price the core itself
     declines to pay — it emits control frames outside every lock precisely so
     a blocking adapter cannot wedge `Handle` for everyone — while a single
     flushing goroutine buys it without blocking the next `Handle`.
-- With no batching middleware installed every envelop carries one frame
+- With no batching middleware installed every envelope carries one frame
   (`Wrap1`, or an adapter's equivalent). That is always conformant: batching
   is an optimization the sender chooses, never something a peer can require.
 - The transport MUST preserve message boundaries and integrity (DTLS/SCTP/WSS
@@ -492,7 +492,7 @@ type TransportInfo interface {
 }
 ```
 
-- Adapters SHOULD implement `TransportInfo` alongside `EnvelopHandler`.
+- Adapters SHOULD implement `TransportInfo` alongside `EnvelopeHandler`.
 - `NewConn`/`NewServer` resolve capabilities **once at construction**
   (`Reliable() == true` → reliable mode, §10.6). Explicit options always
   override discovery.
@@ -526,9 +526,9 @@ type TransportInfo interface {
 
 ### 4.4 Message size — the adapter's concern
 
-The core deals in whole messages (an `Envelop` of 1..n `Frame`s) and is
+The core deals in whole messages (an `Envelope` of 1..n `Frame`s) and is
 size-agnostic: it never fragments, never reassembles, and never asks the
-transport for an MTU. Whether a marshaled envelop fits the channel is decided
+transport for an MTU. Whether a marshaled envelope fits the channel is decided
 where the channel is known — in the adapter:
 
 - **Reliable transports** (WebSocket, TCP-like, reliable DataChannel)
@@ -575,7 +575,7 @@ copies rather than fragments). These are adapter defaults, not protocol
 constants.
 
 **Two ceilings, two axes.** The adapter's limit measures the marshaled
-*Envelop* — frame headers, method string, metadata and framing included — and
+*Envelope* — frame headers, method string, metadata and framing included — and
 is a property of the channel. The per-call limits of the gRPC surface
 (`MaxCallRecvMsgSize` / `MaxCallSendMsgSize`) measure one *message*, after
 compression on the way out and after decompression on the way in, and are an
@@ -637,7 +637,7 @@ message Frame {
   repeated google.protobuf.Any details = 17;  // google.rpc.Status.details (§5).
 }
 
-message Envelop { repeated Frame frames = 1; }
+message Envelope { repeated Frame frames = 1; }
 
 message Metadata {                      // §11
   message Entry { repeated bytes values = 1; }
@@ -655,7 +655,7 @@ Notes:
   timestamp — datagram peers do not share a clock. In-flight latency is not
   charged; the same trade-off as gRPC's `grpc-timeout`.
 - All field numbers are renumbered relative to the pre-v1.0 implementation
-  (Appendix A). `Envelop.frames` moves to field 1, removing the old field-8
+  (Appendix A). `Envelope.frames` moves to field 1, removing the old field-8
   collision with `Frame.payload`.
 - `peer_epoch` names the **client incarnation a server frame addresses**: the
   server sets it on every call-addressed frame it sends (data, `H`, `T`,
@@ -1464,8 +1464,8 @@ path, where its write deadline would otherwise have been the backstop.
 - Compression belongs to the **core**, above the seams of §3: `COMPRESSED` is
   a frame flag and a receiver decompresses per frame. A batching middleware
   (§4.1) sits below it and so only ever packs frames whose compression is
-  already decided; it MUST pack them unchanged. Compressing a whole envelop is
-  not this protocol — there is no envelop-level flag to carry it — and adding
+  already decided; it MUST pack them unchanged. Compressing a whole envelope is
+  not this protocol — there is no envelope-level flag to carry it — and adding
   one would be a wire change.
 
 ## 13. Method addressing
@@ -1688,7 +1688,7 @@ Wire (all breaking; pre-v1.0, no migration):
 
 1. `Frame` renumbered; `epoch`, `flags` added; `deadline` (Timestamp) →
    `timeout` (Duration); `payload` gains explicit presence.
-   `Envelop` becomes the universal wire unit with `frames = 1` (the old
+   `Envelope` becomes the universal wire unit with `frames = 1` (the old
    `frames = 8` / `payload = 8` collision is gone).
 2. Close signaling moves from "`code` presence" to the CLOSE flag; OPEN flag
    introduced (was: any unknown sid opened a call — ghost execution).
@@ -1816,9 +1816,9 @@ Appendix B mirrors the body; where they disagree, the body governs.
   holding it in a field, and override `Handle`
   alone — `AttachConn` (`ConnAttacher`), `Close` (`io.Closer`), `Reliable`
   (`TransportInfo`) and `Peer` (`TransportPeer`) then stay visible to the type
-  assertions in `NewConn`, and the envelop-level send the adapters export
+  assertions in `NewConn`, and the envelope-level send the adapters export
   (e.g. `udp.Transport.Send`) is what the override calls with the packed
-  envelop. A field-wrapper hides all four, and the worst of those failures is
+  envelope. A field-wrapper hides all four, and the worst of those failures is
   silent: without `AttachConn` the receive pump never starts and the endpoint
   hears nothing, with no error anywhere — which is what `Wrap1`'s own doc
   comment warns about.

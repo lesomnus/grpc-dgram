@@ -4,14 +4,14 @@ What is left, and what has to be decided before it can start. Everything that
 is *done* lives in the code, in [PROTOCOL.md](./PROTOCOL.md), or in the feature
 docs next to this file — this list is only the open end.
 
-## 1. `Envelop` batching — the seam is ours, the policy is the application's
+## 1. `Envelope` batching — the seam is ours, the policy is the application's
 
-The wire has always been "one marshaled `Envelop` of 1..n frames per transport
+The wire has always been "one marshaled `Envelope` of 1..n frames per transport
 message" (§4.1), and the receive side has always delivered n of them
 (`drpc.Unpack`). What this section deferred was a `Coalescer` — a batcher the
 library itself would ship — behind four decisions, a benchmark that shows the
 win, and a §4.1/§10.7 revision to match. The benchmark now exists
-([Envelop batching: the measurement](./batching-measurement.md)), and it
+([Envelope batching: the measurement](./batching-measurement.md)), and it
 resolves the section by answering a different question than the one it was
 asked.
 
@@ -35,11 +35,11 @@ batching policy is the application's to write.** PROTOCOL.md now says the same
 normatively (§3, §4.1).
 
 **The seam is complete and exported in both languages.** In Go, `frame.go` has both handler types
-— `FrameHandler` (core-facing, one frame) and `EnvelopHandler` (adapter-facing,
-one envelop of 1..n frames) — plus `Wrap1`, the no-batching default, which the
+— `FrameHandler` (core-facing, one frame) and `EnvelopeHandler` (adapter-facing,
+one envelope of 1..n frames) — plus `Wrap1`, the no-batching default, which the
 adapters implement directly rather than install (it re-exposes nothing,
 `frame.go`), and `Unpack` for the receive side. Every shipped adapter exports
-an envelop-level send (`udp.Transport.Send(ctx, *drpc.Envelop)`, and the same
+an envelope-level send (`udp.Transport.Send(ctx, *drpc.Envelope)`, and the same
 shape in the others). A batcher is a
 `FrameHandler` that buffers frames and calls that `Send` with what it packed;
 it needs no library change to write, and `transport/udp/batcher_test.go` is one
@@ -58,7 +58,7 @@ normatively in §4.1, §4.4 and Appendix C rather than left to taste:
   nothing, with no error. (`Wrap1`'s own doc comment says the same of the
   wrapper it returns — it "re-exposes nothing"; §3 and Appendix C put the duty
   normatively.)
-- **One destination per envelop.** A datagram is addressed by the `ctx` of the
+- **One destination per envelope.** A datagram is addressed by the `ctx` of the
   call that flushes it, not by anything in its frames — `udp.Gateway.Send`
   reads the peer out of `ctx` (§6.4), and the server hands one tx a different
   per-peer ctx per peer. So a batcher above a **gateway** may pack together
@@ -75,7 +75,7 @@ normatively in §4.1, §4.4 and Appendix C rather than left to taste:
   shipped adapters are stateless below `Handle` and never had to care; a
   batcher is the first thing at this seam with mutable state, and without a
   lock it races on its own buffer on the second concurrent call. On a
-  *reliable* adapter it must also keep envelops in the order it packed them
+  *reliable* adapter it must also keep envelopes in the order it packed them
   (§4.3 promises no reordering, and reliable mode has no retransmission to
   repair one): holding the lock across the flush does that, at the price the
   core refuses to pay itself (it sends outside every lock so a blocking
@@ -102,7 +102,7 @@ normatively in §4.1, §4.4 and Appendix C rather than left to taste:
 The four decisions this section said had to come first resolve like this — two
 belong to the application, one dissolves, and one stays ours:
 
-**What may share an envelop** — the application's. Frames in one envelop share
+**What may share an envelope** — the application's. Frames in one envelope share
 its fate (§4.1): batching frames of *different calls* couples calls the
 protocol otherwise keeps independent, and one datagram loss becomes a gap in
 three streams. The narrow version (within one call, or only control frames:
@@ -135,7 +135,7 @@ uncredited control frames immediately.
 it. Per-frame compression belongs to the core and `COMPRESSED` is a frame flag
 (§12.1), so a batcher below the core only ever packs frames whose compression
 is already decided, and must pack them unchanged. Per-batch compression would
-need an envelop-level flag to carry the marker — a wire change, and one that is
+need an envelope-level flag to carry the marker — a wire change, and one that is
 cheap only before the freeze (item 2).
 
 **TypeScript has the same seam**, in the shape the language makes natural.
@@ -144,7 +144,7 @@ tx.attachConn === 'function'` check, and the same for `reliable()` and
 `close()` — so a subclass inherits every one of them through the prototype
 and there is no Go-style wrapper trap: `class Batcher extends UdpTransport`
 overriding `handle` alone keeps all three. What it calls is `sendFrames`,
-the envelop-level entry every exported adapter class now carries
+the envelope-level entry every exported adapter class now carries
 (`UdpTransport`, `UdpGateway`, `WebSocketTransport`, `WebSocketGateway`,
 `DataChannelTransport`, `DataChannelGateway`, `PortTransport`,
 `PortGateway`, `WebTransportDatagramTransport`); `handle` is a one-line

@@ -4,7 +4,7 @@ package jsport_test
 
 // Real MessageChannel end to end, both ends inside one wasm instance: a
 // drpc.Conn on port1 and a drpc.Server behind a jsport.Gateway on port2. The
-// two ends share no Go memory — everything crosses as a marshaled Envelop
+// two ends share no Go memory — everything crosses as a marshaled Envelope
 // through the port — so this is the same wire a browser client drives, with
 // the JS half replaced by the shortest possible piece of JS.
 //
@@ -237,7 +237,7 @@ func TestLargeMessage(t *testing.T) {
 	}
 }
 
-// An explicit send limit refuses an oversized envelop with
+// An explicit send limit refuses an oversized envelope with
 // drpc.ErrMessageTooLarge, which the core maps to ResourceExhausted on the
 // owning call (PROTOCOL.md §4.4). The refusal is synchronous and local — the
 // OPEN never reaches the port — so the channel is untouched and the next call
@@ -315,7 +315,7 @@ func TestPeerIsTheLabel(t *testing.T) {
 }
 
 // The goodbye, client side (PROTOCOL.md §4.5). There is no socket to die, so
-// closing the client posts an empty envelop and that is the server's only
+// closing the client posts an empty envelope and that is the server's only
 // notice: ServePeer must return and DisconnectPeer must run. The parked
 // handler is the proof — with timers off nothing else would ever release it,
 // and GracefulStop waits for in-flight handlers, so a leaked one wedges it.
@@ -358,13 +358,13 @@ func TestGoodbyeFromClient(t *testing.T) {
 }
 
 // The goodbye on the wire, with nothing else confounding it. A 0-byte message
-// is the adapter's close frame (§4.1: an envelop carries 1..n frames, so an
+// is the adapter's close frame (§4.1: an envelope carries 1..n frames, so an
 // empty one can only mean this), and it is posted here by hand — the port
 // stays open and stays entangled, so no runtime "close" event can stand in for
 // the mechanism. This is exactly the byte sequence the TypeScript twin posts,
 // and the teardown must travel both ways from it: the served peer dies, and
 // the goodbye ServePeer posts on its way out fails the client's live call.
-func TestEmptyEnvelopIsGoodbye(t *testing.T) {
+func TestEmptyEnvelopeIsGoodbye(t *testing.T) {
 	e := serve(t, nil, nil)
 
 	stream, err := e.client.Live(t.Context())
@@ -394,7 +394,7 @@ func TestEmptyEnvelopIsGoodbye(t *testing.T) {
 			t.Fatalf("ServePeer reported %v, want nil for a goodbye", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("an empty envelop was not read as the peer's goodbye (§4.5)")
+		t.Fatal("an empty envelope was not read as the peer's goodbye (§4.5)")
 	}
 	select {
 	case err := <-recvErr:
@@ -406,7 +406,7 @@ func TestEmptyEnvelopIsGoodbye(t *testing.T) {
 	}
 }
 
-// An empty envelop through the Send seam is a no-op, not a goodbye. A batching
+// An empty envelope through the Send seam is a no-op, not a goodbye. A batching
 // middleware (§4.1) flushes on a delay budget, so an idle tick hands the seam
 // an empty batch — and on this adapter a 0-byte message is the goodbye, so
 // without the guard in msgPort.send that flush would tear the channel down and
@@ -416,9 +416,9 @@ func TestEmptyEnvelopIsGoodbye(t *testing.T) {
 func TestEmptySendIsNotGoodbye(t *testing.T) {
 	e := serve(t, nil, nil)
 
-	empty := &drpc.Envelop{}
+	empty := &drpc.Envelope{}
 	if err := e.tp.Send(t.Context(), empty); err != nil {
-		t.Fatalf("client Send of an empty envelop: %v", err)
+		t.Fatalf("client Send of an empty envelope: %v", err)
 	}
 
 	// The call still works, so nothing was torn down.
@@ -440,7 +440,7 @@ func TestEmptySendIsNotGoodbye(t *testing.T) {
 }
 
 // The goodbye, server side. A wasm instance that is going away closes its
-// gateway; the empty envelop it posts is what fails the client's live call
+// gateway; the empty envelope it posts is what fails the client's live call
 // with UNAVAILABLE, immediately. Without it the Recv below would block
 // forever — reliable mode runs no timer that could ever fail it.
 func TestGoodbyeFromServer(t *testing.T) {
@@ -479,7 +479,7 @@ func TestGoodbyeFromServer(t *testing.T) {
 }
 
 // The death nobody gets to announce: the port is closed out from under the
-// adapter, so no empty envelop is ever posted. Where the runtime fires "close"
+// adapter, so no empty envelope is ever posted. Where the runtime fires "close"
 // on the entangled port — node does — that event is the whole death signal,
 // and both ends owe the §4.5 teardown from it alone. This is the mechanism
 // that covers a wasm instance which panicked and a tab that went away, and it
@@ -996,19 +996,19 @@ func bytes(b ...byte) js.Value {
 
 // Ports are shared: a page may post its own traffic down the same channel, and
 // a runtime may deliver something that is not a view at all. None of it is an
-// envelop and none of it is a teardown (PROTOCOL.md §4.2) — the channel
+// envelope and none of it is a teardown (PROTOCOL.md §4.2) — the channel
 // survives junk in both directions.
 //
 // The sharp case is the last one. Protobuf keeps fields it does not know, so a
-// message that is not ours at all can still decode to an Envelop carrying no
-// frames — as can a later envelop extension. Only the *empty* message is the
+// message that is not ours at all can still decode to an Envelope carrying no
+// frames — as can a later envelope extension. Only the *empty* message is the
 // goodbye; anything else that decodes to no frames is input to drop, and
 // reading it as EOF would let two stray bytes tear a live channel down.
 func TestJunkIsIgnored(t *testing.T) {
 	e := serve(t, nil, nil)
 
 	for _, p := range []js.Value{e.p1, e.p2} {
-		p.Call("postMessage", "not an envelop")
+		p.Call("postMessage", "not an envelope")
 		p.Call("postMessage", js.Global().Get("Object").New())
 		p.Call("postMessage", bytes(0xff, 0xff, 0xff, 0xff)) // a truncated varint
 		p.Call("postMessage", bytes(0x18, 0x01))             // decodes: unknown field 3, no frames

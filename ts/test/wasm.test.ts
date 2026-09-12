@@ -3,7 +3,7 @@
 // TypeScript client across a MessageChannel, both ends inside this one node
 // process. Nothing is mocked and nothing is stubbed: the Go core dispatches
 // the methods, internal/echo's handlers produce the answers, and every byte
-// between them is a marshaled Envelop (§4.1) posted through the port.
+// between them is a marshaled Envelope (§4.1) posted through the port.
 //
 // The wiring is the shipped pair and not a fixture of its own —
 // jsport.Gateway.Serve publishing the entry point, open() awaiting it and
@@ -22,7 +22,7 @@
 // first time on a channel that earns it. Second, teardown: with every
 // protocol timer off (§10.6) the adapter's §4.5 duty is the ONLY thing that
 // can ever unblock a live call, and both of its halves are Go/TS handshakes —
-// the empty-envelop goodbye, and the host reporting a death the port cannot
+// the empty-envelope goodbye, and the host reporting a death the port cannot
 // see.
 //
 // Skipped when `go` is unavailable, as the UDP fixture is.
@@ -465,7 +465,7 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go wasm ser
     const err = (await stream.recv().catch((e) => e)) as StatusError
     expect(err.code).toBe(Code.UNAVAILABLE)
     // The cause survives, which is what says this was the host's report and
-    // not a goodbye: the peer's empty envelop trips the death latch with no
+    // not a goodbye: the peer's empty envelope trips the death latch with no
     // cause at all, and the first cause wins.
     expect(err.message).toMatch(/the wasm instance exited/)
   })
@@ -513,7 +513,7 @@ describe.skipIf(!hasGo())('cross-language conformance (TS client ↔ Go wasm ser
     server.stop() // jsport.Gateway.Close: one 0-byte message per served port
     const err = (await stream.recv().catch((e) => e)) as StatusError
     expect(err.code).toBe(Code.UNAVAILABLE)
-    // Nothing about that was a frame: the goodbye is the empty envelop
+    // Nothing about that was a frame: the goodbye is the empty envelope
     // itself, so the recorder — which only ever sees decoded frames — saw the
     // call die with nothing delivered after it.
     expect(wire.rx.slice(at)).toEqual([])

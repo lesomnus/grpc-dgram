@@ -1065,7 +1065,7 @@ describe('the worker path', () => {
 // ---------------------------------------------------------------------------
 
 describe('port options reach the connection', () => {
-  it('refuses an oversize envelop on a dialled connection (§4.4)', async () => {
+  it('refuses an oversize envelope on a dialled connection (§4.4)', async () => {
     const go = new FakeGo()
     serving(go)
     const sock = await here(go, { maxMessageSize: 128 })

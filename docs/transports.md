@@ -58,7 +58,7 @@ port yourself, is the manual path below, unchanged.
 path. A page reaches a Go server with a URL and nothing else — no offer/answer,
 no ICE, no signaling server — and gets the unreliable mode the protocol is
 designed around, which WebSocket cannot give it. Only the session's datagram
-side is used, one marshaled `Envelop` per datagram; a reliable channel over
+side is used, one marshaled `Envelope` per datagram; a reliable channel over
 one of the session's streams is the possible second step
 ([TODO.md](./TODO.md#4-smaller-unowned)). The wire is HTTP/3 over QUIC, hence
 always TLS: `https://` only, a certificate on the server — a browser accepts a
@@ -164,7 +164,7 @@ They are often confused, and they measure different things.
 
 | | what it measures | who owns it | what happens past it |
 |---|---|---|---|
-| adapter ceiling | the whole marshaled `Envelop` — frame header, method string, metadata, framing | the adapter (§4.4) | the send is refused synchronously; the core maps it to `ResourceExhausted` on that call |
+| adapter ceiling | the whole marshaled `Envelope` — frame header, method string, metadata, framing | the adapter (§4.4) | the send is refused synchronously; the core maps it to `ResourceExhausted` on that call |
 | `MaxCallSendMsgSize` / `MaxCallRecvMsgSize` | one message, after compression on the way out and after decompression on the way in | the application (gRPC parity) | the call fails `ResourceExhausted` |
 
 Neither implies the other. A 1200-byte send cap still overflows a 1200-byte
@@ -194,7 +194,7 @@ path.
 | channel | address | zero-downtime upgrade |
 |---|---|---|
 | WebSocket, WebTransport | a URL | **version the path.** `wss://host/rpc/2` beside `/rpc/1`, routed by any L7 proxy before the connection is even upgraded. The protocol never sees it. |
-| UDP | host and port | no path: a datagram arrives at a port and that is all a proxy can see without parsing the envelop. |
+| UDP | host and port | no path: a datagram arrives at a port and that is all a proxy can see without parsing the envelope. |
 | WebRTC DataChannel | a negotiated channel | no path and no proxy: after ICE the peers are connected directly. |
 
 For the last two, the only signal is the one PROTOCOL.md §10.6 reserves: a
@@ -211,13 +211,13 @@ the clients first or run the two generations on separate ports.
 Four seams, in the order you will meet them.
 
 **1. Send — `FrameHandler`.** The core hands you frames; you put them on the
-wire. The wire unit is one marshaled `Envelop` per transport message, so the
-usual shape is `drpc.Wrap1` plus your own `EnvelopHandler`, or a single type
+wire. The wire unit is one marshaled `Envelope` per transport message, so the
+usual shape is `drpc.Wrap1` plus your own `EnvelopeHandler`, or a single type
 that does both:
 
 ```go
 func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return t.Send(ctx, e)
 }
@@ -231,7 +231,7 @@ Note that `Wrap1` returns a bare `FrameHandler` and re-exposes nothing: a
 transport wrapped in it loses `TransportInfo` discovery. Implement both on one
 type, or annotate per peer.
 
-**2. Receive — `Conn.Handle` / `Server.Handle`.** Unmarshal one `Envelop`, then
+**2. Receive — `Conn.Handle` / `Server.Handle`.** Unmarshal one `Envelope`, then
 deliver its frames **in order** (`drpc.Unpack` does this), with the peer
 attached to the context. What you may do next depends on the mode:
 
@@ -290,9 +290,9 @@ Death is therefore not detected here. It is **said out loud**, by two
 mechanisms that between them are the whole of the §4.5 duty on this channel.
 
 The first is on the wire: **a 0-byte message is the goodbye**. It is a
-marshaled `Envelop` with no frames — something §4.1 (1..n) means the wire never
+marshaled `Envelope` with no frames — something §4.1 (1..n) means the wire never
 otherwise carries — so `Close` posts one before it drops the port, and the peer
-that reads it tears down. The trigger is the *byte length*, never "the envelop
+that reads it tears down. The trigger is the *byte length*, never "the envelope
 decoded to no frames" — protobuf keeps fields it does not know, so a later wire
 version, or another library's traffic on the same port, decodes to no frames as
 well, and reading one of those as a goodbye would kill a healthy channel over
@@ -326,7 +326,7 @@ datagram.
 ## Checklist
 
 An adapter is done when it: preserves message boundaries; carries one
-`Envelop` per message; answers `Reliable()` truthfully (or annotates per peer);
+`Envelope` per message; answers `Reliable()` truthfully (or annotates per peer);
 refuses oversize sends synchronously with `ErrMessageTooLarge`; delivers frames
 in order with the peer attached; never tears down the channel on a frame-level
 error; and calls the core's teardown API from a signal that is independent of

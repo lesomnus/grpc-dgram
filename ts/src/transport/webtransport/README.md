@@ -2,7 +2,7 @@
 
 dRPC over **WebTransport datagrams** — the TS twin of the Go
 `transport/webtransport` adapter, and wire-compatible with it. One datagram
-carries one marshaled `Envelop`; the channel is unreliable (dRPC's default
+carries one marshaled `Envelope`; the channel is unreliable (dRPC's default
 mode), so the core runs its full timer machinery; nothing is ever fragmented —
 a message over the size limit is refused at send with `MessageTooLargeError`,
 which the core maps to `RESOURCE_EXHAUSTED` on the owning call (§4.4).
@@ -64,7 +64,7 @@ session. A browser client here talks to that on the wire.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `maxMessageSize` | once the session is up, its `datagrams.maxDatagramSize` at each write, else 1200 B; 1200 B while it is still connecting | largest marshaled `Envelop` this endpoint sends (§4.4); bounds sends only. A browser reports a placeholder until `ready` (Chromium: 1024), not the ceiling the datagram will meet, so a call issued while connecting is judged against the default and again, at the write, against the ceiling then in force — the QUIC path's real one, which may still grow with path MTU discovery. `0` removes the adapter's check; the platform still drops what its own ceiling refuses, silently |
+| `maxMessageSize` | once the session is up, its `datagrams.maxDatagramSize` at each write, else 1200 B; 1200 B while it is still connecting | largest marshaled `Envelope` this endpoint sends (§4.4); bounds sends only. A browser reports a placeholder until `ready` (Chromium: 1024), not the ceiling the datagram will meet, so a call issued while connecting is judged against the default and again, at the write, against the ceiling then in force — the QUIC path's real one, which may still grow with path MTU discovery. `0` removes the adapter's check; the platform still drops what its own ceiling refuses, silently |
 | `requireUnreliable` | `true` | fail the handshake unless the server supports datagrams — the platform defaults to `false`, this adapter is made of them |
 | `serverCertificateHashes`, `allowPooling`, `congestionControl`, `protocols` | platform defaults | passed through to `new WebTransport(url, options)` |
 

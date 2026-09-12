@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	// DefaultMaxMessageSizeUnreliable keeps an envelop inside one SCTP packet
+	// DefaultMaxMessageSizeUnreliable keeps an envelope inside one SCTP packet
 	// on the typical 1500-byte path MTU: a partially-reliable message that
 	// SCTP fragments is lost whenever any one fragment is lost, multiplying
 	// the effective loss rate (PROTOCOL.md §4.4).
@@ -49,7 +49,7 @@ const rxBufferSize = 32
 // both ends observe the same parameters, negotiated or DCEP-announced.
 // Ordered delivery with neither a retransmit cap nor a lifetime cap is full
 // SCTP reliability: the core runs with every timer off (PROTOCOL.md §10.6).
-// Any cap — even MaxRetransmits: 0 — or unordered delivery lets envelops
+// Any cap — even MaxRetransmits: 0 — or unordered delivery lets envelopes
 // vanish or arrive out of order: the loss profile the core's timer machinery
 // exists for.
 func channelReliable(dc *webrtc.DataChannel) bool {
@@ -189,17 +189,17 @@ func (ch *channel) bufLowWait() <-chan struct{} {
 	return ch.bufLow
 }
 
-// send transmits one envelop as one channel message. It refuses an envelop
+// send transmits one envelope as one channel message. It refuses an envelope
 // over the size limit synchronously (PROTOCOL.md §4.4), waits for the channel
 // to open, and blocks while BufferedAmount is at the high-water mark — each
 // wait bounded by ctx and by channel death.
-func (ch *channel) send(ctx context.Context, e *drpc.Envelop) error {
+func (ch *channel) send(ctx context.Context, e *drpc.Envelope) error {
 	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(e)
 	if err != nil {
 		return err
 	}
 	if ch.max > 0 && len(data) > ch.max {
-		return fmt.Errorf("pion: %d-byte envelop over the %d-byte limit: %w",
+		return fmt.Errorf("pion: %d-byte envelope over the %d-byte limit: %w",
 			len(data), ch.max, drpc.ErrMessageTooLarge)
 	}
 
@@ -296,7 +296,7 @@ func (ch *channel) serve(ctx context.Context, h drpc.FrameHandler) error {
 // channel (PROTOCOL.md §4.2). In reliable mode h may block, bounded by ctx;
 // the bound rx queue then backs pressure up into pion's read loop.
 func deliver(ctx context.Context, data []byte, h drpc.FrameHandler) {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	if err := proto.Unmarshal(data, e); err != nil {
 		return
 	}

@@ -15,7 +15,7 @@ import (
 )
 
 // ErrMessageTooLarge is returned (or wrapped) by an adapter's Handle when a
-// marshaled envelop cannot fit the transport's message limit. The core never
+// marshaled envelope cannot fit the transport's message limit. The core never
 // fragments; it maps this error to the gRPC status ResourceExhausted on the
 // owning call. See PROTOCOL.md §4.4.
 var ErrMessageTooLarge = errors.New("drpc: message too large for the transport")
@@ -57,29 +57,29 @@ func (f FrameHandlerFunc) Handle(ctx context.Context, frame *Frame) error {
 	return f(ctx, frame)
 }
 
-// EnvelopHandler is the adapter-facing seam: the wire unit is always one
-// Envelop holding 1..n frames. See PROTOCOL.md §3, §4.1.
-type EnvelopHandler interface {
-	Handle(ctx context.Context, e *Envelop) error
+// EnvelopeHandler is the adapter-facing seam: the wire unit is always one
+// Envelope holding 1..n frames. See PROTOCOL.md §3, §4.1.
+type EnvelopeHandler interface {
+	Handle(ctx context.Context, e *Envelope) error
 }
 
-type EnvelopHandlerFunc func(ctx context.Context, e *Envelop) error
+type EnvelopeHandlerFunc func(ctx context.Context, e *Envelope) error
 
-func (f EnvelopHandlerFunc) Handle(ctx context.Context, e *Envelop) error {
+func (f EnvelopeHandlerFunc) Handle(ctx context.Context, e *Envelope) error {
 	return f(ctx, e)
 }
 
-// Wrap1 adapts an EnvelopHandler to a FrameHandler by wrapping each frame in
-// a single-frame envelop (the no-batching default).
+// Wrap1 adapts an EnvelopeHandler to a FrameHandler by wrapping each frame in
+// a single-frame envelope (the no-batching default).
 //
 // The returned handler re-exposes nothing: if h also implements
 // TransportInfo, the wrapper hides it from NewConn/NewServer discovery
 // (PROTOCOL.md §3). Single-mode adapters should implement FrameHandler and
 // TransportInfo on one type instead, mixed-mode gateways annotate per peer
 // (NewReliableContext), or pass WithReliable explicitly.
-func Wrap1(h EnvelopHandler) FrameHandler {
+func Wrap1(h EnvelopeHandler) FrameHandler {
 	return FrameHandlerFunc(func(ctx context.Context, f *Frame) error {
-		e := &Envelop{}
+		e := &Envelope{}
 		e.SetFrames([]*Frame{f})
 		return h.Handle(ctx, e)
 	})
@@ -87,7 +87,7 @@ func Wrap1(h EnvelopHandler) FrameHandler {
 
 // Unpack delivers each frame of e to h in order (PROTOCOL.md §4.1).
 // Adapters use this on the receive path.
-func Unpack(ctx context.Context, e *Envelop, h FrameHandler) error {
+func Unpack(ctx context.Context, e *Envelope, h FrameHandler) error {
 	var errs []error
 	for _, f := range e.GetFrames() {
 		if err := h.Handle(ctx, f); err != nil {

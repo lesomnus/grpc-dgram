@@ -1,4 +1,4 @@
-// drpc over WebSocket: one binary message carries one marshaled Envelop. The
+// drpc over WebSocket: one binary message carries one marshaled Envelope. The
 // channel is reliable and ordered, so the core runs in reliable mode with
 // every protocol timer and retransmission off (PROTOCOL.md §10.6) — leaving
 // this adapter the two duties the protocol no longer covers:
@@ -43,7 +43,7 @@ import type { ConnAttacher, FrameContext, FrameHandler, TransportInfo } from '..
 import { unpack } from '../../seam'
 import { Code, MessageTooLargeError, StatusError } from '../../status'
 import { abortListener, Latch, noop, unrefTimer } from '../../util'
-import { decodeEnvelop, encodeEnvelop, type Frame } from '../../wire'
+import { decodeEnvelope, encodeEnvelope, type Frame } from '../../wire'
 
 // WhatWG WebSocket.readyState values, spelled out so no DOM lib is required.
 const CONNECTING = 0
@@ -102,7 +102,7 @@ export interface WebSocketLike {
 }
 
 export interface WebSocketOptions {
-  // Largest marshaled Envelop this endpoint will send, in bytes; 0 (the
+  // Largest marshaled Envelope this endpoint will send, in bytes; 0 (the
   // default) is unlimited — a reliable transport carries any size
   // (PROTOCOL.md §4.4). Bounds sends only; receives accept any message.
   maxMessageSize?: number
@@ -187,7 +187,7 @@ class Socket {
     this.kaTimeoutMs = o.keepaliveTimeoutMs ?? DefaultKeepaliveTimeoutMs
     this.stallMs = o.sendStallTimeoutMs ?? this.kaTimeoutMs
 
-    // Binary framing is the wire contract (§4.1): one marshaled Envelop per
+    // Binary framing is the wire contract (§4.1): one marshaled Envelope per
     // message. Without this a browser hands back Blobs, which cannot be read
     // synchronously.
     try {
@@ -294,11 +294,11 @@ class Socket {
     const data = (ev as { data?: unknown }).data
     if (data instanceof ArrayBuffer) this.rx.push(new Uint8Array(data))
     else if (ArrayBuffer.isView(data)) this.rx.push(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
-    else return // string / Blob: not a drpc envelop; dropped, never a teardown
+    else return // string / Blob: not a drpc envelope; dropped, never a teardown
     wakeAll(this.rxWaiters)
   }
 
-  // send transmits one envelop as one binary message. It refuses an envelop
+  // send transmits one envelope as one binary message. It refuses an envelope
   // over the size limit (PROTOCOL.md §4.4 — as a rejection, this method being
   // async; the core treats a throw and a rejection alike), waits for the
   // socket to open, and parks while bufferedAmount is at the high-water mark
@@ -309,9 +309,9 @@ class Socket {
   // (§4.2). The core's abort path sends with no signal at all, so a signal
   // alone cannot be the bound.
   async send(frames: readonly Frame[], signal?: AbortSignal): Promise<void> {
-    const data = encodeEnvelop(frames)
+    const data = encodeEnvelope(frames)
     if (this.max > 0 && data.length > this.max) {
-      throw new MessageTooLargeError(`websocket: ${data.length}-byte envelop over the ${this.max}-byte limit`)
+      throw new MessageTooLargeError(`websocket: ${data.length}-byte envelope over the ${this.max}-byte limit`)
     }
 
     const stalled = new Latch()
@@ -385,7 +385,7 @@ class Socket {
       if (data !== undefined) {
         let frames: Frame[]
         try {
-          frames = decodeEnvelop(data)
+          frames = decodeEnvelope(data)
         } catch {
           continue // malformed messages are dropped; never tear down (§4.2)
         }
@@ -469,12 +469,12 @@ export class WebSocketTransport implements FrameHandler, TransportInfo, ConnAtta
   }
 
   // sendFrames sends these frames as ONE binary message — one marshaled
-  // Envelop of 1..n frames is the wire unit either way (PROTOCOL.md §4.1). A
+  // Envelope of 1..n frames is the wire unit either way (PROTOCOL.md §4.1). A
   // thin passthrough: Socket.send owns the gating (open, the buffered-amount
   // mark, the stall budget) and the §4.4 size refusal, and nothing is
   // duplicated here.
   //
-  // It is the envelop-level seam a batching middleware flushes through (§4.1).
+  // It is the envelope-level seam a batching middleware flushes through (§4.1).
   // The library ships no batcher: what may share a message and how long a
   // frame may wait for company (§10.7) are answerable only against a
   // workload. A user subclasses this transport, overrides `handle` to buffer,
@@ -489,7 +489,7 @@ export class WebSocketTransport implements FrameHandler, TransportInfo, ConnAtta
     return this.sock.send(frames, ctx.signal)
   }
 
-  // handle sends one frame as a single-frame envelop: the no-batching default
+  // handle sends one frame as a single-frame envelope: the no-batching default
   // (§4.1), and always conformant.
   handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
     return this.sendFrames([f], ctx)
@@ -602,7 +602,7 @@ export class WebSocketGateway implements FrameHandler, TransportInfo {
   }
 
   // sendFrames sends these frames as ONE binary message to the peer named in
-  // ctx, with the same gating as the client transport — the envelop-level
+  // ctx, with the same gating as the client transport — the envelope-level
   // seam a batching middleware flushes through (PROTOCOL.md §4.1).
   //
   // The ctx IS the address (§6.4): the whole message goes to the one socket it
@@ -622,7 +622,7 @@ export class WebSocketGateway implements FrameHandler, TransportInfo {
     return sock.send(frames, ctx.signal)
   }
 
-  // handle sends one frame as a single-frame envelop to the peer named in ctx:
+  // handle sends one frame as a single-frame envelope to the peer named in ctx:
   // the no-batching default (§4.1).
   handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
     return this.sendFrames([f], ctx)

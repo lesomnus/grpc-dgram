@@ -15,9 +15,9 @@ import {
 } from './metadata'
 import { Code, StatusError } from './status'
 import {
-  decodeEnvelop,
+  decodeEnvelope,
   decodeFrame,
-  encodeEnvelop,
+  encodeEnvelope,
   encodeFrame,
   FlagClose,
   FlagCompressed,
@@ -48,9 +48,9 @@ const unhex = (s: string) => new Uint8Array([...(s.match(/../g) ?? [])].map((x) 
 const goldenFrameHex =
   '0d0403020115050000001d0600000020032a062f612e422f433a046a736f6e420808011080cab5ee014a01aa50005a0164750d0c0b0a'
 
-// Envelop{frames:[OPEN{epoch:1 sid:2 seq:1 flags:1 method:"/a.B/C"},
+// Envelope{frames:[OPEN{epoch:1 sid:2 seq:1 flags:1 method:"/a.B/C"},
 // data{epoch:1 sid:2 seq:2 payload:[0xAA]}]} — frames is field 1.
-const goldenEnvelopHex = '0a190d0100000015020000001d0100000020012a062f612e422f430a120d0100000015020000001d020000004a01aa'
+const goldenEnvelopeHex = '0a190d0100000015020000001d0100000020012a062f612e422f430a120d0100000015020000001d020000004a01aa'
 
 function goldenFrame() {
   const f = frame({
@@ -97,15 +97,15 @@ describe('golden bytes (§5)', () => {
     expect(g.details).toBeUndefined()
   })
 
-  it('Envelop encodes byte-identically to the Go implementation', () => {
+  it('Envelope encodes byte-identically to the Go implementation', () => {
     const open = frame({ epoch: 1, sid: 2, seq: 1, flags: FlagOpen, method: '/a.B/C' })
     const data = frame({ epoch: 1, sid: 2, seq: 2 })
     data.payload = new Uint8Array([0xaa])
-    expect(hex(encodeEnvelop([open, data]))).toBe(goldenEnvelopHex)
+    expect(hex(encodeEnvelope([open, data]))).toBe(goldenEnvelopeHex)
   })
 
-  it('the golden Envelop bytes round-trip', () => {
-    const fs = decodeEnvelop(unhex(goldenEnvelopHex))
+  it('the golden Envelope bytes round-trip', () => {
+    const fs = decodeEnvelope(unhex(goldenEnvelopeHex))
     expect(fs).toHaveLength(2)
     expect(fs[0]!.epoch).toBe(1)
     expect(fs[0]!.sid).toBe(2)
@@ -575,7 +575,7 @@ describe('robustness', () => {
     expect(() => decodeFrame(bytes.subarray(0, bytes.length - 3))).toThrow()
   })
 
-  it('an empty envelop decodes to no frames', () => {
-    expect(decodeEnvelop(new Uint8Array(0))).toEqual([])
+  it('an empty envelope decodes to no frames', () => {
+    expect(decodeEnvelope(new Uint8Array(0))).toEqual([])
   })
 })

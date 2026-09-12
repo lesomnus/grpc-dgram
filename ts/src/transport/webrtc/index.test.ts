@@ -159,7 +159,7 @@ describe('reliable datachannel echo (the final-goal demo shape)', () => {
 })
 
 describe('message size (§4.4)', () => {
-  it('refuses an oversize envelop synchronously and the call fails RESOURCE_EXHAUSTED', async () => {
+  it('refuses an oversize envelope synchronously and the call fails RESOURCE_EXHAUSTED', async () => {
     const [a, b] = mockPair()
     a.open()
     b.open()

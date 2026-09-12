@@ -11,7 +11,7 @@ is, how interoperability is proven, and where the two languages differ.
 
 ## What it is
 
-- **Zero runtime dependencies.** `Frame`, `Envelop` and `Metadata` are
+- **Zero runtime dependencies.** `Frame`, `Envelope` and `Metadata` are
   hand-encoded protobuf; user payloads go through pluggable per-method codecs.
   The protobuf-es and Connect-ES bindings are optional peer dependencies.
 - **Both endpoints**, with the full datagram machinery: seq windows and dedup,
@@ -24,7 +24,7 @@ is, how interoperability is proven, and where the two languages differ.
 
 ```
 ts/src/
-  wire.ts     frame/envelop/metadata codec, flags, shape helpers
+  wire.ts     frame/envelope/metadata codec, flags, shape helpers
   conn.ts     Conn + ClientStream          server.ts  Server + streams
   seq.ts      tx seq + rx window           flow (in util.ts) stream + connection credit windows
   stats.ts    ProtocolStats observer + Counters (the §14 gap counter)
@@ -155,7 +155,7 @@ serializer. If you already use Connect-ES, `createDrpcTransport(conn)` keeps
 | generated stubs / `RegisterService` | `conn.invoke(desc, req)` / `server.register(desc, handler)` |
 | `TransportInfo` / `ConnAttacher` | the same seams, structural (`reliable()`, `attachConn()`) |
 | `drpc.ErrMessageTooLarge` | `MessageTooLargeError` |
-| `udp.Transport.Send(ctx, *Envelop)` — the §4.1 batching seam | `sendFrames` on every exported adapter class, mirroring that class's `handle`: `sendFrames(frames)`, or `sendFrames(frames, ctx)` where `handle` takes a context |
+| `udp.Transport.Send(ctx, *Envelope)` — the §4.1 batching seam | `sendFrames` on every exported adapter class, mirroring that class's `handle`: `sendFrames(frames)`, or `sendFrames(frames, ctx)` where `handle` takes a context |
 | `NewPeerContext` / `NewReliableContext` | a `FrameContext { peer, reliable, signal }` argument |
 | `WithLimits(Limits{MaxPeerWindow: n})` — the §4.2.1 connection window | `limits: { maxPeerWindow: n }` on `ConnOptions` / `ServerOptions`; same floor (`W_CONN` = 1024), same default, same `sid = 0` grants on the wire |
 | `EventPeerFlowStall` / `EventPeerFlowResume` (with the stream pair) | `'peer-flow-stall'` / `'peer-flow-resume'` — see [observability.md](./observability.md#typescript) |

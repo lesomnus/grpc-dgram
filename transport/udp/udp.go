@@ -1,5 +1,5 @@
 // Package udp runs drpc over UDP datagrams: one datagram carries one
-// marshaled Envelop, the channel is unreliable (drpc's default mode), and
+// marshaled Envelope, the channel is unreliable (drpc's default mode), and
 // nothing is ever fragmented — a message that does not fit MaxMessageSize is
 // refused at send with drpc.ErrMessageTooLarge, which the core surfaces as
 // ResourceExhausted on the owning call (PROTOCOL.md §4.4).
@@ -62,7 +62,7 @@ type options struct {
 
 type Option func(*options)
 
-// WithMaxMessageSize sets the largest marshaled Envelop this endpoint will
+// WithMaxMessageSize sets the largest marshaled Envelope this endpoint will
 // send, in bytes. It bounds sends only; receives accept any datagram.
 func WithMaxMessageSize(n int) Option {
 	return func(o *options) { o.maxMessageSize = n }
@@ -76,13 +76,13 @@ func buildOptions(opts []Option) options {
 	return o
 }
 
-func marshal(e *drpc.Envelop, limit int) ([]byte, error) {
+func marshal(e *drpc.Envelope, limit int) ([]byte, error) {
 	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(e)
 	if err != nil {
 		return nil, err
 	}
 	if len(data) > limit {
-		return nil, fmt.Errorf("udp: %d-byte envelop over the %d-byte limit: %w",
+		return nil, fmt.Errorf("udp: %d-byte envelope over the %d-byte limit: %w",
 			len(data), limit, drpc.ErrMessageTooLarge)
 	}
 	return data, nil
@@ -104,7 +104,7 @@ func serve(ctx context.Context, h drpc.FrameHandler, read func([]byte) (int, con
 			}
 			return err
 		}
-		e := &drpc.Envelop{}
+		e := &drpc.Envelope{}
 		if err := proto.Unmarshal(buf[:n], e); err != nil {
 			continue
 		}
@@ -168,18 +168,18 @@ func (t *Transport) Peer() *peer.Peer {
 	return &peer.Peer{Addr: t.c.RemoteAddr(), LocalAddr: t.c.LocalAddr()}
 }
 
-// Handle sends one frame as a single-frame envelop.
+// Handle sends one frame as a single-frame envelope.
 func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return t.Send(ctx, e)
 }
 
-// Send transmits one envelop as one datagram. A transient unreachable
+// Send transmits one envelope as one datagram. A transient unreachable
 // condition is reported as success: the datagram is lost, which UDP already
 // promises — failing the call instead would defeat the retransmission
 // machinery that rides out a restarting peer.
-func (t *Transport) Send(_ context.Context, e *drpc.Envelop) error {
+func (t *Transport) Send(_ context.Context, e *drpc.Envelope) error {
 	data, err := marshal(e, t.max)
 	if err != nil {
 		return err
@@ -207,15 +207,15 @@ func NewGateway(c *net.UDPConn, opts ...Option) *Gateway {
 // Reliable reports false: UDP loses, duplicates, and reorders.
 func (g *Gateway) Reliable() bool { return false }
 
-// Handle sends one frame as a single-frame envelop to the peer named in ctx.
+// Handle sends one frame as a single-frame envelope to the peer named in ctx.
 func (g *Gateway) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return g.Send(ctx, e)
 }
 
-// Send transmits one envelop as one datagram to the peer named in ctx.
-func (g *Gateway) Send(ctx context.Context, e *drpc.Envelop) error {
+// Send transmits one envelope as one datagram to the peer named in ctx.
+func (g *Gateway) Send(ctx context.Context, e *drpc.Envelope) error {
 	key, ok := drpc.PeerFromContext(ctx)
 	if !ok {
 		return errors.New("udp: no peer in context")

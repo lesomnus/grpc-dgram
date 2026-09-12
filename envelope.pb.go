@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        (unknown)
-// source: drpc/envelop.proto
+// source: drpc/envelope.proto
 
 package drpc
 
@@ -20,30 +20,30 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// Envelop is the wire unit: every transport message/datagram is exactly one
-// marshaled Envelop holding 1..n frames, processed in order. See PROTOCOL.md §4.1.
-type Envelop struct {
+// Envelope is the wire unit: every transport message/datagram is exactly one
+// marshaled Envelope holding 1..n frames, processed in order. See PROTOCOL.md §4.1.
+type Envelope struct {
 	state             protoimpl.MessageState `protogen:"opaque.v1"`
 	xxx_hidden_Frames *[]*Frame              `protobuf:"bytes,1,rep,name=frames"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
 
-func (x *Envelop) Reset() {
-	*x = Envelop{}
-	mi := &file_drpc_envelop_proto_msgTypes[0]
+func (x *Envelope) Reset() {
+	*x = Envelope{}
+	mi := &file_drpc_envelope_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *Envelop) String() string {
+func (x *Envelope) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*Envelop) ProtoMessage() {}
+func (*Envelope) ProtoMessage() {}
 
-func (x *Envelop) ProtoReflect() protoreflect.Message {
-	mi := &file_drpc_envelop_proto_msgTypes[0]
+func (x *Envelope) ProtoReflect() protoreflect.Message {
+	mi := &file_drpc_envelope_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -54,7 +54,7 @@ func (x *Envelop) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-func (x *Envelop) GetFrames() []*Frame {
+func (x *Envelope) GetFrames() []*Frame {
 	if x != nil {
 		if x.xxx_hidden_Frames != nil {
 			return *x.xxx_hidden_Frames
@@ -63,39 +63,39 @@ func (x *Envelop) GetFrames() []*Frame {
 	return nil
 }
 
-func (x *Envelop) SetFrames(v []*Frame) {
+func (x *Envelope) SetFrames(v []*Frame) {
 	x.xxx_hidden_Frames = &v
 }
 
-type Envelop_builder struct {
+type Envelope_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
 	Frames []*Frame
 }
 
-func (b0 Envelop_builder) Build() *Envelop {
-	m0 := &Envelop{}
+func (b0 Envelope_builder) Build() *Envelope {
+	m0 := &Envelope{}
 	b, x := &b0, m0
 	_, _ = b, x
 	x.xxx_hidden_Frames = &b.Frames
 	return m0
 }
 
-var File_drpc_envelop_proto protoreflect.FileDescriptor
+var File_drpc_envelope_proto protoreflect.FileDescriptor
 
-const file_drpc_envelop_proto_rawDesc = "" +
+const file_drpc_envelope_proto_rawDesc = "" +
 	"\n" +
-	"\x12drpc/envelop.proto\x12\x04drpc\x1a\x10drpc/frame.proto\".\n" +
-	"\aEnvelop\x12#\n" +
+	"\x13drpc/envelope.proto\x12\x04drpc\x1a\x10drpc/frame.proto\"/\n" +
+	"\bEnvelope\x12#\n" +
 	"\x06frames\x18\x01 \x03(\v2\v.drpc.FrameR\x06framesB%Z#github.com/lesomnus/grpc-dgram;drpcb\beditionsp\xe8\a"
 
-var file_drpc_envelop_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
-var file_drpc_envelop_proto_goTypes = []any{
-	(*Envelop)(nil), // 0: drpc.Envelop
-	(*Frame)(nil),   // 1: drpc.Frame
+var file_drpc_envelope_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_drpc_envelope_proto_goTypes = []any{
+	(*Envelope)(nil), // 0: drpc.Envelope
+	(*Frame)(nil),    // 1: drpc.Frame
 }
-var file_drpc_envelop_proto_depIdxs = []int32{
-	1, // 0: drpc.Envelop.frames:type_name -> drpc.Frame
+var file_drpc_envelope_proto_depIdxs = []int32{
+	1, // 0: drpc.Envelope.frames:type_name -> drpc.Frame
 	1, // [1:1] is the sub-list for method output_type
 	1, // [1:1] is the sub-list for method input_type
 	1, // [1:1] is the sub-list for extension type_name
@@ -103,9 +103,9 @@ var file_drpc_envelop_proto_depIdxs = []int32{
 	0, // [0:1] is the sub-list for field type_name
 }
 
-func init() { file_drpc_envelop_proto_init() }
-func file_drpc_envelop_proto_init() {
-	if File_drpc_envelop_proto != nil {
+func init() { file_drpc_envelope_proto_init() }
+func file_drpc_envelope_proto_init() {
+	if File_drpc_envelope_proto != nil {
 		return
 	}
 	file_drpc_frame_proto_init()
@@ -113,17 +113,17 @@ func file_drpc_envelop_proto_init() {
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_drpc_envelop_proto_rawDesc), len(file_drpc_envelop_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_drpc_envelope_proto_rawDesc), len(file_drpc_envelope_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   1,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_drpc_envelop_proto_goTypes,
-		DependencyIndexes: file_drpc_envelop_proto_depIdxs,
-		MessageInfos:      file_drpc_envelop_proto_msgTypes,
+		GoTypes:           file_drpc_envelope_proto_goTypes,
+		DependencyIndexes: file_drpc_envelope_proto_depIdxs,
+		MessageInfos:      file_drpc_envelope_proto_msgTypes,
 	}.Build()
-	File_drpc_envelop_proto = out.File
-	file_drpc_envelop_proto_goTypes = nil
-	file_drpc_envelop_proto_depIdxs = nil
+	File_drpc_envelope_proto = out.File
+	file_drpc_envelope_proto_goTypes = nil
+	file_drpc_envelope_proto_depIdxs = nil
 }

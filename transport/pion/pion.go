@@ -1,5 +1,5 @@
 // Package pion runs drpc over pion WebRTC DataChannels: one channel message
-// carries one marshaled Envelop, and the protocol mode is derived from the
+// carries one marshaled Envelope, and the protocol mode is derived from the
 // channel's own configuration — an ordered channel with no retransmit or
 // lifetime cap is reliable, so the core runs with every timer off
 // (PROTOCOL.md §10.6); any other configuration is unreliable and the full
@@ -38,7 +38,7 @@ type options struct {
 
 type Option func(*options)
 
-// WithMaxMessageSize sets the largest marshaled Envelop this endpoint will
+// WithMaxMessageSize sets the largest marshaled Envelope this endpoint will
 // send, in bytes; 0 removes the limit. It bounds sends only; receives accept
 // any message. Unset, the limit follows the channel mode:
 // DefaultMaxMessageSizeUnreliable or DefaultMaxMessageSizeReliable.
@@ -134,18 +134,18 @@ func (t *Transport) Peer() *peer.Peer {
 	return &peer.Peer{Addr: dcAddr{label: t.ch.dc.Label()}}
 }
 
-// Handle sends one frame as a single-frame envelop.
+// Handle sends one frame as a single-frame envelope.
 func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return t.Send(ctx, e)
 }
 
-// Send transmits one envelop as one channel message. It waits for the channel
+// Send transmits one envelope as one channel message. It waits for the channel
 // to open and applies backpressure per WithMaxBufferedAmount, both bounded by
-// ctx; an envelop over the size limit is refused synchronously with an error
+// ctx; an envelope over the size limit is refused synchronously with an error
 // wrapping drpc.ErrMessageTooLarge (PROTOCOL.md §4.4).
-func (t *Transport) Send(ctx context.Context, e *drpc.Envelop) error {
+func (t *Transport) Send(ctx context.Context, e *drpc.Envelope) error {
 	return t.ch.send(ctx, e)
 }
 
@@ -253,16 +253,16 @@ func (g *Gateway) ServePeer(ctx context.Context, srv *drpc.Server, dc *webrtc.Da
 	return err
 }
 
-// Handle sends one frame as a single-frame envelop to the peer named in ctx.
+// Handle sends one frame as a single-frame envelope to the peer named in ctx.
 func (g *Gateway) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return g.Send(ctx, e)
 }
 
-// Send transmits one envelop as one channel message to the peer named in
+// Send transmits one envelope as one channel message to the peer named in
 // ctx, with the same gating as Transport.Send.
-func (g *Gateway) Send(ctx context.Context, e *drpc.Envelop) error {
+func (g *Gateway) Send(ctx context.Context, e *drpc.Envelope) error {
 	key, ok := drpc.PeerFromContext(ctx)
 	if !ok {
 		return errors.New("pion: no peer in context")

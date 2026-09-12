@@ -1,6 +1,6 @@
 // Shared test plumbing: a JSON payload codec, an echo service, in-memory
 // transports that round-trip every frame through the real wire codec (the
-// same way the Go e2e pipes marshal real Envelops), and the fake Go runtime
+// same way the Go e2e pipes marshal real Envelopes), and the fake Go runtime
 // both src/wasm suites drive.
 
 import { Conn, type ConnOptions } from '../conn'
@@ -84,7 +84,7 @@ export interface TestNet {
 
 // makeNet wires a Conn and a Server through an in-memory channel with
 // synchronous, in-order delivery (awaited handle per frame, like an adapter
-// delivering an envelop) and per-direction loss filters.
+// delivering an envelope) and per-direction loss filters.
 export function makeNet(opts: { reliable: boolean; connOpts?: ConnOptions; serverOpts?: ServerOptions; register?: (server: Server) => void; peer?: string }): TestNet {
   const peer = opts.peer ?? 'peer-1'
   const net = {

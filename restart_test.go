@@ -58,7 +58,7 @@ func newRestartPipe(t *testing.T) *restartPipe {
 	}
 	p.srv.Store(p.newServer())
 
-	// Frames round-trip through real Envelop serialization (PROTOCOL.md §4.1);
+	// Frames round-trip through real Envelope serialization (PROTOCOL.md §4.1);
 	// the delivery target is resolved per frame so a swapped-in incarnation
 	// takes over the address transparently.
 	pump := func(ch chan []byte, deliver func(context.Context, *drpc.Frame)) func() {
@@ -68,7 +68,7 @@ func newRestartPipe(t *testing.T) *restartPipe {
 				case <-ctx.Done():
 					return
 				case data := <-ch:
-					e := &drpc.Envelop{}
+					e := &drpc.Envelope{}
 					if err := proto.Unmarshal(data, e); err != nil {
 						panic(err)
 					}
@@ -92,7 +92,7 @@ func newRestartPipe(t *testing.T) *restartPipe {
 }
 
 func (p *restartPipe) newServer() *drpc.Server {
-	tx := drpc.Wrap1(drpc.EnvelopHandlerFunc(func(_ context.Context, e *drpc.Envelop) error {
+	tx := drpc.Wrap1(drpc.EnvelopeHandlerFunc(func(_ context.Context, e *drpc.Envelope) error {
 		if p.s2cDead.Load() {
 			return nil
 		}
@@ -112,7 +112,7 @@ func (p *restartPipe) newServer() *drpc.Server {
 // client process dying: its tx goes dark, but nothing is cleaned up.
 func (p *restartPipe) newConn() (client echo.EchoServiceClient, dead *atomic.Bool) {
 	dead = &atomic.Bool{}
-	tx := drpc.Wrap1(drpc.EnvelopHandlerFunc(func(_ context.Context, e *drpc.Envelop) error {
+	tx := drpc.Wrap1(drpc.EnvelopeHandlerFunc(func(_ context.Context, e *drpc.Envelope) error {
 		if dead.Load() {
 			return nil
 		}

@@ -626,7 +626,7 @@ func TestBlockedDeliveryDeath(t *testing.T) {
 func TestLargeMessage(t *testing.T) {
 	e := serveReliable(t)
 
-	// Message sized so the marshaled envelop stays under the 16 KiB reliable
+	// Message sized so the marshaled envelope stays under the 16 KiB reliable
 	// default while dwarfing any single SCTP packet.
 	msg := strings.Repeat("x", 16_000)
 	res, err := e.client.Once(t.Context(), echo.EchoRequest_builder{

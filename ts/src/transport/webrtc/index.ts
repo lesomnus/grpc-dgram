@@ -1,5 +1,5 @@
 // drpc over WebRTC DataChannels: one channel message carries one marshaled
-// Envelop, and the protocol mode is derived from the channel's own
+// Envelope, and the protocol mode is derived from the channel's own
 // configuration — an ordered channel with no retransmit or lifetime cap is
 // reliable, so the core runs with every timer off (PROTOCOL.md §10.6); any
 // other configuration is unreliable and the full timer machinery is on. Same
@@ -31,9 +31,9 @@ import { MessageTooLargeError } from '../../status'
 import type { FrameContext, FrameHandler } from '../../seam'
 import { unpack } from '../../seam'
 import { abortListener, Latch, noop, unrefTimer } from '../../util'
-import { decodeEnvelop, encodeEnvelop, type Frame } from '../../wire'
+import { decodeEnvelope, encodeEnvelope, type Frame } from '../../wire'
 
-// DefaultMaxMessageSizeUnreliable keeps an envelop inside one SCTP packet on
+// DefaultMaxMessageSizeUnreliable keeps an envelope inside one SCTP packet on
 // the typical 1500-byte path MTU: a partially-reliable message that SCTP
 // fragments is lost whenever any one fragment is lost, multiplying the
 // effective loss rate (PROTOCOL.md §4.4).
@@ -80,7 +80,7 @@ export interface DataChannelLike {
 }
 
 export interface DataChannelOptions {
-  // Largest marshaled Envelop this endpoint will send, in bytes; 0 removes
+  // Largest marshaled Envelope this endpoint will send, in bytes; 0 removes
   // the limit. Bounds sends only. Unset, it follows the channel mode:
   // DefaultMaxMessageSizeUnreliable or DefaultMaxMessageSizeReliable.
   maxMessageSize?: number
@@ -98,7 +98,7 @@ export interface DataChannelOptions {
 // both ends observe the same parameters, negotiated or DCEP-announced.
 // Ordered delivery with neither a retransmit cap nor a lifetime cap is full
 // SCTP reliability: the core runs with every timer off (PROTOCOL.md §10.6).
-// Any cap — even maxRetransmits: 0 — or unordered delivery lets envelops
+// Any cap — even maxRetransmits: 0 — or unordered delivery lets envelopes
 // vanish or arrive out of order: the loss profile the core's timer machinery
 // exists for.
 export function channelReliable(dc: DataChannelLike): boolean {
@@ -179,11 +179,11 @@ class Channel {
     const data = (ev as { data?: unknown }).data
     if (data instanceof ArrayBuffer) this.rx.push(new Uint8Array(data))
     else if (data instanceof Uint8Array) this.rx.push(data)
-    else return // string / Blob: not a drpc envelop; dropped
+    else return // string / Blob: not a drpc envelope; dropped
     wakeAll(this.rxWaiters)
   }
 
-  // send transmits one envelop as one channel message. It refuses an envelop
+  // send transmits one envelope as one channel message. It refuses an envelope
   // over the size limit (PROTOCOL.md §4.4 — as a rejection, this method being
   // async; the core treats a throw and a rejection alike), waits for the
   // channel to open, and blocks while bufferedAmount is at the high-water
@@ -191,9 +191,9 @@ class Channel {
   // one stall budget (the core's abort path sends with no signal at all, so
   // a signal alone cannot be the bound, §4.2).
   async send(frames: readonly Frame[], signal?: AbortSignal): Promise<void> {
-    const data = encodeEnvelop(frames)
+    const data = encodeEnvelope(frames)
     if (this.max > 0 && data.length > this.max) {
-      throw new MessageTooLargeError(`webrtc: ${data.length}-byte envelop over the ${this.max}-byte limit`)
+      throw new MessageTooLargeError(`webrtc: ${data.length}-byte envelope over the ${this.max}-byte limit`)
     }
 
     const stalled = new Latch()
@@ -261,7 +261,7 @@ class Channel {
       if (data !== undefined) {
         let frames: Frame[]
         try {
-          frames = decodeEnvelop(data)
+          frames = decodeEnvelope(data)
         } catch {
           continue // malformed messages are dropped; never tear down (§4.2)
         }
@@ -328,12 +328,12 @@ export class DataChannelTransport {
   }
 
   // sendFrames sends these frames as ONE channel message — one marshaled
-  // Envelop of 1..n frames is the wire unit either way (PROTOCOL.md §4.1). A
+  // Envelope of 1..n frames is the wire unit either way (PROTOCOL.md §4.1). A
   // thin passthrough: Channel.send owns the gating (channel open, the
   // buffered-amount mark, the stall budget) and the §4.4 size refusal, and
   // nothing is duplicated here.
   //
-  // It is the envelop-level seam a batching middleware flushes through (§4.1).
+  // It is the envelope-level seam a batching middleware flushes through (§4.1).
   // The library ships no batcher: what may share a message (which couples the
   // frames' fate on an unreliable channel) and how long a frame may wait for
   // company (§10.7) are answerable only against a workload. A user subclasses
@@ -349,7 +349,7 @@ export class DataChannelTransport {
     return this.ch.send(frames, ctx.signal)
   }
 
-  // handle sends one frame as a single-frame envelop: the no-batching default
+  // handle sends one frame as a single-frame envelope: the no-batching default
   // (§4.1), and always conformant.
   handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
     return this.sendFrames([f], ctx)
@@ -463,7 +463,7 @@ export class DataChannelGateway {
   }
 
   // sendFrames sends these frames as ONE channel message to the peer named in
-  // ctx, with the same gating as the client transport — the envelop-level seam
+  // ctx, with the same gating as the client transport — the envelope-level seam
   // a batching middleware flushes through (PROTOCOL.md §4.1).
   //
   // The ctx IS the address (§6.4): the whole message goes to the one channel
@@ -485,7 +485,7 @@ export class DataChannelGateway {
     return ch.send(frames, ctx.signal)
   }
 
-  // handle sends one frame as a single-frame envelop to the peer named in ctx:
+  // handle sends one frame as a single-frame envelope to the peer named in ctx:
   // the no-batching default (§4.1).
   handle(f: Frame, ctx: FrameContext = {}): Promise<void> {
     return this.sendFrames([f], ctx)

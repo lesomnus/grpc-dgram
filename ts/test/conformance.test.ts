@@ -96,7 +96,7 @@ const TRL_TEXT = 'conformance trailer 0x20..0x7E'
 const ERROR_INFO = new Uint8Array([0x0a, 0x0b, ...ascii('CONFORMANCE'), 0x12, 0x10, ...ascii('drpc.conformance')])
 
 // gzipBody is ~2 kB of compressible text: over the 1200-byte datagram limit
-// raw (both adapters refuse a larger envelop, §4.4), a few dozen bytes gzipped.
+// raw (both adapters refuse a larger envelope, §4.4), a few dozen bytes gzipped.
 // A call carrying it can only complete if BOTH implementations compress.
 const gzipBody = 'drpc-conformance-gzip-'.repeat(96)
 

@@ -12,7 +12,7 @@ package udp_test
 //  1. Embedding the adapter keeps every interface drpc.NewConn discovers
 //     visible. A field-wrapper would hide them, and the worst failure is
 //     silent (see TestBatcherKeepsTheDiscoveredInterfaces).
-//  2. A k-frame Envelop the Batcher builds leaves as ONE datagram and arrives
+//  2. A k-frame Envelope the Batcher builds leaves as ONE datagram and arrives
 //     as k frames, in order, through drpc.Unpack — the receive side has taken
 //     1..n frames per datagram all along (PROTOCOL.md §4.1).
 //  3. The §4.4 duty survives the Batcher: a frame that cannot fit the
@@ -55,7 +55,7 @@ import (
 )
 
 // batcher is what a user writes: a FrameHandler that collects frames and hands
-// them to the adapter as one Envelop.
+// them to the adapter as one Envelope.
 //
 // The adapter is EMBEDDED, not held in a field. Embedding promotes
 // AttachConn, Close, Reliable and Peer, which is exactly the set drpc.NewConn
@@ -82,7 +82,7 @@ type batcher struct {
 	mu      sync.Mutex
 	pending []*drpc.Frame
 
-	datagrams atomic.Int64 // envelops actually handed to the adapter
+	datagrams atomic.Int64 // envelopes actually handed to the adapter
 }
 
 func newBatcher(c net.Conn, flushAt int) *batcher {
@@ -94,9 +94,9 @@ func newBatcher(c net.Conn, flushAt int) *batcher {
 	}
 }
 
-// envelopSize is the marshaled length of the datagram these frames would make.
-func envelopSize(frames ...*drpc.Frame) int {
-	e := &drpc.Envelop{}
+// envelopeSize is the marshaled length of the datagram these frames would make.
+func envelopeSize(frames ...*drpc.Frame) int {
+	e := &drpc.Envelope{}
 	e.SetFrames(frames)
 	return proto.Size(e)
 }
@@ -112,16 +112,16 @@ func (b *batcher) Handle(ctx context.Context, f *drpc.Frame) error {
 	// undoRefused reclaims that call's seq and refunds its credit while the
 	// frame that really overran is dropped in silence. So the budget check
 	// happens here, synchronously, and b.max is the adapter's own budget.
-	if n := envelopSize(f); n > b.max {
+	if n := envelopeSize(f); n > b.max {
 		return fmt.Errorf("batcher: %d-byte frame over the %d-byte budget: %w", n, b.max, drpc.ErrMessageTooLarge)
 	}
 
 	b.mu.Lock()
 	var batch []*drpc.Frame
 	switch {
-	case len(b.pending) > 0 && envelopSize(append(append([]*drpc.Frame{}, b.pending...), f)...) > b.max:
+	case len(b.pending) > 0 && envelopeSize(append(append([]*drpc.Frame{}, b.pending...), f)...) > b.max:
 		// f does not fit alongside what is already waiting: what is waiting
-		// goes now, in order, and f opens the next envelop.
+		// goes now, in order, and f opens the next envelope.
 		batch, b.pending = b.pending, []*drpc.Frame{f}
 	default:
 		b.pending = append(b.pending, f)
@@ -134,11 +134,11 @@ func (b *batcher) Handle(ctx context.Context, f *drpc.Frame) error {
 	if batch == nil {
 		return nil
 	}
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames(batch)
 	b.datagrams.Add(1)
-	// Transport.Send is the exported envelop-level seam (drpc.EnvelopHandler,
-	// frame.go): one Envelop of 1..n frames, one datagram.
+	// Transport.Send is the exported envelope-level seam (drpc.EnvelopeHandler,
+	// frame.go): one Envelope of 1..n frames, one datagram.
 	return b.Transport.Send(ctx, e)
 }
 
@@ -189,7 +189,7 @@ type fieldBatcher struct {
 }
 
 func (b *fieldBatcher) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return b.tx.Send(ctx, e)
 }
@@ -274,7 +274,7 @@ func TestBatcherSendsOneDatagramPerBatch(t *testing.T) {
 		}
 	}
 	if got := b.datagrams.Load(); got != 1 {
-		t.Fatalf("envelops sent: got %d, want 1", got)
+		t.Fatalf("envelopes sent: got %d, want 1", got)
 	}
 
 	buf := make([]byte, 2048)
@@ -285,9 +285,9 @@ func TestBatcherSendsOneDatagramPerBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	if err := proto.Unmarshal(buf[:n], e); err != nil {
-		t.Fatalf("the datagram is not an Envelop: %v", err)
+		t.Fatalf("the datagram is not an Envelope: %v", err)
 	}
 
 	// drpc.Unpack is what an adapter runs on the receive path; driving it here
@@ -304,7 +304,7 @@ func TestBatcherSendsOneDatagramPerBatch(t *testing.T) {
 		t.Fatalf("frames delivered from one %d-byte datagram: got %d, want %d", n, len(got), len(want))
 	}
 	for i := range want {
-		// Order is not decoration: within one envelop the frames of a stream
+		// Order is not decoration: within one envelope the frames of a stream
 		// are delivered in the order they were packed (§4.1).
 		if got[i] != want[i] {
 			t.Fatalf("frame %d: got sid/seq %v, want %v", i, got[i], want[i])
@@ -340,7 +340,7 @@ func TestBatcherFailsAnOversizeFrameSynchronously(t *testing.T) {
 		t.Fatalf("frames left pending after the refusal: got %d, want 0", got)
 	}
 	if got := b.datagrams.Load(); got != 0 {
-		t.Fatalf("envelops sent: got %d, want 0", got)
+		t.Fatalf("envelopes sent: got %d, want 0", got)
 	}
 
 	// A frame that does fit still flows: the refusal is per message, and the
@@ -358,7 +358,7 @@ func TestBatcherFailsAnOversizeFrameSynchronously(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	if err := proto.Unmarshal(buf[:n], e); err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +399,7 @@ func TestBatcherSerialisesConcurrentHandles(t *testing.T) {
 	}
 
 	// Every frame handed in left exactly once: none lost to a torn append,
-	// none packed into two envelops.
+	// none packed into two envelopes.
 	seen := map[uint32]int{}
 	buf := make([]byte, 2048)
 	for range senders / flushAt {
@@ -410,9 +410,9 @@ func TestBatcherSerialisesConcurrentHandles(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		e := &drpc.Envelop{}
+		e := &drpc.Envelope{}
 		if err := proto.Unmarshal(buf[:n], e); err != nil {
-			t.Fatalf("the datagram is not an Envelop: %v", err)
+			t.Fatalf("the datagram is not an Envelope: %v", err)
 		}
 		for _, f := range e.GetFrames() {
 			seen[f.GetSid()]++

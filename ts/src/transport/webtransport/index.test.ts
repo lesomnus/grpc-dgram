@@ -17,7 +17,7 @@ import { unpack } from '../../seam'
 import { Code, MessageTooLargeError, type StatusError } from '../../status'
 import { echo, registerEcho, tick } from '../../testing'
 import { noop } from '../../util'
-import { decodeEnvelop, encodeEnvelop, FlagOpen, FlagPing, frame, type Frame } from '../../wire'
+import { decodeEnvelope, encodeEnvelope, FlagOpen, FlagPing, frame, type Frame } from '../../wire'
 import { DefaultMaxMessageSize, dialWebTransport, WebTransportDatagramTransport, type WebTransportDatagramOptions, type WebTransportDialOptions, type WebTransportLike } from './index'
 
 // The platform's own WebTransport fits the structural type as the DOM lib
@@ -162,11 +162,11 @@ function mockPair(maxDatagramSize?: number, shape?: SinkShape): [MockWebTranspor
 }
 
 // serveMock stands in for the Go gateway on the far end of a pair: a Server
-// whose tx writes one envelop per datagram, fed by a pump over the mock's
+// whose tx writes one envelope per datagram, fed by a pump over the mock's
 // readable under a fixed peer key and the mode annotation (§4.3).
 function serveMock(wt: MockWebTransport, reliable = false) {
   const writer = wt.sink.getWriter()
-  const server = new Server({ handle: (f: Frame) => writer.write(encodeEnvelop([f])).catch(noop) }, { reliable })
+  const server = new Server({ handle: (f: Frame) => writer.write(encodeEnvelope([f])).catch(noop) }, { reliable })
   const counts = registerEcho(server)
   const serving = (async () => {
     const reader = wt.datagrams.readable.getReader()
@@ -176,7 +176,7 @@ function serveMock(wt: MockWebTransport, reliable = false) {
       if (value === undefined) continue
       let frames: Frame[]
       try {
-        frames = decodeEnvelop(value)
+        frames = decodeEnvelope(value)
       } catch {
         continue
       }
@@ -199,7 +199,7 @@ function wireEnds(opts: { connect?: boolean; maxDatagramSize?: number; client?: 
   return { a, b, conn, ...far }
 }
 
-// bigFrame is an OPEN whose envelop is at least n bytes.
+// bigFrame is an OPEN whose envelope is at least n bytes.
 function bigFrame(n: number): Frame {
   return frame({ epoch: 1, sid: 1, flags: FlagOpen, method: '/test.Echo/Once', payload: new Uint8Array(n) })
 }
@@ -214,7 +214,7 @@ describe('unreliable webtransport echo (the Go transport/webtransport pair, TS s
     expect(net.conn.reliable).toBe(false) // discovered via TransportInfo, not configured
     expect(await net.conn.invoke(echo.once, { text: 'hello' })).toEqual({ text: 'echo:hello' })
     expect(net.a.sent.length).toBeGreaterThanOrEqual(1)
-    for (const d of net.a.sent) expect(() => decodeEnvelop(d)).not.toThrow() // one marshaled Envelop per datagram
+    for (const d of net.a.sent) expect(() => decodeEnvelope(d)).not.toThrow() // one marshaled Envelope per datagram
     net.conn.close()
     await net.serving
   })
@@ -275,7 +275,7 @@ describe('unreliable webtransport echo (the Go transport/webtransport pair, TS s
 })
 
 describe('message size (§4.4)', () => {
-  it('refuses an oversize envelop synchronously — nothing reaches the platform — and the call fails RESOURCE_EXHAUSTED', async () => {
+  it('refuses an oversize envelope synchronously — nothing reaches the platform — and the call fails RESOURCE_EXHAUSTED', async () => {
     const net = wireEnds({ client: { maxMessageSize: 128 } })
     const err = (await net.conn.invoke(echo.once, { text: 'x'.repeat(500) }).catch((e) => e)) as StatusError
     expect(err.code).toBe(Code.RESOURCE_EXHAUSTED)
@@ -351,7 +351,7 @@ describe('message size (§4.4)', () => {
     net.conn.close()
   })
 
-  it('once up, the ceiling in force at the write is the judge: a queued envelop over it is refused, and nothing reaches the platform', async () => {
+  it('once up, the ceiling in force at the write is the judge: a queued envelope over it is refused, and nothing reaches the platform', async () => {
     const net = wireEnds({ connect: false, conn: { timing: { callMs: 300 } } })
     const p = net.conn.invoke(echo.once, { text: 'x'.repeat(1100) }).catch((e) => e)
     await tick()
@@ -494,7 +494,7 @@ describe('nothing is delivered after close (§4.5)', () => {
     a.connect()
     await tick()
 
-    const env = encodeEnvelop([frame({ epoch: 1, flags: FlagPing })])
+    const env = encodeEnvelope([frame({ epoch: 1, flags: FlagPing })])
     a.deliver(env)
     await tick()
     expect(conn.handle).toHaveBeenCalledTimes(1) // a live session delivers

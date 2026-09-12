@@ -555,14 +555,14 @@ func frameOf(n int) *drpc.Frame {
 	return f
 }
 
-// envelopOf builds a single-frame envelop that marshals to exactly n bytes.
-func envelopOf(t *testing.T, n int) *drpc.Envelop {
+// envelopeOf builds a single-frame envelope that marshals to exactly n bytes.
+func envelopeOf(t *testing.T, n int) *drpc.Envelope {
 	t.Helper()
 	// The framing overhead depends on the payload through its length
 	// varints; a few corrections converge.
 	payload := n
 	for range 4 {
-		e := &drpc.Envelop{}
+		e := &drpc.Envelope{}
 		e.SetFrames([]*drpc.Frame{frameOf(payload)})
 		got := proto.Size(e)
 		if got == n {
@@ -570,11 +570,11 @@ func envelopOf(t *testing.T, n int) *drpc.Envelop {
 		}
 		payload -= got - n
 	}
-	t.Fatalf("could not build a %d-byte envelop", n)
+	t.Fatalf("could not build a %d-byte envelope", n)
 	return nil
 }
 
-// TestLargeMessage covers PROTOCOL.md §4.4: an envelop that does not fit is
+// TestLargeMessage covers PROTOCOL.md §4.4: an envelope that does not fit is
 // refused synchronously with ErrMessageTooLarge — by the adapter's limit, or
 // by the stack's own ceiling when the limit is raised past it — and nothing
 // reaches the wire; the owning call fails ResourceExhausted and the channel
@@ -657,7 +657,7 @@ func TestSendBoundedOnDeadPath(t *testing.T) {
 	tp := webtransport.New(cs)
 
 	// A warm path: one datagram across.
-	if err := tp.Send(t.Context(), envelopOf(t, 1000)); err != nil {
+	if err := tp.Send(t.Context(), envelopeOf(t, 1000)); err != nil {
 		t.Fatal(err)
 	}
 	rctx, rcancel := context.WithTimeout(t.Context(), 2*time.Second)
@@ -672,7 +672,7 @@ func TestSendBoundedOnDeadPath(t *testing.T) {
 	// parks — and must give up on its ctx, promptly, rather than wait for
 	// the probe that frees a slot.
 	bh.drop.Store(true)
-	e := envelopOf(t, 1000)
+	e := envelopeOf(t, 1000)
 	const budget = 100 * time.Millisecond
 	parked := 0
 	for i := 0; i < 512 && parked < 4; i++ {
@@ -712,8 +712,8 @@ func TestMaxMessageSizeDefault(t *testing.T) {
 	tp := webtransport.New(cs)
 
 	// Exactly the default: sent, and it arrives whole.
-	if err := tp.Send(t.Context(), envelopOf(t, webtransport.DefaultMaxMessageSize)); err != nil {
-		t.Fatalf("a %d-byte envelop must go through the default limit: %v", webtransport.DefaultMaxMessageSize, err)
+	if err := tp.Send(t.Context(), envelopeOf(t, webtransport.DefaultMaxMessageSize)); err != nil {
+		t.Fatalf("a %d-byte envelope must go through the default limit: %v", webtransport.DefaultMaxMessageSize, err)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
@@ -724,16 +724,16 @@ func TestMaxMessageSizeDefault(t *testing.T) {
 	if len(b) != webtransport.DefaultMaxMessageSize {
 		t.Fatalf("got a %d-byte datagram, want %d", len(b), webtransport.DefaultMaxMessageSize)
 	}
-	if err := proto.Unmarshal(b, &drpc.Envelop{}); err != nil {
-		t.Fatalf("the datagram is not the envelop: %v", err)
+	if err := proto.Unmarshal(b, &drpc.Envelope{}); err != nil {
+		t.Fatalf("the datagram is not the envelope: %v", err)
 	}
 
 	// One byte more is refused; the option moves the line.
-	if err := tp.Send(t.Context(), envelopOf(t, webtransport.DefaultMaxMessageSize+1)); !errors.Is(err, drpc.ErrMessageTooLarge) {
+	if err := tp.Send(t.Context(), envelopeOf(t, webtransport.DefaultMaxMessageSize+1)); !errors.Is(err, drpc.ErrMessageTooLarge) {
 		t.Fatalf("got %v, want ErrMessageTooLarge", err)
 	}
 	small := webtransport.New(cs, webtransport.WithMaxMessageSize(64))
-	if err := small.Send(t.Context(), envelopOf(t, 65)); !errors.Is(err, drpc.ErrMessageTooLarge) {
+	if err := small.Send(t.Context(), envelopeOf(t, 65)); !errors.Is(err, drpc.ErrMessageTooLarge) {
 		t.Fatalf("got %v, want ErrMessageTooLarge under a 64-byte limit", err)
 	}
 }

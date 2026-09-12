@@ -1,5 +1,5 @@
 // Package webtransport runs drpc over WebTransport datagrams: one datagram
-// carries one marshaled Envelop, the channel is unreliable (drpc's default
+// carries one marshaled Envelope, the channel is unreliable (drpc's default
 // mode), and nothing is ever fragmented — a message that does not fit
 // MaxMessageSize is refused at send with drpc.ErrMessageTooLarge, which the
 // core surfaces as ResourceExhausted on the owning call (PROTOCOL.md §4.4).
@@ -52,7 +52,7 @@ type options struct {
 
 type Option func(*options)
 
-// WithMaxMessageSize sets the largest marshaled Envelop this endpoint will
+// WithMaxMessageSize sets the largest marshaled Envelope this endpoint will
 // send, in bytes. It bounds sends only; receives accept any datagram. The
 // QUIC stack keeps its own, path-dependent ceiling underneath: a limit
 // raised past it does not fragment — the send is refused the same way
@@ -69,19 +69,19 @@ func buildOptions(opts []Option) options {
 	return o
 }
 
-func marshal(e *drpc.Envelop, limit int) ([]byte, error) {
+func marshal(e *drpc.Envelope, limit int) ([]byte, error) {
 	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(e)
 	if err != nil {
 		return nil, err
 	}
 	if len(data) > limit {
-		return nil, fmt.Errorf("webtransport: %d-byte envelop over the %d-byte limit: %w",
+		return nil, fmt.Errorf("webtransport: %d-byte envelope over the %d-byte limit: %w",
 			len(data), limit, drpc.ErrMessageTooLarge)
 	}
 	return data, nil
 }
 
-// send transmits one marshaled envelop as one datagram, waiting on the
+// send transmits one marshaled envelope as one datagram, waiting on the
 // stack only as long as ctx and the session live. The stack checks its own
 // ceiling — the peer's max_datagram_frame_size and the current path-MTU
 // estimate — synchronously, before anything is queued; a refusal there is a
@@ -113,7 +113,7 @@ func send(ctx context.Context, sess *wt.Session, data []byte) error {
 	case err := <-done:
 		var tooLarge *quic.DatagramTooLargeError
 		if errors.As(err, &tooLarge) {
-			return fmt.Errorf("webtransport: %d-byte envelop over the session's %d-byte datagram ceiling (HTTP/3 prefix included): %w",
+			return fmt.Errorf("webtransport: %d-byte envelope over the session's %d-byte datagram ceiling (HTTP/3 prefix included): %w",
 				len(data), tooLarge.MaxDatagramPayloadSize, drpc.ErrMessageTooLarge)
 		}
 		return err
@@ -171,7 +171,7 @@ func serve(ctx context.Context, sess *wt.Session, rxCtx context.Context, h drpc.
 // Malformed datagrams are dropped — frame-level errors never tear down the
 // channel (PROTOCOL.md §4.2).
 func deliver(ctx context.Context, data []byte, h drpc.FrameHandler) {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	if err := proto.Unmarshal(data, e); err != nil {
 		return
 	}
@@ -279,20 +279,20 @@ func (t *Transport) Peer() *peer.Peer {
 	return &peer.Peer{Addr: t.sess.RemoteAddr(), LocalAddr: t.sess.LocalAddr()}
 }
 
-// Handle sends one frame as a single-frame envelop.
+// Handle sends one frame as a single-frame envelope.
 func (t *Transport) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return t.Send(ctx, e)
 }
 
-// Send transmits one envelop as one datagram. An envelop over the size
+// Send transmits one envelope as one datagram. An envelope over the size
 // limit — the adapter's or the stack's — is refused synchronously with an
 // error wrapping drpc.ErrMessageTooLarge (PROTOCOL.md §4.4). A send the
 // stack cannot take at once — its queue is full because the path has
 // stopped acknowledging — waits only as long as ctx and the session live,
 // and returns ctx's error when ctx ends first (see send).
-func (t *Transport) Send(ctx context.Context, e *drpc.Envelop) error {
+func (t *Transport) Send(ctx context.Context, e *drpc.Envelope) error {
 	data, err := marshal(e, t.max)
 	if err != nil {
 		return err
@@ -328,16 +328,16 @@ func NewGateway(opts ...Option) *Gateway {
 // ordered, so they are lost and reordered.
 func (g *Gateway) Reliable() bool { return false }
 
-// Handle sends one frame as a single-frame envelop to the peer named in ctx.
+// Handle sends one frame as a single-frame envelope to the peer named in ctx.
 func (g *Gateway) Handle(ctx context.Context, f *drpc.Frame) error {
-	e := &drpc.Envelop{}
+	e := &drpc.Envelope{}
 	e.SetFrames([]*drpc.Frame{f})
 	return g.Send(ctx, e)
 }
 
-// Send transmits one envelop as one datagram to the peer named in ctx, with
+// Send transmits one envelope as one datagram to the peer named in ctx, with
 // the same size refusal and the same ctx-bounded wait as Transport.Send.
-func (g *Gateway) Send(ctx context.Context, e *drpc.Envelop) error {
+func (g *Gateway) Send(ctx context.Context, e *drpc.Envelope) error {
 	key, ok := drpc.PeerFromContext(ctx)
 	if !ok {
 		return errors.New("webtransport: no peer in context")

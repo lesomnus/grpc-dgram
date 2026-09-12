@@ -22,7 +22,7 @@ log.Fatal(gw.Serve(context.Background(), srv))
 ```
 
 The wire between them is dRPC v1.1 — the same bytes a WebSocket carries, one
-marshaled `Envelop` per posted message (§4.1). And the server is not a mock of
+marshaled `Envelope` per posted message (§4.1). And the server is not a mock of
 the server: `todo/` implements `todopb.TodoServiceServer` with generated stubs,
 request validation, real statuses and a server-streaming method, and nothing in
 it is browser-specific — `GOOS=js GOARCH=wasm` is the entire difference between

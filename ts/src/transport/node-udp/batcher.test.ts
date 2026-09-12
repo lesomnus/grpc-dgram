@@ -21,7 +21,7 @@
 //     duck typing (seam.ts), and a subclass inherits attachConn/reliable/close
 //     through the prototype; a field-wrapper — the tempting shape — satisfies
 //     FrameHandler and loses all three, silently.
-//  2. A k-frame envelop the Batcher builds leaves as ONE datagram and arrives
+//  2. A k-frame envelope the Batcher builds leaves as ONE datagram and arrives
 //     as k frames, in order (§4.1) — the receive side has taken 1..n frames
 //     per datagram all along, so nothing there changes.
 //  3. The §4.4 duty survives the Batcher: a frame that cannot fit the
@@ -60,7 +60,7 @@ import { hasConnAttacher, hasTransportInfo, type FrameHandler } from '../../seam
 import { Server } from '../../server'
 import { MessageTooLargeError } from '../../status'
 import { echo, registerEcho } from '../../testing'
-import { decodeEnvelop, encodeEnvelop, frame, type Frame } from '../../wire'
+import { decodeEnvelope, encodeEnvelope, frame, type Frame } from '../../wire'
 import { DefaultMaxMessageSize, listenUdp, UdpGateway, UdpTransport } from './index'
 import { PortGateway, PortTransport } from '../port/index'
 import { DataChannelGateway, DataChannelTransport } from '../webrtc/index'
@@ -81,13 +81,13 @@ afterEach(() => {
   }
 })
 
-// envelopSize is the marshaled length of the datagram these frames would make.
-function envelopSize(frames: readonly Frame[]): number {
-  return encodeEnvelop(frames).length
+// envelopeSize is the marshaled length of the datagram these frames would make.
+function envelopeSize(frames: readonly Frame[]): number {
+  return encodeEnvelope(frames).length
 }
 
 // Batcher is what a user writes: a FrameHandler that collects frames and hands
-// them to the adapter as one envelop.
+// them to the adapter as one envelope.
 //
 // It EXTENDS the adapter rather than holding one in a field. The Conn
 // discovers capabilities by duck typing — hasConnAttacher, hasTransportInfo,
@@ -96,7 +96,7 @@ function envelopSize(frames: readonly Frame[]): number {
 // would satisfy FrameHandler and lose them all (see FieldBatcher).
 class Batcher extends UdpTransport {
   private pending: Frame[] = []
-  // Envelops actually handed to the adapter, i.e. datagrams written.
+  // Envelopes actually handed to the adapter, i.e. datagrams written.
   datagrams = 0
 
   constructor(
@@ -126,15 +126,15 @@ class Batcher extends UdpTransport {
     // OTHER call's handle happened to trigger it, so that call is told its
     // frame was too large — and the core believes it, reclaiming that call's
     // seq while the frame that really overran is dropped in silence.
-    const n = envelopSize([f])
+    const n = envelopeSize([f])
     if (this.budget > 0 && n > this.budget) {
       throw new MessageTooLargeError(`batcher: ${n}-byte frame over the ${this.budget}-byte budget`)
     }
 
     let batch: Frame[] | undefined
-    if (this.pending.length > 0 && envelopSize([...this.pending, f]) > this.budget) {
+    if (this.pending.length > 0 && envelopeSize([...this.pending, f]) > this.budget) {
       // f does not fit alongside what is already waiting: what is waiting goes
-      // now, in order, and f opens the next envelop.
+      // now, in order, and f opens the next envelope.
       batch = this.pending
       this.pending = [f]
     } else {
@@ -147,7 +147,7 @@ class Batcher extends UdpTransport {
     if (batch === undefined) return Promise.resolve()
 
     this.datagrams++
-    // sendFrames is the exported envelop-level seam: one envelop of 1..n
+    // sendFrames is the exported envelope-level seam: one envelope of 1..n
     // frames, one datagram (§4.1).
     return this.sendFrames(batch)
   }
@@ -269,10 +269,10 @@ describe('a user-written Batcher over the node-udp adapter', () => {
     expect(b.datagrams).toBe(1)
 
     const data = await recv(peer)
-    // decodeEnvelop is what an adapter runs on the receive path; driving it
+    // decodeEnvelope is what an adapter runs on the receive path; driving it
     // here is the proof that a batched datagram needs no receive-side change.
-    const frames = decodeEnvelop(data)
-    // Order is not decoration: within one envelop the frames of a stream are
+    const frames = decodeEnvelope(data)
+    // Order is not decoration: within one envelope the frames of a stream are
     // delivered in the order they were packed (§4.1).
     expect(frames.map((f) => [f.sid, f.seq])).toEqual([
       [1, 10],
@@ -306,7 +306,7 @@ describe('a user-written Batcher over the node-udp adapter', () => {
     for (let i = 1; i <= 2; i++) {
       await b.handle(dataFrame(i, i, new TextEncoder().encode('ok')))
     }
-    expect(decodeEnvelop(await recv(peer))).toHaveLength(2)
+    expect(decodeEnvelope(await recv(peer))).toHaveLength(2)
   })
 
   // Real RPCs over a Conn whose transport is the Batcher — the shape a user
@@ -386,7 +386,7 @@ describe('a user-written Batcher over the node-udp gateway', () => {
     const b = await bind(createSocket('udp4'))
     const keyA = `127.0.0.1:${a.address().port}`
     const keyB = `127.0.0.1:${b.address().port}`
-    for (const s of [a, b]) s.send(encodeEnvelop([]), gwSock.address().port, '127.0.0.1')
+    for (const s of [a, b]) s.send(encodeEnvelope([]), gwSock.address().port, '127.0.0.1')
     await new Promise((res) => setTimeout(res, 50))
 
     // Interleaved, as a server serving two peers at once would emit them.
@@ -398,11 +398,11 @@ describe('a user-written Batcher over the node-udp gateway', () => {
 
     // Each peer got ONE datagram, carrying its own two frames in order — and
     // nothing of the other's.
-    expect(decodeEnvelop(await recv(a)).map((f) => [f.sid, f.seq])).toEqual([
+    expect(decodeEnvelope(await recv(a)).map((f) => [f.sid, f.seq])).toEqual([
       [1, 1],
       [1, 2],
     ])
-    expect(decodeEnvelop(await recv(b)).map((f) => [f.sid, f.seq])).toEqual([
+    expect(decodeEnvelope(await recv(b)).map((f) => [f.sid, f.seq])).toEqual([
       [2, 1],
       [2, 2],
     ])
@@ -414,7 +414,7 @@ describe('a user-written Batcher over the node-udp gateway', () => {
 // The seam is one name on every adapter, transport and gateway alike: a
 // batching middleware written against one of them is written against all of
 // them, and a renamed or missing entry here is what would make that false.
-describe('the envelop-level seam', () => {
+describe('the envelope-level seam', () => {
   it('is sendFrames on every exported adapter class', () => {
     const classes = [
       UdpTransport,

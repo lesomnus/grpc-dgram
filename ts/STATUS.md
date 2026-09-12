@@ -10,7 +10,7 @@ Go server is verified at runtime over UDP — including the v1.1 surface, where
 a Go/TS split would be silent: binary metadata, status details and the
 flow-control advertisements are asserted against exact bytes, not mirrored
 shapes. Nothing is outstanding: the last gap, an
-envelop-level send for an application's own batcher to call, closed with
+envelope-level send for an application's own batcher to call, closed with
 `sendFrames` on every exported adapter class (`../docs/TODO.md` §1 — the
 batching policy is the workload's, and neither language ships a batcher).
 
@@ -70,7 +70,7 @@ mirroring Go's `transport/{udp,pion,gorilla,webtransport,jsport}/` layout (dir
 
 | File | Role | Go twin |
 |---|---|---|
-| `wire.ts` | zero-dep protobuf codec for `Frame`/`Envelop`/`Metadata` | `*.pb.go`, `frame.go` |
+| `wire.ts` | zero-dep protobuf codec for `Frame`/`Envelope`/`Metadata` | `*.pb.go`, `frame.go` |
 | `seq.ts` | tx seq + rx window (dedup, beyond-window fail-loud, strict mode) | `seq.go` |
 | `timing.ts` / `limits.ts` | timer + resource-cap resolution (`maxPeerWindow` floored at `W_CONN`) | `timing.go`, `limits.go` |
 | `status.ts` / `metadata.ts` | `StatusError`/`Code`, `Metadata` | `status`, `metadata.go` |
@@ -280,7 +280,7 @@ consumer drains. The Node/pion read-loop blocking has no browser equivalent.
    bytes — so a TS client and the Go server address the same methods with the
    same encoding. Regenerate the fixture with `pnpm gen`. Core stays zero-dep;
    verified the core bundles carry no `@bufbuild/protobuf` reference.)*
-5. **The envelop-level send seam** — **done** (`sendFrames` on every
+5. **The envelope-level send seam** — **done** (`sendFrames` on every
    exported adapter class; `src/transport/node-udp/batcher.test.ts` shows
    the shape, including the per-peer batching a gateway must respect). A
    batcher itself stays deliberately absent in both languages: the policy is

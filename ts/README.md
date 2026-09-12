@@ -6,7 +6,7 @@ Wire-compatible with the Go implementation — the §5 golden byte vectors are
 shared between the two test suites — so a TS client interoperates with a Go
 server and vice versa.
 
-- **Zero runtime dependencies.** The three wire messages (`Frame`, `Envelop`,
+- **Zero runtime dependencies.** The three wire messages (`Frame`, `Envelope`,
   `Metadata`) are hand-encoded; user payloads go through pluggable
   per-method marshallers (protobuf-es, JSON, anything that produces bytes).
   A **protobuf-es binding** (`@lesomnus/grpc-dgram/transport/protobuf-es`, optional peer
@@ -31,14 +31,14 @@ server and vice versa.
   caps, and the shape/modifier flag split (§7.1) — an unimplemented flag bit
   fails the call instead of silently corrupting or gapping it.
 - **WebSocket adapter** (`@lesomnus/grpc-dgram/transport/websocket`), the TS
-  twin of the Go `transport/gorilla` adapter: reliable mode, one Envelop per
+  twin of the Go `transport/gorilla` adapter: reliable mode, one Envelope per
   message, and the §4.5 teardown duty carried by `onclose`/`onerror` plus a
   keepalive — browser-safe (WhatWG `WebSocket`, `binaryType='arraybuffer'`).
   `dialWebSocket(url)` is a `Conn` in one line; `new WebSocketTransport(ws)` is
   the path for a socket you brought yourself.
 - **WebTransport datagram adapter** (`@lesomnus/grpc-dgram/transport/webtransport`),
   the TS twin of the Go `transport/webtransport` adapter: unreliable mode over
-  the session's datagrams, one Envelop per datagram — the browser's datagram
+  the session's datagrams, one Envelope per datagram — the browser's datagram
   channel with no signaling, a URL and nothing else. `dialWebTransport(url)` is
   a `Conn` in one line (`https://` only; `serverCertificateHashes` pins a
   development certificate), `new WebTransportDatagramTransport(wt)` the path
