@@ -1,18 +1,21 @@
 name: npm publish
 
-# Publishes ts/ to npm by trusted publishing — npm's GitHub Actions OIDC
-# exchange — so no token lives in this repository. Three things make it work:
+# Stages ts/ for publication on npm by trusted publishing — npm's GitHub
+# Actions OIDC exchange — so no token lives in this repository, and nothing
+# goes live from here: `npm stage publish` parks the version in the package's
+# staging queue, and a maintainer approves it on npmjs.com with 2FA (or with
+# `npm stage approve`). Three things make it work:
 #   - npmjs.com lists this workflow as the package's trusted publisher
 #     (package settings → Trusted Publisher → GitHub Actions: owner lesomnus,
-#     repository grpc-dgram, workflow filename npm-publish.yaml, no environment,
-#     and — the trap — "Allowed actions" with `npm publish` ticked: a
-#     configuration made after 2026-09-03 allows only `npm stage publish` by
-#     default, and then the token exchange succeeds while the PUT fails with
-#     `403 OIDC permission denied for this action`);
+#     repository grpc-dgram, workflow filename npm-publish.yaml, no
+#     environment). Its "Allowed actions" default, `npm stage publish`, is
+#     exactly this; a direct `npm publish` would need the extra tick there,
+#     and without it fails after a successful token exchange with
+#     `403 OIDC permission denied for this action`;
 #   - the job has `id-token: write`, and its npm is ≥ 11.5.1 on Node ≥ 22;
 #   - the tag names the version in ts/package.json (ts-v0.1.0 ↔ 0.1.0), so a
-#     publish is always of the commit the tag pins, with provenance attached
-#     automatically.
+#     staged release is always of the commit the tag pins, with provenance
+#     attached automatically.
 # Deprecating an old version is not a publish and is done by hand (npmjs.com,
 # or `npm deprecate` after `npm login`).
 
@@ -88,5 +91,5 @@ jobs:
 
       # verbose, so that a failed OIDC token exchange — which npm logs at
       # this level and otherwise swallows — names its cause in the run log.
-      - name: Publish
-        run: npm publish --loglevel verbose
+      - name: Stage the release (a maintainer approves it on npmjs.com)
+        run: npm stage publish --loglevel verbose

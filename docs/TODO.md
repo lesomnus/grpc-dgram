@@ -179,9 +179,9 @@ chaining each on the last.
   `publishConfig.access: public`), published by
   `.github/workflows/npm-publish.yaml` on a `ts-v*` tag through npm trusted
   publishing (GitHub OIDC: no token in the repo, provenance attached; the tag
-  must name the version in `ts/package.json`; on npmjs.com the trusted
-  publisher's "Allowed actions" must include `npm publish`, not only the
-  default `npm stage publish`). Still open: the versioning
+  must name the version in `ts/package.json`). The workflow runs `npm stage
+  publish`: nothing goes live from CI, a maintainer approves the staged
+  version on npmjs.com with 2FA. Still open: the versioning
   relationship to the Go modules (they share a wire text, not a release
   cadence).
 - **Wire freeze.** PROTOCOL.md is unversioned and untagged: no independent
